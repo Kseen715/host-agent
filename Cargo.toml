@@ -1,0 +1,22 @@
+[package]
+name = "host-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pushes a host's metrics to Prometheus and its logs to Loki"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+regex-lite = "0.1"
+snap = "1"
+
+# Small and lean: an agent on every host, idle between rounds, so size
+# and memory count, speed does not.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
