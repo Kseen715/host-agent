@@ -1,15 +1,11 @@
 //! SNMP v2c over UDP, as much as walking a device takes: BER for a
 //! GetBulkRequest and its Response (RFC 3416), one request at a time.
 
+use super::transport::Transport;
 use std::io;
-use std::net::UdpSocket;
-use std::time::Duration;
 
 /// snmp_exporter's.
 const MAX_REPETITIONS: i64 = 25;
-/// A device on the LAN answers in milliseconds, and the round waits for
-/// a dead one: it is given up on soon.
-const TIMEOUT: Duration = Duration::from_secs(1);
 const RETRIES: u64 = 2;
 
 pub enum Value {
@@ -18,8 +14,8 @@ pub enum Value {
     Oid(String),
 }
 
-pub struct Client {
-    socket: UdpSocket,
+pub struct Client<T> {
+    transport: T,
     community: Vec<u8>,
     request_id: i64,
     buf: Vec<u8>,
@@ -27,18 +23,11 @@ pub struct Client {
     pub retried: u64,
 }
 
-impl Client {
+impl<T: Transport> Client<T> {
     /// `address` with its port, or 161.
-    pub fn connect(address: &str, community: &str) -> io::Result<Client> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        if address.contains(':') {
-            socket.connect(address)?;
-        } else {
-            socket.connect((address, 161))?;
-        }
-        socket.set_read_timeout(Some(TIMEOUT))?;
+    pub async fn connect(address: &str, community: &str) -> io::Result<Self> {
         Ok(Client {
-            socket,
+            transport: T::connect(address).await?,
             community: community.as_bytes().to_vec(),
             request_id: 0,
             buf: vec![0; 65536],
@@ -48,7 +37,7 @@ impl Client {
     }
 
     /// Every variable under `root`, in the device's order.
-    pub fn walk(
+    pub async fn walk(
         &mut self,
         root: &str,
         out: &mut Vec<(String, Value)>,
@@ -56,7 +45,7 @@ impl Client {
         let prefix = format!("{root}.");
         let mut from = root.to_owned();
         loop {
-            let binds = self.get_bulk(&from)?;
+            let binds = self.get_bulk(&from).await?;
             let last = from.clone();
             for (oid, value) in binds {
                 let Some(value) = value.filter(|_| oid.starts_with(&prefix))
@@ -73,18 +62,18 @@ impl Client {
         }
     }
 
-    fn get_bulk(&mut self, oid: &str) -> io::Result<Vec<Bind>> {
+    async fn get_bulk(&mut self, oid: &str) -> io::Result<Vec<Bind>> {
         self.request_id = (self.request_id + 1) & 0x7fff_ffff;
         let request = request(&self.community, self.request_id, oid)
             .ok_or_else(|| io::Error::other(format!("bad OID {oid}")))?;
         for attempt in 0..=RETRIES {
             self.retried += u64::from(attempt > 0);
-            self.socket.send(&request)?;
+            self.transport.send(&request).await?;
             self.sent += 1;
             loop {
-                let length = match self.socket.recv(&mut self.buf) {
+                let length = match self.transport.recv(&mut self.buf).await {
                     Ok(length) => length,
-                    Err(e) if timed_out(&e) => break,
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
                     Err(e) => return Err(e),
                 };
                 // Another request's answer, late: wait on.
@@ -96,13 +85,6 @@ impl Client {
         }
         Err(io::Error::new(io::ErrorKind::TimedOut, "no answer"))
     }
-}
-
-fn timed_out(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
 }
 
 /// A variable and its value; None past the end of the device's MIB.

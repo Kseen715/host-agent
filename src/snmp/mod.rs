@@ -2,49 +2,173 @@
 //! prometheus.exporter.snmp with snmp_exporter's modules: job `snmp`,
 //! the device's name in `instance` and `host`, the MIB's names for the
 //! metrics and, for text, a label of the metric's name with value 1.
-//! Polled in the round, one device after another.
+//! Each device is polled once an interval apart from the round, so a
+//! slow or dead one holds up nothing: a round sends each device's
+//! latest poll.
 
 mod ber;
+mod transport;
 
 use crate::config::Device;
 use crate::parts::Part;
 use crate::remote::Writer;
 use ber::{Client, Value};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::io;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+/// A device's index and its poll.
+type Polled = (usize, io::Result<Samples>);
 
 pub struct Snmp {
-    devices: Vec<Device>,
+    names: Vec<String>,
+    polls: Receiver<Polled>,
+    latest: Vec<Option<io::Result<Samples>>>,
+    /// One round only (--print): it waits for every device's first poll.
+    wait: bool,
 }
 
 impl Snmp {
-    pub fn new(devices: Vec<Device>) -> Result<Snmp, String> {
+    pub fn new(
+        devices: Vec<Device>,
+        interval: Duration,
+        wait: bool,
+    ) -> Result<Snmp, String> {
         let names = devices.iter().flat_map(|d| &d.modules);
         if let Some(name) = names.into_iter().find(|n| module(n).is_none()) {
             return Err(format!("no SNMP module `{name}`"));
         }
-        Ok(Snmp { devices })
+        let names: Vec<String> =
+            devices.iter().map(|d| d.name.clone()).collect();
+        let (sender, polls) = mpsc::channel();
+        start(devices, interval, sender)
+            .map_err(|e| format!("SNMP pollers: {e}"))?;
+        Ok(Snmp {
+            latest: names.iter().map(|_| None).collect(),
+            names,
+            polls,
+            wait,
+        })
+    }
+
+    fn receive(&mut self, (index, polled): Polled) {
+        if let Err(error) = &polled {
+            eprintln!("SNMP {}: {error}", self.names[index]);
+        }
+        self.latest[index] = Some(polled);
     }
 }
 
 impl Part for Snmp {
     fn round(&mut self, w: &mut Writer, _now_ms: i64) {
-        for device in &self.devices {
-            let name = device.name.as_str();
-            w.target("snmp", &[("instance", name), ("host", name)]);
-            let scraped = Client::connect(&device.address, &device.community)
-                .and_then(|mut client| {
-                    let modules =
-                        device.modules.iter().filter_map(|m| module(m));
-                    modules
-                        .into_iter()
-                        .try_for_each(|m| scrape(w, &mut client, m))
-                });
-            if let Err(error) = &scraped {
-                eprintln!("SNMP {name}: {error}");
+        while self.wait && self.latest.iter().any(Option::is_none) {
+            match self.polls.recv() {
+                Ok(polled) => self.receive(polled),
+                Err(_) => break,
             }
-            w.up(scraped.is_ok());
         }
+        while let Ok(polled) = self.polls.try_recv() {
+            self.receive(polled);
+        }
+        for (name, latest) in self.names.iter().zip(&self.latest) {
+            let Some(polled) = latest else {
+                continue;
+            };
+            let name = name.as_str();
+            w.target("snmp", &[("instance", name), ("host", name)]);
+            for (metric, labels, value) in polled.iter().flat_map(|s| &s.0) {
+                let labels: Vec<(&str, &str)> =
+                    labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                w.add(metric, &labels, *value);
+            }
+            w.up(polled.is_ok());
+        }
+    }
+}
+
+/// Each device on a thread of its own, polled until the part is gone.
+#[cfg(not(feature = "tokio"))]
+fn start(
+    devices: Vec<Device>,
+    interval: Duration,
+    sender: Sender<Polled>,
+) -> io::Result<()> {
+    use transport::{Blocking, block_on};
+    for (index, device) in devices.into_iter().enumerate() {
+        let sender = sender.clone();
+        let name = format!("snmp {}", device.name);
+        std::thread::Builder::new().name(name).spawn(move || {
+            loop {
+                let begun = Instant::now();
+                let polled = block_on(poll::<Blocking>(&device));
+                if sender.send((index, polled)).is_err() {
+                    return;
+                }
+                std::thread::sleep(interval.saturating_sub(begun.elapsed()));
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Every device a task on one thread's runtime, polled until the part
+/// is gone.
+#[cfg(feature = "tokio")]
+fn start(
+    devices: Vec<Device>,
+    interval: Duration,
+    sender: Sender<Polled>,
+) -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let thread = std::thread::Builder::new().name("snmp".into());
+    let run = move || {
+        let tasks = tokio::task::LocalSet::new();
+        for (index, device) in devices.into_iter().enumerate() {
+            let sender = sender.clone();
+            tasks.spawn_local(async move {
+                loop {
+                    let begun = tokio::time::Instant::now();
+                    let polled = poll::<transport::Tokio>(&device).await;
+                    if sender.send((index, polled)).is_err() {
+                        return;
+                    }
+                    tokio::time::sleep_until(begun + interval).await;
+                }
+            });
+        }
+        runtime.block_on(tasks);
+    };
+    thread.spawn(run).map(drop)
+}
+
+/// A device's modules, walked one after another.
+async fn poll<T: transport::Transport>(device: &Device) -> io::Result<Samples> {
+    let mut client =
+        Client::<T>::connect(&device.address, &device.community).await?;
+    let mut samples = Samples::default();
+    for module in device.modules.iter().filter_map(|m| module(m)) {
+        scrape(&mut samples, &mut client, module).await?;
+    }
+    Ok(samples)
+}
+
+/// One poll's series: name, labels, value.
+#[derive(Default)]
+struct Samples(Vec<(String, Labels, f64)>);
+
+type Labels = Vec<(&'static str, String)>;
+
+impl Samples {
+    fn add(
+        &mut self,
+        name: &str,
+        labels: &[(&'static str, String)],
+        value: f64,
+    ) {
+        self.0.push((name.to_owned(), labels.to_vec(), value));
     }
 }
 
@@ -53,25 +177,22 @@ fn module(name: &str) -> Option<&'static Module> {
 }
 
 /// One module's walks, its metrics and snmp_exporter's numbers on them.
-fn scrape(
-    w: &mut Writer,
-    client: &mut Client,
+async fn scrape<T: transport::Transport>(
+    w: &mut Samples,
+    client: &mut Client<T>,
     module: &Module,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let start = Instant::now();
     let (sent, retried) = (client.sent, client.retried);
     let mut binds = Vec::new();
     for root in module.walk {
-        client.walk(root, &mut binds)?;
+        client.walk(root, &mut binds).await?;
     }
-    let labels = [("module", module.name)];
+    let labels = [("module", module.name.to_owned())];
     let walked = start.elapsed().as_secs_f64();
     w.add("snmp_scrape_walk_duration_seconds", &labels, walked);
-    w.add(
-        "snmp_scrape_packets_sent",
-        &labels,
-        (client.sent - sent) as f64,
-    );
+    let sent = (client.sent - sent) as f64;
+    w.add("snmp_scrape_packets_sent", &labels, sent);
     let retries = (client.retried - retried) as f64;
     w.add("snmp_scrape_packets_retried", &labels, retries);
     w.add("snmp_scrape_pdus_returned", &labels, binds.len() as f64);
@@ -82,7 +203,7 @@ fn scrape(
 }
 
 /// Each variable as the metric it falls under, the longest match.
-fn metrics(w: &mut Writer, module: &Module, binds: &[(String, Value)]) {
+fn metrics(w: &mut Samples, module: &Module, binds: &[(String, Value)]) {
     let values: HashMap<&str, &Value> = binds
         .iter()
         .map(|(oid, value)| (oid.as_str(), value))
@@ -98,7 +219,7 @@ fn metrics(w: &mut Writer, module: &Module, binds: &[(String, Value)]) {
         let mut labels = index_labels(base, &oid[base.len() + 1..], &values);
         let name = match (kind, value) {
             (Kind::Number, Value::Number(number)) => {
-                add(w, name, &labels, *number);
+                w.add(name, &labels, *number);
                 continue;
             }
             (Kind::Number, _) => continue,
@@ -119,14 +240,8 @@ fn metrics(w: &mut Writer, module: &Module, binds: &[(String, Value)]) {
                 (*name).to_owned()
             }
         };
-        add(w, &name, &labels, 1.0);
+        w.add(&name, &labels, 1.0);
     }
-}
-
-fn add(w: &mut Writer, name: &str, labels: &[(&str, String)], value: f64) {
-    let labels: Vec<(&str, &str)> =
-        labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    w.add(name, &labels, value);
 }
 
 /// A table row's labels: its index, and its lookups' values.
@@ -411,3 +526,29 @@ const MODULES: &[Module] = &[
         ],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dead_device_holds_up_no_round() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let device = Device {
+            name: "dead".into(),
+            address: silent.local_addr().unwrap().to_string(),
+            community: "public".into(),
+            modules: vec!["if_mib".into()],
+        };
+        let interval = Duration::from_secs(60);
+        let mut snmp = Snmp::new(vec![device], interval, false).unwrap();
+        let mut w = Writer::new("http://127.0.0.1:1/", "test", true).unwrap();
+        let begun = Instant::now();
+        snmp.round(&mut w, 0);
+        assert!(begun.elapsed() < Duration::from_millis(100));
+        let (index, polled) = snmp.polls.recv().unwrap();
+        assert_eq!(index, 0);
+        let error = polled.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+}

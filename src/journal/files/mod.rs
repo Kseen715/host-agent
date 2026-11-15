@@ -1,9 +1,10 @@
 //! The journal read from its files, without journalctl: the
 //! local machine's directories under /var/log/journal and
 //! /run/log/journal (crate::host, so a container reads the host's).
-//! inotify wakes it when journald writes. Each file is read in its own
-//! order, archived ones first; the cursor kept is journalctl's, so
-//! either reader resumes where the other stopped.
+//! inotify wakes it when journald writes. The files' entries are
+//! merged as journalctl merges them, so the cursor kept, journalctl's,
+//! marks everything before it as read: either reader resumes where the
+//! other stopped.
 
 mod format;
 
@@ -30,13 +31,40 @@ pub struct Journal {
     inotify: OwnedFd,
     /// Readable while entries are left to read.
     behind: OwnedFd,
-    files: Vec<JournalFile>,
+    files: Vec<Reading>,
     /// Files opened or passed over, by device and inode.
     seen: HashSet<(u64, u64)>,
     /// None until the saved cursor is known (`prepare`).
     start: Option<Start>,
     max_age: String,
     drops: Vec<Regex>,
+}
+
+/// An entry's seqnum_id, seqnum and realtime.
+type Place = ([u8; 16], u64, u64);
+
+/// Whether `a` was written before `b`, as journalctl orders entries:
+/// by seqnum in one sequence (journald's, across its files), else by
+/// time.
+fn before(a: Place, b: Place) -> bool {
+    if a.0 == b.0 { a.1 < b.1 } else { a.2 < b.2 }
+}
+
+/// A file being read and its next entry, if it has one yet.
+struct Reading {
+    file: JournalFile,
+    next: Option<(u64, Place)>,
+}
+
+impl Reading {
+    fn peek(&mut self) {
+        let offset = self
+            .file
+            .next_entries()
+            .ok()
+            .and_then(|o| o.first().copied());
+        self.next = offset.and_then(|o| Some((o, self.file.place(o).ok()?)));
+    }
 }
 
 /// Where reading begins in a file present at the start.
@@ -50,13 +78,12 @@ enum Start {
 impl Start {
     /// Whether the entry at `place` (seqnum_id, seqnum, realtime) was
     /// read before: by seqnum in the cursor's sequence, else by time.
-    fn covers(&self, (id, seqnum, realtime): ([u8; 16], u64, u64)) -> bool {
+    fn covers(&self, place: Place) -> bool {
         match *self {
-            Start::After(after_id, after, _) if after_id == id => {
-                seqnum <= after
+            Start::After(id, seqnum, realtime) => {
+                !before((id, seqnum, realtime), place)
             }
-            Start::After(_, _, after) => realtime <= after,
-            Start::Since(since) => realtime < since,
+            Start::Since(since) => place.2 < since,
         }
     }
 }
@@ -128,7 +155,7 @@ impl Journal {
             eprintln!("Journal: {error}");
             return;
         }
-        self.files.push(file);
+        self.files.push(Reading { file, next: None });
     }
 
     fn skip(&self, file: &mut JournalFile) -> io::Result<()> {
@@ -149,40 +176,37 @@ impl Journal {
         }
     }
 
-    /// Reads up to ENTRIES_AT_ONCE entries; whether all were read.
+    /// Reads up to ENTRIES_AT_ONCE entries, the earliest first;
+    /// whether all were read.
     fn read_entries(
         &mut self,
         loki: &mut Loki,
         positions: &mut Positions,
     ) -> bool {
-        let mut left = ENTRIES_AT_ONCE;
-        let mut index = 0;
-        while index < self.files.len() {
-            if left == 0 || loki.blocked(Instant::now()) {
+        for reading in &mut self.files {
+            reading.peek();
+        }
+        self.files.retain(|r| {
+            r.next.is_some() || r.file.header().is_ok_and(|h| !h.archived)
+        });
+        for _ in 0..ENTRIES_AT_ONCE {
+            if loki.blocked(Instant::now()) {
                 return false;
             }
-            let file = &mut self.files[index];
-            let offsets = file.next_entries().unwrap_or_default();
-            if offsets.is_empty() {
-                let done = file.header().map_or(true, |h| h.archived);
-                if done {
-                    self.files.remove(index);
-                } else {
-                    index += 1;
-                }
-                continue;
+            let next = self.files.iter().map(|r| r.next.map(|n| n.1));
+            let Some(index) = earliest(next) else {
+                return true;
+            };
+            let reading = &mut self.files[index];
+            let (offset, _) = reading.next.expect("earliest has one");
+            match reading.file.entry(offset) {
+                Ok(entry) => send(&self.drops, &entry, loki, positions),
+                Err(error) => eprintln!("Journal: entry {offset}: {error}"),
             }
-            let take = offsets.len().min(left);
-            for &offset in &offsets[..take] {
-                match file.entry(offset) {
-                    Ok(entry) => send(&self.drops, &entry, loki, positions),
-                    Err(error) => eprintln!("Journal: entry {offset}: {error}"),
-                }
-            }
-            file.advance(take);
-            left -= take;
+            reading.file.advance(1);
+            reading.peek();
         }
-        true
+        false
     }
 }
 
@@ -215,6 +239,13 @@ impl Part for Journal {
             signal(&self.behind);
         }
     }
+}
+
+/// The index of the place written first.
+fn earliest(places: impl Iterator<Item = Option<Place>>) -> Option<usize> {
+    let places = places.enumerate().filter_map(|(i, p)| Some((i, p?)));
+    let first = places.reduce(|a, b| if before(b.1, a.1) { b } else { a });
+    first.map(|(index, _)| index)
 }
 
 fn send(
@@ -353,5 +384,15 @@ mod tests {
         assert!(!start.covers((id, 32, 50)));
         assert!(start.covers(([0; 16], 99, 100)));
         assert_eq!(seconds("12h"), 43200);
+    }
+
+    #[test]
+    fn merges_by_seqnum_else_time() {
+        let (a, b) = ([1; 16], [2; 16]);
+        let places = [Some((a, 7, 900)), None, Some((a, 5, 950))];
+        assert_eq!(earliest(places.into_iter()), Some(2));
+        let places = [Some((a, 5, 950)), Some((b, 1, 940))];
+        assert_eq!(earliest(places.into_iter()), Some(1));
+        assert_eq!(earliest([None].into_iter()), None);
     }
 }

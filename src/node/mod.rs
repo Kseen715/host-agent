@@ -9,7 +9,6 @@ mod filesystems;
 mod hardware;
 mod kernel;
 mod network;
-#[cfg(feature = "filesystems")]
 mod nfs;
 mod platform;
 mod storage;
@@ -52,9 +51,7 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("netclass", network::netclass),
     ("netdev", network::netdev),
     ("netstat", network::netstat),
-    #[cfg(feature = "filesystems")]
     ("nfs", nfs::client),
-    #[cfg(feature = "filesystems")]
     ("nfsd", nfs::server),
     ("nvme", platform::nvme),
     ("os", kernel::os),

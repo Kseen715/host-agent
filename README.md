@@ -24,7 +24,8 @@ used, in about 1 MiB of memory instead of about 100.
   labels (`metric_relabel`, `log_relabel`).
 - An OTLP/HTTP receiver that passes each request on unchanged to its
   signal's backend (Loki and Prometheus take OTLP themselves).
-- One thread around poll(2). Metrics Prometheus does not take wait on
+- One thread around poll(2), and SNMP devices polled apart from it, so
+  a dead one holds nothing up. Metrics Prometheus does not take wait on
   disk (`state_dir/spool`, up to 2 hours and `spool_max_mb`) and are
   sent oldest first when it is back. An outage of Loki pauses the log
   sources, which resume from saved positions (journal cursor, Docker
@@ -41,7 +42,10 @@ Each part a host may lack is a cargo feature, all on by default:
 `docker` (containers' metrics and logs), `minecraft` (servers' plugins
 in containers; needs `docker`), `journal` (through journalctl),
 `journal-files` (from the files, without journalctl), `filesystems`
-(btrfs, XFS, ZFS, NFS), `snmp`, `syslog`, `relabel`, `otlp`. A smaller build:
+(btrfs, XFS, ZFS), `snmp`, `syslog`, `relabel`, `otlp`. Off by
+default: `journal-xz` (fields journald compressed with xz, before
+systemd 246), `tokio` (SNMP devices polled by tasks on one thread
+instead of a thread each). A smaller build:
 `--no-default-features --features journal,filesystems`. A
 configuration that needs a part the build lacks is refused.
 

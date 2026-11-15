@@ -52,7 +52,11 @@ pub fn build(
     #[cfg(feature = "snmp")]
     if !config.snmp.is_empty() {
         let devices = std::mem::take(&mut config.snmp);
-        parts.push(Box::new(crate::snmp::Snmp::new(devices)?));
+        parts.push(Box::new(crate::snmp::Snmp::new(
+            devices,
+            config.interval,
+            print,
+        )?));
     }
     #[cfg(feature = "otlp")]
     if let (Some(address), false) = (&config.otlp, print) {

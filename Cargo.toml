@@ -27,20 +27,30 @@ journal = []
 # The journal read from its files instead of through journalctl, which
 # a container from scratch lacks.
 journal-files = ["journal", "dep:lz4_flex", "dep:ruzstd"]
+# Fields journald compressed with xz, its default before systemd 246.
+journal-xz = ["journal-files", "dep:lzma-rs"]
 minecraft = ["docker"]
 otlp = []
 relabel = []
 snmp = []
 syslog = []
+# SNMP devices polled by tasks on one thread instead of a thread each.
+tokio = ["snmp", "dep:tokio"]
 
 [dependencies]
 libc = "0.2"
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = [
     "safe-decode",
 ] }
+lzma-rs = { version = "0.3", optional = true }
 regex-lite = "0.1"
 ruzstd = { version = "0.9", optional = true }
 snap = "1"
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "net",
+    "rt",
+    "time",
+] }
 
 # Small and lean: an agent on every host, idle between rounds, so size
 # and memory count, speed does not.

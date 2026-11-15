@@ -1,5 +1,6 @@
 //! One thread around poll(2): log sources are read as lines arrive and
-//! sent within a second; metrics are collected and sent every interval.
+//! sent within a second; metrics are collected and sent every interval
+//! (SNMP devices are polled apart: crate::snmp).
 //! Nothing is buffered beyond one log batch and one metrics chunk.
 
 use crate::config::Config;

@@ -147,7 +147,7 @@ impl JournalFile {
             0 => Ok(payload.to_vec()),
             4 => zstd(payload),
             2 => lz4(payload),
-            _ => Err(io::Error::other("an xz field")),
+            _ => xz(payload),
         }
     }
 
@@ -194,6 +194,19 @@ fn zstd(payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "journal-xz")]
+fn xz(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    lzma_rs::xz_decompress(&mut &payload[..], &mut out)
+        .map_err(io::Error::other)?;
+    Ok(out)
+}
+
+#[cfg(not(feature = "journal-xz"))]
+fn xz(_: &[u8]) -> io::Result<Vec<u8>> {
+    Err(io::Error::other("an xz field, built without journal-xz"))
+}
+
 /// journald's LZ4: the size, little-endian in 8 bytes, then the block.
 fn lz4(payload: &[u8]) -> io::Result<Vec<u8>> {
     let size = payload.get(..8).map(u64_at).unwrap_or(0) as usize;
@@ -206,4 +219,23 @@ fn lz4(payload: &[u8]) -> io::Result<Vec<u8>> {
         .map_err(io::Error::other)?;
     out.truncate(length);
     Ok(out)
+}
+
+#[cfg(all(test, feature = "journal-xz"))]
+mod tests {
+    /// `printf 'MESSAGE=hello xz' | xz --check=none`, as journald
+    /// writes it.
+    const FIELD: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x00, 0xff, 0x12, 0xd9, 0x41,
+        0x04, 0xc0, 0x14, 0x10, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x41, 0x20, 0x45, 0x1f, 0x01, 0x00, 0x0f, 0x4d,
+        0x45, 0x53, 0x53, 0x41, 0x47, 0x45, 0x3d, 0x68, 0x65, 0x6c, 0x6c, 0x6f,
+        0x20, 0x78, 0x7a, 0x00, 0x00, 0x01, 0x28, 0x10, 0xe5, 0x0b, 0x6c, 0x60,
+        0x06, 0x72, 0x9e, 0x7a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x59, 0x5a,
+    ];
+
+    #[test]
+    fn reads_an_xz_field() {
+        assert_eq!(super::xz(FIELD).unwrap(), b"MESSAGE=hello xz");
+    }
 }
