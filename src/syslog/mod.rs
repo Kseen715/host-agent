@@ -18,11 +18,15 @@ use format::Message;
 use std::io::{self, Read};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Datagrams or reads per wake: other sources wait meanwhile.
 const READ_AT_ONCE: usize = 256;
 const READ_SIZE: usize = 64 << 10;
+// A client may hold a connection with a byte now and then of a
+// handshake, which idle_timeout alone would never end.
+#[cfg(feature = "tls")]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum Socket {
     Udp(UdpSocket),
@@ -35,10 +39,23 @@ struct Connection {
     buf: Vec<u8>,
     last: Instant,
     #[cfg(feature = "tls")]
+    opened: Instant,
+    #[cfg(feature = "tls")]
     tls: Option<rustls::ServerConnection>,
 }
 
 impl Connection {
+    /// Silent for `idle` (zero: never), or not through its handshake.
+    fn expired(&self, idle: Duration) -> bool {
+        #[cfg(feature = "tls")]
+        if self.tls.as_ref().is_some_and(|t| t.is_handshaking())
+            && self.opened.elapsed() >= HANDSHAKE_TIMEOUT
+        {
+            return true;
+        }
+        !idle.is_zero() && self.last.elapsed() >= idle
+    }
+
     /// Reads what arrived into `buf`; false when the stream ended.
     fn fill(&mut self, chunk: &mut [u8]) -> bool {
         self.last = Instant::now();
@@ -132,6 +149,8 @@ impl Syslog {
                 buf: Vec::new(),
                 last: Instant::now(),
                 #[cfg(feature = "tls")]
+                opened: Instant::now(),
+                #[cfg(feature = "tls")]
                 tls,
             });
         }
@@ -161,7 +180,7 @@ impl Part for Syslog {
     fn prepare(&mut self, _positions: &Positions) {
         let idle = self.listener.idle_timeout;
         if let Socket::Tcp(_, connections) = &mut self.socket {
-            connections.retain(|c| idle.is_zero() || c.last.elapsed() < idle);
+            connections.retain(|c| !c.expired(idle));
         }
     }
 
