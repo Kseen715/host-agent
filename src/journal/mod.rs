@@ -1,6 +1,5 @@
-//! The systemd journal to Loki as Alloy's loki.source.journal sends it:
-//! job `journal`, `unit`, `level` in the journal's words. Read through
-//! journalctl, or from the files with feature `journal-files`.
+//! loki.source.journal: the systemd journal, read through journalctl,
+//! or from the files with feature `journal-files`.
 
 #[cfg(feature = "journal-files")]
 mod files;
@@ -12,40 +11,46 @@ pub use files::Journal;
 #[cfg(not(feature = "journal-files"))]
 pub use journalctl::Journal;
 
-use crate::levels::PRIORITIES;
-use crate::loki::Loki;
-use regex_lite::Regex;
+use crate::logs::{Logs, Source};
 
-/// The fields of an entry that are sent.
+/// The journal's words for its priorities 0 to 7.
+const PRIORITIES: [&str; 8] = [
+    "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug",
+];
+
+/// An entry's time and its fields, `NAME` and value.
 #[derive(Default)]
 pub struct Fields<'a> {
     pub realtime_us: Option<i64>,
-    pub message: Option<&'a [u8]>,
-    pub priority: Option<&'a [u8]>,
-    pub unit: Option<&'a [u8]>,
+    pub pairs: Vec<(&'a [u8], &'a [u8])>,
 }
 
-/// An entry to Loki as Alloy's loki.source.journal sends it, unless a
-/// drop expression matches its message.
-pub fn deliver(drops: &[Regex], entry: &Fields, loki: &mut Loki) {
-    let Some(message) = entry.message else {
-        return;
-    };
-    let message = String::from_utf8_lossy(message);
-    if drops.iter().any(|drop| drop.is_match(&message)) {
-        return;
+/// An entry as Alloy's loki.source.journal gives it: MESSAGE the line,
+/// every field a label `__journal_<name>` for the source's rules, and
+/// `__journal_priority_keyword` the priority's word.
+pub fn deliver(source: &Source, entry: &Fields, logs: &mut Logs) {
+    let mut message = None;
+    let mut labels = Vec::with_capacity(entry.pairs.len() + 1);
+    for &(name, value) in &entry.pairs {
+        let value = String::from_utf8_lossy(value).into_owned();
+        match name {
+            b"MESSAGE" => message = Some(value.clone()),
+            b"PRIORITY" => {
+                let word =
+                    value.parse().ok().and_then(|p: usize| PRIORITIES.get(p));
+                let word = word.map_or(value.clone(), |w| (*w).to_owned());
+                labels.push(("__journal_priority_keyword".into(), word));
+            }
+            _ => {}
+        }
+        let name = String::from_utf8_lossy(name).to_lowercase();
+        labels.push((format!("__journal_{name}"), value));
     }
-    let number = |field: Option<&[u8]>| -> Option<i64> {
-        std::str::from_utf8(field?).ok()?.parse().ok()
+    let Some(message) = message else {
+        return;
     };
-    let ns = entry.realtime_us.unwrap_or(0) * 1000;
-    let level = number(entry.priority)
-        .and_then(|p| PRIORITIES.get(usize::try_from(p).ok()?));
-    let unit = entry.unit.map(String::from_utf8_lossy);
-    let labels = [
-        ("job", "journal"),
-        ("unit", unit.as_deref().unwrap_or("")),
-        ("level", level.copied().unwrap_or("")),
-    ];
-    loki.add(&labels, ns, &message);
+    let ns = entry
+        .realtime_us
+        .map_or_else(crate::time::now_ns, |us| us * 1000);
+    source.emit(logs, labels, ns, &message);
 }

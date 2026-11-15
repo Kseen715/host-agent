@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 
 pub fn collect(node: &Node, w: &mut Writer) -> io::Result<()> {
-    let Some(dir) = &node.textfile_dir else {
+    let Some(dir) = &node.settings.textfile_dir else {
         return Ok(());
     };
     let mut paths: Vec<_> = fs::read_dir(dir)?

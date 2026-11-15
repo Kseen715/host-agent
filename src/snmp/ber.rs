@@ -3,10 +3,18 @@
 
 use super::transport::Transport;
 use std::io;
+use std::time::Instant;
 
 /// snmp_exporter's.
 const MAX_REPETITIONS: i64 = 25;
 const RETRIES: u64 = 2;
+/// snmp_exporter's snmp_packet_duration_seconds buckets: 0.1 ms
+/// doubled 15 times.
+pub const BUCKETS: usize = 15;
+
+pub fn bucket_bound(index: usize) -> f64 {
+    0.0001 * f64::from(1u32 << index)
+}
 
 pub enum Value {
     Number(f64),
@@ -21,6 +29,12 @@ pub struct Client<T> {
     buf: Vec<u8>,
     pub sent: u64,
     pub retried: u64,
+    /// Answers that were not a Response PDU.
+    pub unexpected: u64,
+    /// Each answered request's time, from its first sending: counts
+    /// per bucket (not cumulative), and the sum in seconds.
+    pub durations: [u64; BUCKETS + 1],
+    pub duration_sum: f64,
 }
 
 impl<T: Transport> Client<T> {
@@ -33,6 +47,9 @@ impl<T: Transport> Client<T> {
             buf: vec![0; 65536],
             sent: 0,
             retried: 0,
+            unexpected: 0,
+            durations: [0; BUCKETS + 1],
+            duration_sum: 0.0,
         })
     }
 
@@ -66,6 +83,7 @@ impl<T: Transport> Client<T> {
         self.request_id = (self.request_id + 1) & 0x7fff_ffff;
         let request = request(&self.community, self.request_id, oid)
             .ok_or_else(|| io::Error::other(format!("bad OID {oid}")))?;
+        let start = Instant::now();
         for attempt in 0..=RETRIES {
             self.retried += u64::from(attempt > 0);
             self.transport.send(&request).await?;
@@ -77,13 +95,21 @@ impl<T: Transport> Client<T> {
                     Err(e) => return Err(e),
                 };
                 // Another request's answer, late: wait on.
-                let answer = response(&self.buf[..length], self.request_id);
-                if let Some(answer) = answer {
+                let answer = &self.buf[..length];
+                self.unexpected += u64::from(!is_response(answer));
+                if let Some(answer) = response(answer, self.request_id) {
+                    self.observe(start.elapsed().as_secs_f64());
                     return answer;
                 }
             }
         }
         Err(io::Error::new(io::ErrorKind::TimedOut, "no answer"))
+    }
+
+    fn observe(&mut self, seconds: f64) {
+        let bucket = (0..BUCKETS).find(|&i| seconds <= bucket_bound(i));
+        self.durations[bucket.unwrap_or(BUCKETS)] += 1;
+        self.duration_sum += seconds;
     }
 }
 
@@ -170,6 +196,19 @@ fn read(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 
 /// The variables of the Response to request `id`; None for anything
 /// else.
+/// Whether `buf` is an SNMP message carrying a Response PDU.
+fn is_response(buf: &[u8]) -> bool {
+    let pdu = || {
+        let (0x30, message, _) = read(buf)? else {
+            return None;
+        };
+        let (_, _version, rest) = read(message)?;
+        let (_, _community, rest) = read(rest)?;
+        read(rest).map(|(tag, _, _)| tag)
+    };
+    pdu() == Some(0xA2)
+}
+
 fn response(buf: &[u8], id: i64) -> Option<io::Result<Vec<Bind>>> {
     let (0x30, message, _) = read(buf)? else {
         return None;

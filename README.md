@@ -15,18 +15,23 @@ used, in about 1 MiB of memory instead of about 100.
   (job `alloy`).
 - Logs: the systemd journal (read from its files, or through
   `journalctl --output=export` without feature `journal-files`),
-  every running Docker container's output, files named in `log` lines
-  and in file_sd JSON files (`__path__` may be a glob, `**` included),
+  every running Docker container's output, files from static targets
+  and from file_sd JSON files (`__path__` may be a glob, `**` included),
   network devices' syslog over UDP (RFC 3164).
-  A `level` label comes from the journal's priority or from a line's
-  first level word.
-- Prometheus's relabel rules for the series sent and for log lines'
-  labels (`metric_relabel`, `log_relabel`).
+  Labels from the journal's fields and syslog's header, for
+  `loki.relabel` and `loki.process` to shape.
+- Alloy's configuration: it reads `config.alloy` and does what its
+  components say (below), so either can run from the same file.
 - An OTLP/HTTP receiver that passes each request on unchanged to its
   signal's backend (Loki and Prometheus take OTLP themselves).
+- Alloy's HTTP server on `127.0.0.1:12345`: a status
+  page, `/metrics`, `/-/ready`, `/-/healthy`, `/-/reload`, and live
+  views of each sample and log line sent (`/debug/metrics`,
+  `/debug/logs`).
 - One thread around poll(2), and SNMP devices polled apart from it, so
   a dead one holds nothing up. Metrics Prometheus does not take wait on
-  disk (`state_dir/spool`, up to 2 hours and `spool_max_mb`) and are
+  disk (`<storage>/prometheus.remote_write.<name>`, up to 2 hours and
+  256 MiB) and are
   sent oldest first when it is back. An outage of Loki pauses the log
   sources, which resume from saved positions (journal cursor, Docker
   timestamp, file offset) once the lines are sent.
@@ -39,10 +44,10 @@ cargo test
 ```
 
 Each part a host may lack is a cargo feature, all on by default:
-`docker` (containers' metrics and logs), `minecraft` (servers' plugins
-in containers; needs `docker`), `journal` (through journalctl),
-`journal-files` (from the files, without journalctl), `filesystems`
-(btrfs, XFS, ZFS), `snmp`, `syslog`, `relabel`, `otlp`. Off by
+`docker` (containers' metrics and logs), `journal` (through
+journalctl), `journal-files` (from the files, without journalctl),
+`filesystems` (btrfs, XFS, ZFS), `snmp`, `syslog`, `otlp`, `server`. Off
+by
 default: `journal-xz` (fields journald compressed with xz, before
 systemd 246), `tokio` (SNMP devices polled by tasks on one thread
 instead of a thread each). A smaller build:
@@ -55,17 +60,42 @@ for each host's architecture.
 
 ## Run
 
+Alloy's command line, for the flags it shares:
+
 ```bash
-host-agent /etc/host-agent/config          # the agent
-host-agent --print /etc/host-agent/config  # one round of metrics, sent nowhere
-kill -HUP <pid>                            # read the configuration again
+host-agent run /etc/host-agent/config.alloy   # the agent
+host-agent run --server.http.listen-addr=127.0.0.1:12345 \
+  --storage.path=/var/lib/host-agent config.d/   # a directory of *.alloy
+host-agent --print config.alloy   # one round of metrics, sent nowhere
+kill -HUP <pid>                   # read the configuration again
 ```
 
-The configuration format, with an example, is at the top of
-[src/config.rs](src/config.rs); `HOST_AGENT_CONFIG`, when set, holds its
-text instead of the file. Positions are kept in `state_dir/positions`.
-It runs as root: the journal, Docker's socket and the containers'
-`/proc` need it.
+Alloy's other flags are warned of and ignored. `HOST_AGENT_CONFIG`,
+when set, holds the configuration's text instead of the file. Positions
+are kept in `<storage>/positions`. It runs as root: the journal,
+Docker's socket and the containers' `/proc` need it.
+
+## Configuration
+
+Alloy's syntax: blocks, attributes, references between components
+(`prometheus.remote_write.default.receiver`), `sys.env`, `constants.*`,
+`string.format`, `string.join`, `coalesce`, `array.concat`. Components:
+
+- `prometheus.exporter.unix`, `.self`, `.cadvisor`, `.snmp`;
+  `prometheus.scrape`, `prometheus.relabel`, `prometheus.remote_write`;
+- `discovery.docker`, `discovery.file`, `discovery.relabel`;
+- `loki.source.journal`, `.file`, `.docker`, `.syslog` (UDP, RFC
+  3164); `loki.relabel`, `loki.write`, `loki.process` with the stages
+  `regex`, `template`, `replace`, `labels`, `static_labels`,
+  `label_drop`, `label_keep`, `drop`, `json`, `logfmt`, `timestamp`
+  (UTC), `output`, `match`;
+- `otelcol.receiver.otlp` into `otelcol.exporter.otlphttp` (passed on
+  unchanged; `otelcol.processor.batch` in between is let through).
+
+What it cannot do as Alloy would (another component, attribute or
+block, a second journal, Docker or OTLP receiver source) is refused
+with its position in the file, never ignored. `logging`,
+`livedebugging` and `tracing` are accepted and ignored.
 
 ## Docker
 
@@ -84,8 +114,9 @@ docker run -d --name host-agent --restart unless-stopped \
   -e HOST_AGENT_CONFIG="$(cat config)" host-agent:local
 ```
 
-The configuration says `root /host/root`: every host path (`/proc`,
+`prometheus.exporter.unix` says `rootfs_path = "/host/root"`: every
+host path (`/proc`,
 `/sys`, `/run`, `/etc`, log files) is read under it, as node_exporter's
 `--path.rootfs`; in an LXC that keeps lxcfs's `/proc`. It needs no
 privileges. The journal is read from the host's files under it; a
-host without systemd names its syslog file in a `log` line.
+host without systemd reads its syslog file by `loki.source.file`.

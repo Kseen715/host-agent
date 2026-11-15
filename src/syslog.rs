@@ -1,16 +1,14 @@
-//! Network devices' syslog over UDP, as Alloy's loki.source.syslog in
-//! RFC 3164 format with the homelab's relabel rules: lines from the
-//! listed devices only, `host` the device's name, `app` the sender's tag
-//! and `level` the journal's word for the severity. A BSD timestamp has
-//! no year and no time zone, so lines keep their arrival time.
+//! loki.source.syslog's UDP listener in RFC 3164 format: each line
+//! with the `__syslog_*` labels Alloy gives it, for the source's rules.
+//! A BSD timestamp has no year and no time zone, so lines keep their
+//! arrival time.
 
-use crate::levels::PRIORITIES;
-use crate::loki::Loki;
+use crate::logs::{Logs, Source};
 use crate::parts::Part;
 use crate::state::Positions;
 use crate::time;
 use std::io;
-use std::net::{IpAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Instant;
 
@@ -19,22 +17,59 @@ const MAX_LENGTH: usize = 8192;
 /// Datagrams read per wake: other sources wait meanwhile.
 const READ_AT_ONCE: usize = 256;
 
+/// RFC 5424's words for the severities 0 to 7, as Alloy's labels have
+/// them.
+const SEVERITIES: [&str; 8] = [
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warning",
+    "notice",
+    "informational",
+    "debug",
+];
+
+const FACILITIES: [&str; 24] = [
+    "kern",
+    "user",
+    "mail",
+    "daemon",
+    "auth",
+    "syslog",
+    "lpr",
+    "news",
+    "uucp",
+    "cron",
+    "authpriv",
+    "ftp",
+    "ntp",
+    "security",
+    "console",
+    "solaris-cron",
+    "local0",
+    "local1",
+    "local2",
+    "local3",
+    "local4",
+    "local5",
+    "local6",
+    "local7",
+];
+
 pub struct Syslog {
     socket: UdpSocket,
-    devices: Vec<(String, IpAddr)>,
+    source: Source,
     buf: Vec<u8>,
 }
 
 impl Syslog {
-    pub fn bind(
-        port: u16,
-        devices: Vec<(String, IpAddr)>,
-    ) -> io::Result<Syslog> {
-        let socket = UdpSocket::bind(("0.0.0.0", port))?;
+    pub fn bind(address: &str, source: Source) -> io::Result<Syslog> {
+        let socket = UdpSocket::bind(address)?;
         socket.set_nonblocking(true)?;
         Ok(Syslog {
             socket,
-            devices,
+            source,
             buf: vec![0; MAX_LENGTH],
         })
     }
@@ -45,9 +80,9 @@ impl Part for Syslog {
         vec![self.socket.as_raw_fd()]
     }
 
-    fn read(&mut self, _index: usize, loki: &mut Loki, _p: &mut Positions) {
+    fn read(&mut self, _index: usize, logs: &mut Logs, _p: &mut Positions) {
         for _ in 0..READ_AT_ONCE {
-            if loki.blocked(Instant::now()) {
+            if logs.blocked(Instant::now()) {
                 return;
             }
             let (length, from) = match self.socket.recv_from(&mut self.buf) {
@@ -60,27 +95,32 @@ impl Part for Syslog {
                     return;
                 }
             };
-            let device = self.devices.iter().find(|(_, ip)| *ip == from.ip());
-            let Some((name, _)) = device else {
+            let datagram = String::from_utf8_lossy(&self.buf[..length]);
+            let Some(message) = parse(&datagram) else {
                 continue;
             };
-            let datagram = String::from_utf8_lossy(&self.buf[..length]);
-            if let Some(message) = parse(&datagram) {
-                let labels = [
-                    ("job", "syslog"),
-                    ("host", name.as_str()),
-                    ("app", message.app),
-                    ("level", message.level),
-                ];
-                loki.add(&labels, time::now_ns(), message.text);
-            }
+            let label = |name: &str, value: &str| {
+                (format!("__syslog_{name}"), value.to_owned())
+            };
+            let labels = vec![
+                label("connection_ip_address", &from.ip().to_string()),
+                label("message_severity", message.severity),
+                label("message_facility", message.facility),
+                label("message_hostname", message.hostname),
+                label("message_app_name", message.app),
+                label("message_proc_id", message.pid),
+            ];
+            self.source.emit(logs, labels, time::now_ns(), message.text);
         }
     }
 }
 
 struct Message<'a> {
-    level: &'static str,
+    severity: &'static str,
+    facility: &'static str,
+    hostname: &'a str,
     app: &'a str,
+    pid: &'a str,
     text: &'a str,
 }
 
@@ -90,12 +130,18 @@ fn parse(datagram: &str) -> Option<Message<'_>> {
     let (priority, rest) = datagram.strip_prefix('<')?.split_once('>')?;
     let priority: u8 = priority.parse().ok()?;
     let rest = after_timestamp(rest);
-    let after_host = rest.split_once(' ').map(|(_, after)| after);
-    let (app, text) =
-        tag(rest).or_else(|| tag(after_host?)).unwrap_or(("", rest));
+    let (host, after_host) = rest.split_once(' ').unwrap_or(("", rest));
+    let (hostname, (app, pid, text)) = match tag(rest) {
+        Some(tagged) => ("", tagged),
+        None => (host, tag(after_host).unwrap_or(("", "", rest))),
+    };
+    let text = if app.is_empty() { rest } else { text };
     Some(Message {
-        level: PRIORITIES[usize::from(priority & 7)],
+        severity: SEVERITIES[usize::from(priority & 7)],
+        facility: FACILITIES.get(usize::from(priority >> 3)).unwrap_or(&""),
+        hostname: if app.is_empty() { "" } else { hostname },
         app,
+        pid,
         text,
     })
 }
@@ -118,15 +164,16 @@ fn after_timestamp(rest: &str) -> &str {
     }
 }
 
-/// `tag[pid]: text` as the tag and the text; None if `rest` does not
-/// start with one.
-fn tag(rest: &str) -> Option<(&str, &str)> {
+/// `tag[pid]: text` as the tag, the pid and the text; None if `rest`
+/// does not start with one.
+fn tag(rest: &str) -> Option<(&str, &str, &str)> {
     let (head, text) = rest.split_once(':')?;
     if head.is_empty() || head.contains(' ') {
         return None;
     }
-    let app = head.split('[').next()?;
-    Some((app, text.strip_prefix(' ').unwrap_or(text)))
+    let (app, pid) = head.split_once('[').unwrap_or((head, ""));
+    let pid = pid.trim_end_matches(']');
+    Some((app, pid, text.strip_prefix(' ').unwrap_or(text)))
 }
 
 #[cfg(test)]
@@ -135,24 +182,29 @@ mod tests {
 
     fn fields(datagram: &str) -> (&'static str, &str, &str) {
         let m = parse(datagram).unwrap();
-        (m.level, m.app, m.text)
+        (m.severity, m.app, m.text)
     }
 
     #[test]
     fn reads_bsd_syslog() {
         assert_eq!(
             fields("<30>Nov 15 02:36:24 ndhcps: sending ACK. "),
-            ("info", "ndhcps", "sending ACK. ")
+            ("informational", "ndhcps", "sending ACK. ")
         );
         assert_eq!(
             fields("<27>Nov  5 02:36:24 keenetic ndm: Core::Syslog: x"),
-            ("err", "ndm", "Core::Syslog: x")
+            ("error", "ndm", "Core::Syslog: x")
         );
         assert_eq!(
             fields("<12>2026-11-15T02:36:24Z dropbear[42]: login"),
             ("warning", "dropbear", "login")
         );
-        assert_eq!(fields("<14>just text"), ("info", "", "just text"));
+        assert_eq!(fields("<14>just text"), ("informational", "", "just text"));
+        let m = parse("<27>Nov  5 02:36:24 keenetic ndm[7]: x").unwrap();
+        assert_eq!(
+            (m.hostname, m.pid, m.facility),
+            ("keenetic", "7", "daemon")
+        );
         assert!(parse("no priority").is_none());
     }
 }

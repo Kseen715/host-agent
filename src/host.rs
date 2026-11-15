@@ -68,6 +68,18 @@ pub fn unescape(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// This host's name, as Alloy's `constants.hostname` gives it.
+pub fn hostname() -> String {
+    let mut name = [0u8; 256];
+    // SAFETY: the buffer is writable and its length is given.
+    let ok = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    if ok != 0 {
+        return String::new();
+    }
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    String::from_utf8_lossy(&name[..end]).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,17 +7,16 @@ description = "Pushes a host's metrics to Prometheus and its logs to Loki"
 license = "MIT"
 publish = false
 
-# Parts a host may go without, for a smaller binary. `minecraft` needs
-# `docker`: the plugins are found through the containers.
+# Parts a host may go without, for a smaller binary: a configuration
+# with a component of a part left out is refused.
 [features]
 default = [
     "docker",
     "filesystems",
     "journal",
     "journal-files",
-    "minecraft",
     "otlp",
-    "relabel",
+    "server",
     "snmp",
     "syslog",
 ]
@@ -29,9 +28,10 @@ journal = []
 journal-files = ["journal", "dep:lz4_flex", "dep:ruzstd"]
 # Fields journald compressed with xz, its default before systemd 246.
 journal-xz = ["journal-files", "dep:lzma-rs"]
-minecraft = ["docker"]
 otlp = []
-relabel = []
+# Alloy's HTTP server: a status page, the agent's own metrics, health,
+# reload and live views of what is sent.
+server = []
 snmp = []
 syslog = []
 # SNMP devices polled by tasks on one thread instead of a thread each.

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>host-agent: {host}</title>
+<style>
+:root {{ color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }}
+body {{ margin: 1rem auto; max-width: 60rem; padding: 0 1rem; }}
+table {{ border-collapse: collapse; width: 100%; }}
+td, th {{ border-bottom: 1px solid #8884; padding: .25rem .5rem;
+  text-align: left; vertical-align: top; }}
+.up {{ color: #2a7; }} .down {{ color: #d33; }}
+code {{ font-size: 90%; }}
+</style>
+<h1>host-agent on {host}</h1>
+<p>Version {version} ({revision}), configuration {loaded}.</p>
+<p>Metrics to <code>{metrics_url}</code>: {samples} samples sent,
+  {failed} failed. Logs to <code>{loki}</code>: {sent} lines sent,
+  {dropped} dropped.</p>
+<h2>Targets, last round</h2>
+<table>
+<tr><th>Labels</th><th>Up</th><th>Samples</th><th>Took</th></tr>
+{rows}
+</table>
+<h2>Endpoints</h2>
+<ul>
+<li><a href="/metrics">/metrics</a>: the agent's own metrics</li>
+<li><a href="/debug/metrics">/debug/metrics</a>: each sample as it is
+  sent, live</li>
+<li><a href="/debug/logs">/debug/logs</a>: each log line as it is sent,
+  live</li>
+<li><a href="/-/ready">/-/ready</a>, <a href="/-/healthy">/-/healthy</a>;
+  <code>POST /-/reload</code> reads the configuration again</li>
+</ul>
+</html>

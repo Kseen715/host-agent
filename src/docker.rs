@@ -1,15 +1,14 @@
 //! Docker's containers, from its API on the local socket: the list
-//! every round (for their metrics, their logs and the Minecraft
-//! servers' addresses) and one log stream per running container.
+//! every round (cAdvisor's metrics, discovery.docker's targets) and,
+//! for loki.source.docker, one log stream per container it targets.
 
-use crate::config::Minecraft;
-use crate::http::{self, Dechunk, Url};
+use crate::http::{self, Dechunk};
 use crate::json::Json;
-use crate::levels;
-use crate::loki::Loki;
+use crate::logs::{Logs, Source};
 use crate::parts::Part;
-use crate::remote::Writer;
+use crate::relabel::Labels;
 use crate::state::Positions;
+use crate::targets::{self, Targets};
 use crate::time;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -18,17 +17,15 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 pub const SOCKET: &str = "/var/run/docker.sock";
-const COMPOSE: &str = "com.docker.compose.";
 
 pub struct Container {
     pub id: String,
     pub name: String,
     pub image: String,
-    pub project: String,
-    pub service: String,
-    pub ips: Vec<String>,
-    /// Ports the container exposes, inside it.
-    pub ports: Vec<u16>,
+    pub network_mode: String,
+    /// Each network's name, id and the container's address there.
+    pub networks: Vec<[String; 3]>,
+    pub ports: Vec<Port>,
     /// Its labels as cAdvisor gives them: `container_label_<key>` with
     /// `[^a-zA-Z0-9_]` as `_`.
     pub labels: Vec<(String, String)>,
@@ -36,6 +33,14 @@ pub struct Container {
     /// cAdvisor's container_health_state: 1 healthy, -1 no check, else 0.
     pub health: f64,
     pub details: Details,
+}
+
+/// A port the container exposes, and where it is published.
+pub struct Port {
+    pub private: u16,
+    pub public: Option<u16>,
+    pub public_ip: String,
+    pub tcp: bool,
 }
 
 /// What only inspecting a container tells: asked once per container.
@@ -50,41 +55,80 @@ pub struct Docker {
     socket: PathBuf,
     details: HashMap<String, Details>,
     pub containers: Vec<Container>,
+    /// Whether Docker answered the last listing.
+    pub up: bool,
+    /// loki.source.docker's targets and what it does with lines.
+    logs: Option<(Targets, Source)>,
     streams: Vec<LogStream>,
     /// Containers started after this are read from their start.
     since_ns: i64,
-    minecraft: Vec<Minecraft>,
 }
 
 impl Docker {
-    /// None where Docker does not run.
-    pub fn new(minecraft: Vec<Minecraft>) -> Option<Docker> {
-        let socket = PathBuf::from(SOCKET);
-        socket.exists().then(|| Docker {
-            socket,
+    /// Docker on its socket, whether it runs yet or not.
+    pub fn new(logs: Option<(Targets, Source)>) -> Docker {
+        Docker {
+            socket: PathBuf::from(SOCKET),
             details: HashMap::new(),
             containers: Vec::new(),
+            up: false,
+            logs,
             streams: Vec::new(),
             since_ns: time::now_ns(),
-            minecraft,
-        })
+        }
     }
 
-    /// Lists the running containers; true if Docker answered.
-    pub fn refresh(&mut self) -> bool {
+    /// Lists the running containers.
+    pub fn refresh(&mut self) {
         match self.list() {
             Ok(containers) => {
                 self.details
                     .retain(|id, _| containers.iter().any(|c| &c.id == id));
                 self.containers = containers;
-                true
+                self.up = true;
             }
             Err(error) => {
-                eprintln!("Docker: {error}");
+                if self.up || self.containers.is_empty() {
+                    eprintln!("Docker: {error}");
+                }
                 self.containers.clear();
-                false
+                self.up = false;
             }
         }
+    }
+
+    /// discovery.docker's targets, as Prometheus's docker_sd makes
+    /// them: one per container, network and TCP port, or port 80 for
+    /// a container that exposes none.
+    pub fn targets(&self) -> Vec<Labels> {
+        let mut targets = Vec::new();
+        for c in &self.containers {
+            let mut common = vec![
+                ("__meta_docker_container_id".into(), c.id.clone()),
+                (
+                    "__meta_docker_container_name".into(),
+                    format!("/{}", c.name),
+                ),
+                (
+                    "__meta_docker_container_network_mode".into(),
+                    c.network_mode.clone(),
+                ),
+            ];
+            let labels = c
+                .labels
+                .iter()
+                .map(|(k, v)| (format!("__meta_docker_{k}"), v.clone()));
+            common.extend(labels);
+            for [name, id, ip] in &c.networks {
+                let mut network = common.clone();
+                network
+                    .push(("__meta_docker_network_name".into(), name.clone()));
+                network.push(("__meta_docker_network_id".into(), id.clone()));
+                network.push(("__meta_docker_network_ip".into(), ip.clone()));
+                targets.extend(port_targets(&network, ip, &c.ports));
+            }
+        }
+        targets
     }
 
     fn list(&mut self) -> io::Result<Vec<Container>> {
@@ -124,33 +168,61 @@ impl Docker {
         })
     }
 
-    /// Opens a log stream for each running container that has none and
-    /// forgets the positions of containers gone.
-    pub fn follow_logs(&mut self, loki: &mut Loki, positions: &mut Positions) {
-        self.streams
-            .retain(|s| self.containers.iter().any(|c| c.id == s.id));
+    /// The positions of containers no longer targeted, forgotten.
+    fn forget_gone(positions: &mut Positions, wanted: &[(String, Labels)]) {
         let before = positions.docker.len();
         positions
             .docker
-            .retain(|id, _| self.containers.iter().any(|c| &c.id == id));
+            .retain(|id, _| wanted.iter().any(|(w, _)| w == id));
         if positions.docker.len() != before {
             positions.touch();
         }
-        for container in &self.containers {
-            if self.streams.iter().any(|s| s.id == container.id) {
+    }
+
+    /// Each container targeted, by id, with its first target.
+    fn wanted(&self, targets: &Targets) -> Vec<(String, Labels)> {
+        let mut wanted: Vec<(String, Labels)> = Vec::new();
+        for target in targets.resolve(&self.targets()) {
+            let id = targets::get(&target, "__meta_docker_container_id");
+            if !id.is_empty() && !wanted.iter().any(|(w, _)| w == id) {
+                wanted.push((id.to_owned(), target));
+            }
+        }
+        wanted
+    }
+
+    /// Opens a log stream for each container targeted that has none,
+    /// and forgets the positions of containers gone.
+    pub fn follow_logs(&mut self, logs: &mut Logs, positions: &mut Positions) {
+        let Some((targets, source)) = &self.logs else {
+            return;
+        };
+        let wanted = self.wanted(targets);
+        self.streams
+            .retain(|s| wanted.iter().any(|(id, _)| *id == s.id));
+        Self::forget_gone(positions, &wanted);
+        for (id, target) in wanted {
+            let container = self.containers.iter().find(|c| c.id == id);
+            let Some(container) = container else {
+                continue;
+            };
+            if self.streams.iter().any(|s| s.id == id) {
                 continue;
             }
-            let since = positions.docker.get(&container.id).copied();
+            let Some(labels) = source.labels_for(target) else {
+                continue;
+            };
+            let since = positions.docker.get(&id).copied();
             let start = container.details.started_ns;
             let since = since.unwrap_or(if start > self.since_ns {
                 start - 1_000_000_000
             } else {
                 time::now_ns()
             });
-            match LogStream::open(&self.socket, container, since) {
+            match LogStream::open(&self.socket, container, since, labels) {
                 // Lines that came with the headers wait for no poll.
                 Ok(mut stream) => {
-                    if stream.read(loki, positions) {
+                    if stream.read(source, logs, positions) {
                         self.streams.push(stream);
                     }
                 }
@@ -166,13 +238,15 @@ impl Docker {
     pub fn read(
         &mut self,
         index: usize,
-        loki: &mut Loki,
+        logs: &mut Logs,
         positions: &mut Positions,
     ) {
-        let Some(stream) = self.streams.get_mut(index) else {
+        let (Some(stream), Some((_, source))) =
+            (self.streams.get_mut(index), &self.logs)
+        else {
             return;
         };
-        if !stream.read(loki, positions) {
+        if !stream.read(source, logs, positions) {
             self.streams.remove(index);
         }
     }
@@ -183,31 +257,60 @@ fn container(item: &Json, id: &str, details: Details) -> Container {
         value.and_then(Json::str).unwrap_or("").to_owned()
     };
     let labels = item.get("Labels");
-    let label = |key: &str| {
-        text(labels.and_then(|l| l.get(&format!("{COMPOSE}{key}"))))
-    };
     let name = item.get("Names").map(|n| n.arr()).and_then(<[Json]>::first);
     let networks = item.get("NetworkSettings").and_then(|n| n.get("Networks"));
-    let ips = networks.map(Json::obj).unwrap_or_default().iter();
-    let ips = ips.filter_map(|(_, net)| net.get("IPAddress")?.str());
+    let networks = networks.map(Json::obj).unwrap_or_default().iter();
+    let networks = networks.map(|(name, net)| {
+        let field = |key: &str| text(net.get(key));
+        [name.clone(), field("NetworkID"), field("IPAddress")]
+    });
     let ports = item.get("Ports").map(Json::arr).unwrap_or_default().iter();
-    let ports = ports.filter_map(|p| p.get("PrivatePort")?.num());
-    let mut ports: Vec<u16> = ports.map(|p| p as u16).collect();
-    ports.sort_unstable();
-    ports.dedup();
+    let ports = ports.filter_map(|p| {
+        Some(Port {
+            private: p.get("PrivatePort")?.num()? as u16,
+            public: p.get("PublicPort").and_then(Json::num).map(|n| n as u16),
+            public_ip: text(p.get("IP")),
+            tcp: p.get("Type").and_then(Json::str).unwrap_or("tcp") == "tcp",
+        })
+    });
+    let mode = item.get("HostConfig").and_then(|h| h.get("NetworkMode"));
     Container {
         id: id.to_owned(),
         name: text(name).trim_start_matches('/').to_owned(),
         image: text(item.get("Image")),
-        project: label("project"),
-        service: label("service"),
-        ips: ips.filter(|ip| !ip.is_empty()).map(str::to_owned).collect(),
-        ports,
+        network_mode: text(mode),
+        networks: networks.collect(),
+        ports: ports.collect(),
         labels: cadvisor_labels(labels.map(Json::obj).unwrap_or_default()),
         created: item.get("Created").and_then(Json::num).unwrap_or(0.0),
         health: health(item.get("Status").and_then(Json::str).unwrap_or("")),
         details,
     }
+}
+
+fn port_targets(network: &Labels, ip: &str, ports: &[Port]) -> Vec<Labels> {
+    let address =
+        |port: u16| ("__address__".to_owned(), format!("{ip}:{port}"));
+    let mut targets = Vec::new();
+    for port in ports.iter().filter(|p| p.tcp) {
+        let mut target = network.clone();
+        let private = port.private.to_string();
+        target.push(("__meta_docker_port_private".into(), private));
+        if let Some(public) = port.public {
+            let public = public.to_string();
+            target.push(("__meta_docker_port_public".into(), public));
+            let ip = port.public_ip.clone();
+            target.push(("__meta_docker_port_public_ip".into(), ip));
+        }
+        target.push(address(port.private));
+        targets.push(target);
+    }
+    if targets.is_empty() {
+        let mut target = network.clone();
+        target.push(address(80));
+        targets.push(target);
+    }
+    targets
 }
 
 fn cadvisor_labels(labels: &[(String, Json)]) -> Vec<(String, String)> {
@@ -248,7 +351,7 @@ fn get_json(socket: &Path, path: &str) -> io::Result<Json> {
 /// line that starts with its RFC 3339 time.
 struct LogStream {
     id: String,
-    labels: [(&'static str, String); 3],
+    labels: Labels,
     socket: UnixStream,
     tty: bool,
     raw: Vec<u8>,
@@ -263,6 +366,7 @@ impl LogStream {
         socket: &Path,
         container: &Container,
         since_ns: i64,
+        labels: Labels,
     ) -> io::Result<LogStream> {
         let mut stream = UnixStream::connect(socket)?;
         stream.set_read_timeout(Some(http::TIMEOUT))?;
@@ -281,11 +385,7 @@ impl LogStream {
         stream.set_nonblocking(true)?;
         Ok(LogStream {
             id: container.id.clone(),
-            labels: [
-                ("container", container.name.clone()),
-                ("compose_project", container.project.clone()),
-                ("compose_service", container.service.clone()),
-            ],
+            labels,
             socket: stream,
             tty: container.details.tty,
             raw,
@@ -296,7 +396,12 @@ impl LogStream {
     }
 
     /// Reads what arrived; false when the stream ended.
-    fn read(&mut self, loki: &mut Loki, positions: &mut Positions) -> bool {
+    fn read(
+        &mut self,
+        source: &Source,
+        logs: &mut Logs,
+        positions: &mut Positions,
+    ) -> bool {
         let mut chunk = [0; 16 << 10];
         let open = match self.socket.read(&mut chunk) {
             Ok(0) => false,
@@ -308,9 +413,9 @@ impl LogStream {
         };
         self.dechunk.feed(&mut self.raw, &mut self.data);
         let used = if self.tty {
-            self.take_lines(loki)
+            self.take_lines(source, logs)
         } else {
-            self.take_frames(loki)
+            self.take_frames(source, logs)
         };
         self.data.drain(..used);
         if positions.docker.get(&self.id) != Some(&self.last_ns) {
@@ -320,7 +425,7 @@ impl LogStream {
         open && !self.dechunk.done()
     }
 
-    fn take_frames(&mut self, loki: &mut Loki) -> usize {
+    fn take_frames(&mut self, source: &Source, logs: &mut Logs) -> usize {
         let mut at = 0;
         while let Some(header) = self.data.get(at..at + 8) {
             let size = u32::from_be_bytes([
@@ -333,25 +438,25 @@ impl LogStream {
             let payload =
                 String::from_utf8_lossy(&self.data[at + 8..end]).into_owned();
             for line in payload.lines() {
-                self.add(line, loki);
+                self.add(line, source, logs);
             }
             at = end;
         }
         at
     }
 
-    fn take_lines(&mut self, loki: &mut Loki) -> usize {
+    fn take_lines(&mut self, source: &Source, logs: &mut Logs) -> usize {
         let Some(end) = self.data.iter().rposition(|&b| b == b'\n') else {
             return 0;
         };
         let text = String::from_utf8_lossy(&self.data[..end]).into_owned();
         for line in text.lines() {
-            self.add(line.trim_end_matches('\r'), loki);
+            self.add(line.trim_end_matches('\r'), source, logs);
         }
         end + 1
     }
 
-    fn add(&mut self, line: &str, loki: &mut Loki) {
+    fn add(&mut self, line: &str, source: &Source, logs: &mut Logs) {
         let (stamp, text) = line.split_once(' ').unwrap_or((line, ""));
         let Some(ns) = time::parse_rfc3339(stamp) else {
             return;
@@ -360,15 +465,7 @@ impl LogStream {
             return;
         }
         self.last_ns = ns;
-        let [(k1, v1), (k2, v2), (k3, v3)] = &self.labels;
-        let labels = [
-            ("job", "docker"),
-            (*k1, v1.as_str()),
-            (*k2, v2.as_str()),
-            (*k3, v3.as_str()),
-            ("level", levels::level(text).unwrap_or("")),
-        ];
-        loki.add(&labels, ns, text);
+        source.send(logs, self.labels.clone(), ns, text);
     }
 }
 
@@ -396,47 +493,14 @@ fn read_head(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Containers' metrics under cAdvisor's job, the Minecraft plugins in
-/// them, and their logs.
+/// The containers' log streams.
 impl Part for Docker {
-    fn round(&mut self, w: &mut Writer, now_ms: i64) {
-        let up = self.refresh();
-        w.target("cadvisor", &[]);
-        w.up(up);
-        crate::agent::build_info(w, "cadvisor_build_info");
-        crate::containers::collect(w, &self.containers, now_ms as f64 / 1e3);
-        #[cfg(feature = "minecraft")]
-        self.minecraft(w);
-    }
-
-    fn follow(&mut self, loki: &mut Loki, positions: &mut Positions) {
-        self.follow_logs(loki, positions);
-    }
-
     fn fds(&self) -> Vec<RawFd> {
         self.streams.iter().map(|s| s.socket.as_raw_fd()).collect()
     }
 
-    fn read(&mut self, index: usize, loki: &mut Loki, p: &mut Positions) {
-        Docker::read(self, index, loki, p);
-    }
-}
-
-impl Docker {
-    /// Each server's plugin at the addresses of the service's containers
-    /// that expose the server's port.
-    #[cfg(feature = "minecraft")]
-    fn minecraft(&self, w: &mut Writer) {
-        for server in &self.minecraft {
-            let hosts = self.containers.iter().filter(|c| {
-                c.service == server.service && c.ports.contains(&server.port)
-            });
-            for ip in hosts.flat_map(|c| &c.ips) {
-                w.target("minecraft", &[("server", &server.server)]);
-                let address = format!("{ip}:{}", server.metrics_port);
-                crate::scrape::scrape(w, &Url::metrics(&address), &[]);
-            }
-        }
+    fn read(&mut self, index: usize, logs: &mut Logs, p: &mut Positions) {
+        Docker::read(self, index, logs, p);
     }
 }
 
@@ -462,11 +526,18 @@ mod tests {
         };
         let c = container(&json.arr()[0], "abc", details);
         assert_eq!(c.name, "crafty-crafty-1");
-        assert_eq!(
-            (c.project.as_str(), c.service.as_str()),
-            ("crafty", "crafty")
-        );
-        assert_eq!(c.ips, ["172.18.0.2"]);
-        assert_eq!(c.ports, [25565]);
+        let docker = Docker {
+            containers: vec![c],
+            ..Docker::new(None)
+        };
+        let targets = docker.targets();
+        assert_eq!(targets.len(), 2);
+        let get = |name| targets::get(&targets[0], name);
+        assert_eq!(get("__address__"), "172.18.0.2:25565");
+        assert_eq!(get("__meta_docker_container_name"), "/crafty-crafty-1");
+        let service =
+            "__meta_docker_container_label_com_docker_compose_service";
+        assert_eq!(get(service), "crafty");
+        assert_eq!(targets::get(&targets[1], "__meta_docker_port_public"), "1");
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::http::{self, Url};
 use crate::json::escape;
+use crate::relabel::Labels;
 use std::time::{Duration, Instant};
 
 const MAX_BATCH: usize = 256 << 10;
@@ -31,7 +32,10 @@ pub enum Flushed {
 pub struct Loki {
     url: Url,
     pub address: String,
-    host: String,
+    /// Its component's label: `central` of loki.write "central".
+    pub name: String,
+    /// Set on each line that lacks them.
+    external: Labels,
     streams: Vec<Stream>,
     bytes: usize,
     first: Option<Instant>,
@@ -39,17 +43,17 @@ pub struct Loki {
     backoff: Duration,
     pub sent: u64,
     pub dropped: u64,
-    #[cfg(feature = "relabel")]
-    pub rules: Vec<crate::relabel::Rule>,
+    pub tap: crate::tap::Tap,
 }
 
 impl Loki {
-    pub fn new(url_text: &str, host: &str) -> Option<Loki> {
+    pub fn new(url_text: &str, name: &str, external: Labels) -> Option<Loki> {
         let url = Url::parse(url_text)?;
         Some(Loki {
             address: url.authority.clone(),
             url,
-            host: host.to_owned(),
+            name: name.to_owned(),
+            external,
             streams: Vec::new(),
             bytes: 0,
             first: None,
@@ -57,30 +61,16 @@ impl Loki {
             backoff: Duration::ZERO,
             sent: 0,
             dropped: 0,
-            #[cfg(feature = "relabel")]
-            rules: Vec::new(),
+            tap: crate::tap::Tap::default(),
         })
     }
 
-    /// One line, after `log_relabel`. Labels with empty values are left
-    /// out; `host` is added unless the line has its own (a network
-    /// device's).
-    pub fn add(&mut self, labels: &[(&str, &str)], ns: i64, line: &str) {
-        #[cfg(feature = "relabel")]
-        let relabeled;
-        #[cfg(feature = "relabel")]
-        let labels = if self.rules.is_empty() {
-            labels
-        } else {
-            let mut owned = crate::remote::owned(labels);
-            if !crate::relabel::apply(&self.rules, &mut owned) {
-                return;
-            }
-            relabeled = owned;
-            let pairs = relabeled.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-            &pairs.collect::<Vec<_>>()
-        };
+    /// One line. Labels with empty values are left out.
+    pub fn add(&mut self, labels: &Labels, ns: i64, line: &str) {
         let key = self.key(labels);
+        if self.tap.is_open() {
+            self.tap.line(&format!("{key} {line}"));
+        }
         let index = match self.streams.iter().position(|s| s.labels == key) {
             Some(index) => index,
             None => {
@@ -106,14 +96,14 @@ impl Loki {
         self.first.get_or_insert_with(Instant::now);
     }
 
-    fn key(&self, labels: &[(&str, &str)]) -> String {
+    fn key(&self, labels: &Labels) -> String {
         let mut all: Vec<(&str, &str)> = labels
             .iter()
+            .chain(&self.external)
             .filter(|(_, value)| !value.is_empty())
-            .copied()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        all.push(("host", &self.host));
-        // Stable: of two `host`s, the line's own comes first and stays.
+        // Stable: of two, the line's own comes first and stays.
         all.sort_by(|a, b| a.0.cmp(b.0));
         all.dedup_by(|a, b| a.0 == b.0);
         let mut key = String::from("{");
@@ -219,10 +209,18 @@ mod tests {
 
     #[test]
     fn groups_lines_by_labels() {
-        let mut loki = Loki::new("http://127.0.0.1:1/push", "h").unwrap();
-        loki.add(&[("job", "docker"), ("level", "")], 1, "a \"q\"");
-        loki.add(&[("job", "journal")], 2, "b");
-        loki.add(&[("job", "docker")], 3, "c");
+        let host = vec![("host".into(), "h".into())];
+        let mut loki =
+            Loki::new("http://127.0.0.1:1/push", "central", host).unwrap();
+        let labels = |pairs: &[(&str, &str)]| -> Labels {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        loki.add(&labels(&[("job", "docker"), ("level", "")]), 1, "a \"q\"");
+        loki.add(&labels(&[("job", "journal")]), 2, "b");
+        loki.add(&labels(&[("job", "docker")]), 3, "c");
         let body = Json::parse(&loki.body()).unwrap();
         let streams = body.get("streams").unwrap().arr();
         assert_eq!(streams.len(), 2);

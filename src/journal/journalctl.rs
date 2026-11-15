@@ -5,10 +5,9 @@
 
 use super::{Fields, deliver};
 use crate::host;
-use crate::loki::Loki;
+use crate::logs::{Logs, Source};
 use crate::parts::Part;
 use crate::state::Positions;
-use regex_lite::Regex;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -23,8 +22,8 @@ pub struct Journal {
     read_any: bool,
     buf: Vec<u8>,
     restart_at: Instant,
-    max_age: String,
-    drops: Vec<Regex>,
+    max_age: Duration,
+    source: Source,
 }
 
 /// An entry's cursor and the fields sent.
@@ -36,14 +35,14 @@ struct Entry<'a> {
 
 impl Journal {
     /// None on a host without systemd.
-    pub fn new(max_age: &str, drops: Vec<Regex>) -> Option<Journal> {
+    pub fn new(max_age: Duration, source: Source) -> Option<Journal> {
         host::path("/run/systemd/system").is_dir().then(|| Journal {
             child: None,
             read_any: false,
             buf: Vec::new(),
             restart_at: Instant::now(),
-            max_age: max_age.to_owned(),
-            drops,
+            max_age,
+            source,
         })
     }
 
@@ -60,7 +59,9 @@ impl Journal {
         command.args(["--follow", "--output=export", "--no-pager"]);
         match cursor {
             Some(cursor) => command.arg(format!("--after-cursor={cursor}")),
-            None => command.arg(format!("--since=-{}", self.max_age)),
+            None => {
+                command.arg(format!("--since=-{}s", self.max_age.as_secs()))
+            }
         };
         command.stdin(Stdio::null()).stdout(Stdio::piped());
         match command.spawn() {
@@ -77,8 +78,8 @@ impl Journal {
         }
     }
 
-    /// Reads what journalctl wrote and adds its whole entries to `loki`.
-    pub fn read(&mut self, loki: &mut Loki, positions: &mut Positions) {
+    /// Reads what journalctl wrote and sends its whole entries.
+    pub fn read(&mut self, logs: &mut Logs, positions: &mut Positions) {
         let Some((_, stdout)) = &mut self.child else {
             return;
         };
@@ -98,7 +99,7 @@ impl Journal {
         if ended {
             self.stopped(positions);
         }
-        self.take_entries(loki, positions);
+        self.take_entries(logs, positions);
     }
 
     /// A journalctl that failed before its first entry may have been
@@ -117,7 +118,7 @@ impl Journal {
         self.restart_at = Instant::now() + RESTART_AFTER;
     }
 
-    fn take_entries(&mut self, loki: &mut Loki, positions: &mut Positions) {
+    fn take_entries(&mut self, logs: &mut Logs, positions: &mut Positions) {
         let mut at = 0;
         while let Some((entry, used)) = parse_entry(&self.buf[at..]) {
             at += used;
@@ -127,7 +128,7 @@ impl Journal {
                 positions.journal = Some(cursor);
                 positions.touch();
             }
-            deliver(&self.drops, &entry.fields, loki);
+            deliver(&self.source, &entry.fields, logs);
         }
         self.buf.drain(..at);
         if self.buf.capacity() > 4 * READ_AT_ONCE
@@ -147,8 +148,8 @@ impl Part for Journal {
         self.fd().into_iter().collect()
     }
 
-    fn read(&mut self, _index: usize, loki: &mut Loki, p: &mut Positions) {
-        Journal::read(self, loki, p);
+    fn read(&mut self, _index: usize, logs: &mut Logs, p: &mut Positions) {
+        Journal::read(self, logs, p);
     }
 }
 
@@ -201,10 +202,8 @@ fn parse_entry(buf: &[u8]) -> Option<(Entry<'_>, usize)> {
                 let text = std::str::from_utf8(value).ok();
                 entry.fields.realtime_us = text.and_then(|t| t.parse().ok());
             }
-            b"MESSAGE" => entry.fields.message = Some(value),
-            b"PRIORITY" => entry.fields.priority = Some(value),
-            b"_SYSTEMD_UNIT" => entry.fields.unit = Some(value),
-            _ => {}
+            name if name.starts_with(b"__") => {}
+            name => entry.fields.pairs.push((name, value)),
         }
     }
 }
@@ -221,8 +220,9 @@ mod tests {
         wire.extend_from_slice(b"a\nb\nPRIORITY=3\n\nMESSAGE=next\n");
         let (entry, used) = parse_entry(&wire).unwrap();
         assert_eq!(entry.cursor, Some(&b"s=1"[..]));
-        assert_eq!(entry.fields.message, Some(&b"a\nb"[..]));
-        assert_eq!(entry.fields.priority, Some(&b"3"[..]));
+        let message = (&b"MESSAGE"[..], &b"a\nb"[..]);
+        let priority = (&b"PRIORITY"[..], &b"3"[..]);
+        assert_eq!(entry.fields.pairs, [message, priority]);
         assert!(parse_entry(&wire[used..]).is_none(), "not whole yet");
         for cut in 0..used {
             assert!(parse_entry(&wire[..cut]).is_none(), "cut at {cut}");

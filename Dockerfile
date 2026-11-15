@@ -7,7 +7,9 @@ FROM --platform=$BUILDPLATFORM rust:1.100.0-alpine3.22 AS build
 ARG TARGETARCH
 # Cargo features, comma-separated: the parts this host needs.
 ARG FEATURES=default
-ENV RUSTFLAGS="-C linker=rust-lld"
+# build_info's revision: the sources come here without git.
+ARG REVISION=unknown
+ENV RUSTFLAGS="-C linker=rust-lld" HOST_AGENT_REVISION=$REVISION
 WORKDIR /src
 RUN case "$TARGETARCH" in \
       amd64) echo x86_64-unknown-linux-musl ;; \
@@ -16,7 +18,7 @@ RUN case "$TARGETARCH" in \
     esac > /target && rustup target add "$(cat /target)"
 # The crates first, in a layer of their own: a change to the sources
 # does not fetch and build them again.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked --target "$(cat /target)" \
        --no-default-features --features "$FEATURES" && rm -r src

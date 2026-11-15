@@ -1,14 +1,7 @@
-//! Prometheus's relabel rules (relabel_config), for series before they
-//! are sent (`metric_relabel`, as a scrape's metric_relabel_configs)
-//! and for log lines' labels (`log_relabel`, as loki.relabel). A rule
-//! is a line: the action, then `key=value` settings, `regex=` last as
-//! it may hold spaces:
-//!
-//! ```text
-//! metric_relabel drop source_labels=__name__ regex=go_.*
-//! metric_relabel labelmap regex=__meta_(.+)
-//! log_relabel labeldrop regex=filename
-//! ```
+//! Prometheus's relabel rules (relabel_config), as Alloy's `rule`
+//! blocks give them: for targets (discovery.relabel), series
+//! (prometheus.relabel) and log lines' labels (loki.relabel and the
+//! sources' relabel_rules).
 
 use regex_lite::Regex;
 
@@ -17,6 +10,8 @@ enum Action {
     Replace,
     Keep,
     Drop,
+    KeepEqual,
+    DropEqual,
     LabelMap,
     LabelKeep,
     LabelDrop,
@@ -36,53 +31,67 @@ pub struct Rule {
 /// A label set as a rule sees it.
 pub type Labels = Vec<(String, String)>;
 
+/// A rule's settings, Alloy's defaults where not given.
+pub struct Settings {
+    pub action: String,
+    pub sources: Vec<String>,
+    pub separator: String,
+    pub regex: String,
+    pub target: String,
+    pub replacement: String,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            action: "replace".into(),
+            sources: Vec::new(),
+            separator: ";".into(),
+            regex: "(.*)".into(),
+            target: String::new(),
+            replacement: "$1".into(),
+        }
+    }
+}
+
 impl Rule {
-    /// A rule from the words after its key; `regex=` takes the rest.
-    pub fn parse(value: &str) -> Result<Rule, String> {
-        let (settings, regex) = match value.split_once(" regex=") {
-            Some((settings, regex)) => (settings, regex),
-            None => (value, "(.*)"),
-        };
-        let mut words = settings.split_whitespace();
-        let action = match words.next().unwrap_or_default() {
+    pub fn new(settings: Settings) -> Result<Rule, String> {
+        let action = match settings.action.to_lowercase().as_str() {
             "replace" => Action::Replace,
             "keep" => Action::Keep,
             "drop" => Action::Drop,
+            "keepequal" => Action::KeepEqual,
+            "dropequal" => Action::DropEqual,
             "labelmap" => Action::LabelMap,
             "labelkeep" => Action::LabelKeep,
             "labeldrop" => Action::LabelDrop,
             "lowercase" => Action::Lowercase,
             "uppercase" => Action::Uppercase,
-            other => return Err(format!("no relabel action `{other}`")),
-        };
-        let regex = Regex::new(&format!("^(?:{regex})$"))
-            .map_err(|e| format!("regex: {e}"))?;
-        let mut rule = Rule {
-            action,
-            sources: Vec::new(),
-            separator: ";".into(),
-            regex,
-            target: String::new(),
-            replacement: "$1".into(),
-        };
-        for word in words {
-            rule.set(word)?;
-        }
-        Ok(rule)
-    }
-
-    fn set(&mut self, word: &str) -> Result<(), String> {
-        let (key, value) = word.split_once('=').unwrap_or((word, ""));
-        match key {
-            "source_labels" => {
-                self.sources = value.split(',').map(str::to_owned).collect();
+            other => {
+                return Err(format!("relabel action `{other}` unsupported"));
             }
-            "separator" => self.separator = value.into(),
-            "target_label" => self.target = value.into(),
-            "replacement" => self.replacement = value.into(),
-            _ => return Err(format!("cannot read `{word}`")),
+        };
+        let regex = Regex::new(&format!("^(?:{})$", settings.regex))
+            .map_err(|e| format!("regex: {e}"))?;
+        let needs_target = matches!(
+            action,
+            Action::Replace
+                | Action::KeepEqual
+                | Action::DropEqual
+                | Action::Lowercase
+                | Action::Uppercase
+        );
+        if needs_target && settings.target.is_empty() {
+            return Err(format!("`{}` needs target_label", settings.action));
         }
-        Ok(())
+        Ok(Rule {
+            action,
+            sources: settings.sources,
+            separator: settings.separator,
+            regex,
+            target: settings.target,
+            replacement: settings.replacement,
+        })
     }
 
     /// Applies the rule; false if the series or line is dropped.
@@ -96,6 +105,8 @@ impl Rule {
         match self.action {
             Action::Keep => return self.regex.is_match(&value),
             Action::Drop => return !self.regex.is_match(&value),
+            Action::KeepEqual => return get(&self.target) == value,
+            Action::DropEqual => return get(&self.target) != value,
             Action::Replace => {
                 if let Some(captures) = self.regex.captures(&value) {
                     let mut target = String::new();
@@ -157,16 +168,28 @@ mod tests {
             .collect()
     }
 
+    fn rule(action: &str, sources: &str, target: &str, regex: &str) -> Rule {
+        let mut settings = Settings {
+            action: action.into(),
+            sources: sources.split(',').map(str::to_owned).collect(),
+            target: target.into(),
+            ..Settings::default()
+        };
+        settings.sources.retain(|s| !s.is_empty());
+        if !regex.is_empty() {
+            settings.regex = regex.into();
+        }
+        Rule::new(settings).unwrap()
+    }
+
     #[test]
     fn applies_like_prometheus() {
         let rules = [
-            "drop source_labels=__name__ regex=go_.*",
-            "replace source_labels=instance target_label=node \
-             regex=(.*):\\d+",
-            "labeldrop regex=job",
-            "uppercase source_labels=node target_label=NODE",
-        ]
-        .map(|rule| Rule::parse(rule).unwrap());
+            rule("drop", "__name__", "", "go_.*"),
+            rule("replace", "instance", "node", "(.*):\\d+"),
+            rule("labeldrop", "", "", "job"),
+            rule("uppercase", "node", "NODE", ""),
+        ];
         let mut kept = labels(&[
             ("__name__", "up"),
             ("instance", "mc-01:9100"),
@@ -186,12 +209,18 @@ mod tests {
         let mut dropped = labels(&[("__name__", "go_goroutines")]);
         assert!(!apply(&rules, &mut dropped));
 
-        let keep = Rule::parse("keep source_labels=a,b regex=x;y").unwrap();
+        let keep = rule("keep", "a,b", "", "x;y");
         assert!(apply(&[keep], &mut labels(&[("a", "x"), ("b", "y")])));
-        let map = Rule::parse("labelmap regex=__meta_(.+)").unwrap();
+        let map = rule("labelmap", "", "", "__meta_(.+)");
         let mut mapped = labels(&[("__meta_zone", "home")]);
         assert!(apply(&[map], &mut mapped));
         assert!(mapped.contains(&("zone".into(), "home".into())));
-        assert!(Rule::parse("hashmod").is_err());
+        let equal = rule("keepequal", "a", "b", "");
+        assert!(apply(&[equal], &mut labels(&[("a", "1"), ("b", "1")])));
+        let settings = Settings {
+            action: "hashmod".into(),
+            ..Settings::default()
+        };
+        assert!(Rule::new(settings).is_err());
     }
 }

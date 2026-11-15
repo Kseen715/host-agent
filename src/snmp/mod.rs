@@ -1,16 +1,14 @@
 //! Network devices polled over SNMP v2c, as Alloy's
-//! prometheus.exporter.snmp with snmp_exporter's modules: job `snmp`,
-//! the device's name in `instance` and `host`, the MIB's names for the
-//! metrics and, for text, a label of the metric's name with value 1.
-//! Each device is polled once an interval apart from the round, so a
-//! slow or dead one holds up nothing: a round sends each device's
-//! latest poll.
+//! prometheus.exporter.snmp with snmp_exporter's modules: the MIB's
+//! names for the metrics and, for text, a label of the metric's name
+//! with value 1. Each device is polled once a scrape interval apart from
+//! the scrapes, so a slow or dead one holds up nothing: a scrape sends
+//! the poll that ended since the last, stamped with its own start and
+//! duration, or nothing.
 
 mod ber;
 mod transport;
 
-use crate::config::Device;
-use crate::parts::Part;
 use crate::remote::Writer;
 use ber::{Client, Value};
 use std::collections::HashMap;
@@ -18,72 +16,90 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+/// A network device polled over SNMP v2c.
+pub struct Device {
+    pub name: String,
+    pub address: String,
+    pub community: String,
+    pub modules: Vec<String>,
+}
+
 /// A device's index and its poll.
-type Polled = (usize, io::Result<Samples>);
+type Polled = (usize, Poll);
+
+pub struct Poll {
+    at_ms: i64,
+    took: Duration,
+    samples: io::Result<Samples>,
+}
 
 pub struct Snmp {
     names: Vec<String>,
-    polls: Receiver<Polled>,
-    latest: Vec<Option<io::Result<Samples>>>,
+    /// Until the first scrape starts their polls.
+    devices: Vec<Device>,
+    polls: Option<Receiver<Polled>>,
+    /// Each device's poll not yet sent.
+    latest: Vec<Option<Poll>>,
     /// One round only (--print): it waits for every device's first poll.
     wait: bool,
 }
 
 impl Snmp {
-    pub fn new(
-        devices: Vec<Device>,
-        interval: Duration,
-        wait: bool,
-    ) -> Result<Snmp, String> {
+    pub fn new(devices: Vec<Device>, wait: bool) -> Result<Snmp, String> {
         let names = devices.iter().flat_map(|d| &d.modules);
         if let Some(name) = names.into_iter().find(|n| module(n).is_none()) {
             return Err(format!("no SNMP module `{name}`"));
         }
-        let names: Vec<String> =
-            devices.iter().map(|d| d.name.clone()).collect();
-        let (sender, polls) = mpsc::channel();
-        start(devices, interval, sender)
-            .map_err(|e| format!("SNMP pollers: {e}"))?;
         Ok(Snmp {
-            latest: names.iter().map(|_| None).collect(),
-            names,
-            polls,
+            names: devices.iter().map(|d| d.name.clone()).collect(),
+            latest: devices.iter().map(|_| None).collect(),
+            devices,
+            polls: None,
             wait,
         })
     }
 
-    fn receive(&mut self, (index, polled): Polled) {
-        if let Err(error) = &polled {
-            eprintln!("SNMP {}: {error}", self.names[index]);
+    /// The device's poll that ended since the last taken; polls start
+    /// with the first, every `interval`.
+    pub fn take(&mut self, name: &str, interval: Duration) -> Option<Poll> {
+        if self.polls.is_none() {
+            let (sender, polls) = mpsc::channel();
+            let devices = std::mem::take(&mut self.devices);
+            if let Err(error) = start(devices, interval, sender) {
+                eprintln!("SNMP pollers: {error}");
+            }
+            self.polls = Some(polls);
         }
-        self.latest[index] = Some(polled);
+        let polls = self.polls.as_ref()?;
+        while self.wait && self.latest.iter().any(Option::is_none) {
+            let Ok((index, polled)) = polls.recv() else {
+                break;
+            };
+            self.latest[index] = Some(polled);
+        }
+        while let Ok((index, polled)) = polls.try_recv() {
+            self.latest[index] = Some(polled);
+        }
+        let index = self.names.iter().position(|n| n == name)?;
+        let polled = self.latest[index].take()?;
+        if let Err(error) = &polled.samples {
+            eprintln!("SNMP {name}: {error}");
+        }
+        Some(polled)
     }
 }
 
-impl Part for Snmp {
-    fn round(&mut self, w: &mut Writer, _now_ms: i64) {
-        while self.wait && self.latest.iter().any(Option::is_none) {
-            match self.polls.recv() {
-                Ok(polled) => self.receive(polled),
-                Err(_) => break,
-            }
+impl Poll {
+    /// As the current target's scrape.
+    pub fn write(self, w: &mut Writer) {
+        w.polled(self.at_ms, self.took);
+        let samples = self.samples.iter().flat_map(|s| &s.0);
+        for (metric, labels, value) in samples {
+            let labels: Vec<(&str, &str)> =
+                labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            w.add(metric, &labels, *value);
         }
-        while let Ok(polled) = self.polls.try_recv() {
-            self.receive(polled);
-        }
-        for (name, latest) in self.names.iter().zip(&self.latest) {
-            let Some(polled) = latest else {
-                continue;
-            };
-            let name = name.as_str();
-            w.target("snmp", &[("instance", name), ("host", name)]);
-            for (metric, labels, value) in polled.iter().flat_map(|s| &s.0) {
-                let labels: Vec<(&str, &str)> =
-                    labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                w.add(metric, &labels, *value);
-            }
-            w.up(polled.is_ok());
-        }
+        w.up(self.samples.is_ok());
     }
 }
 
@@ -144,15 +160,51 @@ fn start(
     thread.spawn(run).map(drop)
 }
 
-/// A device's modules, walked one after another.
-async fn poll<T: transport::Transport>(device: &Device) -> io::Result<Samples> {
+async fn poll<T: transport::Transport>(device: &Device) -> Poll {
+    let at_ms = crate::time::now_ms();
+    let begun = Instant::now();
+    let samples = walk::<T>(device).await;
+    Poll {
+        at_ms,
+        took: begun.elapsed(),
+        samples,
+    }
+}
+
+/// A device's modules, walked one after another, and snmp_exporter's
+/// own numbers on them.
+async fn walk<T: transport::Transport>(device: &Device) -> io::Result<Samples> {
     let mut client =
         Client::<T>::connect(&device.address, &device.community).await?;
     let mut samples = Samples::default();
     for module in device.modules.iter().filter_map(|m| module(m)) {
         scrape(&mut samples, &mut client, module).await?;
     }
+    exporter_metrics(&mut samples, &client);
     Ok(samples)
+}
+
+/// The exporter's own series, under snmp_exporter's names, for this
+/// poll alone: Alloy's registry is new each scrape too.
+fn exporter_metrics<T>(w: &mut Samples, client: &Client<T>) {
+    w.add("snmp_packets_total", &[], client.sent as f64);
+    w.add("snmp_packet_retries_total", &[], client.retried as f64);
+    let unexpected = client.unexpected as f64;
+    w.add("snmp_unexpected_pdu_type_total", &[], unexpected);
+    w.add("snmp_request_in_flight", &[], 0.0);
+    let mut count = 0;
+    for (index, n) in client.durations.iter().enumerate() {
+        count += n;
+        let le = match index {
+            ber::BUCKETS => "+Inf".to_owned(),
+            _ => ber::bucket_bound(index).to_string(),
+        };
+        let name = "snmp_packet_duration_seconds_bucket";
+        w.add(name, &[("le", le)], count as f64);
+    }
+    let sum = client.duration_sum;
+    w.add("snmp_packet_duration_seconds_sum", &[], sum);
+    w.add("snmp_packet_duration_seconds_count", &[], count as f64);
 }
 
 /// One poll's series: name, labels, value.
@@ -541,14 +593,24 @@ mod tests {
             modules: vec!["if_mib".into()],
         };
         let interval = Duration::from_secs(60);
-        let mut snmp = Snmp::new(vec![device], interval, false).unwrap();
-        let mut w = Writer::new("http://127.0.0.1:1/", "test", true).unwrap();
+        let mut snmp = Snmp::new(vec![device], false).unwrap();
         let begun = Instant::now();
-        snmp.round(&mut w, 0);
+        assert!(snmp.take("dead", interval).is_none());
         assert!(begun.elapsed() < Duration::from_millis(100));
-        let (index, polled) = snmp.polls.recv().unwrap();
+        let (index, polled) = snmp.polls.as_ref().unwrap().recv().unwrap();
         assert_eq!(index, 0);
-        let error = polled.err().unwrap();
+        assert!(polled.took >= Duration::from_secs(3));
+        let error = polled.samples.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn has_snmp_exporters_buckets() {
+        let bounds: Vec<String> = (0..ber::BUCKETS)
+            .map(|i| ber::bucket_bound(i).to_string())
+            .collect();
+        assert_eq!(bounds[0], "0.0001");
+        assert_eq!(bounds[7], "0.0128");
+        assert_eq!(bounds[14], "1.6384");
     }
 }

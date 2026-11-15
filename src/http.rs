@@ -33,13 +33,6 @@ impl Url {
         let path = path.to_owned();
         Some(Url { authority, path })
     }
-
-    /// An exporter's metrics at `host:port`.
-    pub fn metrics(address: &str) -> Url {
-        let authority = address.to_owned();
-        let path = String::from("/metrics");
-        Url { authority, path }
-    }
 }
 
 pub struct Response {

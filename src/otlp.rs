@@ -1,13 +1,13 @@
-//! An OTLP/HTTP receiver (`otlp <address>`, such as 127.0.0.1:4318)
-//! that passes each request on as it came to its signal's backend
-//! (`otlp_forward <signal> <url>`): Loki and Prometheus take OTLP
-//! themselves, traces and profiles go where they are sent. The client
+//! otelcol.receiver.otlp's HTTP endpoint (such as 127.0.0.1:4318),
+//! which passes each request on as it came to its signal's backend,
+//! the otelcol.exporter.otlphttp its output leads to: Loki and
+//! Prometheus take OTLP themselves. The client
 //! gets the backend's answer, so its own retries cover an outage, and
 //! nothing waits here. One request per connection, read whole: the
 //! clients are local.
 
 use crate::http::{self, Url};
-use crate::loki::Loki;
+use crate::logs::Logs;
 use crate::parts::Part;
 use crate::state::Positions;
 use std::io::{self, Read, Write};
@@ -61,7 +61,7 @@ impl Part for Otlp {
         false
     }
 
-    fn read(&mut self, _index: usize, _loki: &mut Loki, _p: &mut Positions) {
+    fn read(&mut self, _index: usize, _logs: &mut Logs, _p: &mut Positions) {
         while let Ok((stream, _)) = self.listener.accept() {
             if let Err(error) = self.serve(stream) {
                 eprintln!("OTLP: {error}");

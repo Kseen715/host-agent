@@ -10,18 +10,17 @@ mod format;
 
 use super::{Fields, deliver};
 use crate::host;
-use crate::loki::Loki;
+use crate::logs::{Logs, Source};
 use crate::parts::Part;
 use crate::state::Positions;
 use format::JournalFile;
-use regex_lite::Regex;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Entries read per wake: the loop has other sources.
 const ENTRIES_AT_ONCE: usize = 512;
@@ -36,8 +35,8 @@ pub struct Journal {
     seen: HashSet<(u64, u64)>,
     /// None until the saved cursor is known (`prepare`).
     start: Option<Start>,
-    max_age: String,
-    drops: Vec<Regex>,
+    max_age: Duration,
+    source: Source,
 }
 
 /// An entry's seqnum_id, seqnum and realtime.
@@ -90,7 +89,7 @@ impl Start {
 
 impl Journal {
     /// None on a host without journal directories.
-    pub fn new(max_age: &str, drops: Vec<Regex>) -> Option<Journal> {
+    pub fn new(max_age: Duration, source: Source) -> Option<Journal> {
         let machine = fs::read_to_string(host::path("/etc/machine-id")).ok()?;
         let dirs: Vec<PathBuf> = ["/var/log/journal", "/run/log/journal"]
             .iter()
@@ -107,8 +106,8 @@ impl Journal {
             files: Vec::new(),
             seen: HashSet::new(),
             start: None,
-            max_age: max_age.to_owned(),
-            drops,
+            max_age,
+            source,
         })
     }
 
@@ -180,7 +179,7 @@ impl Journal {
     /// whether all were read.
     fn read_entries(
         &mut self,
-        loki: &mut Loki,
+        logs: &mut Logs,
         positions: &mut Positions,
     ) -> bool {
         for reading in &mut self.files {
@@ -190,7 +189,7 @@ impl Journal {
             r.next.is_some() || r.file.header().is_ok_and(|h| !h.archived)
         });
         for _ in 0..ENTRIES_AT_ONCE {
-            if loki.blocked(Instant::now()) {
+            if logs.blocked(Instant::now()) {
                 return false;
             }
             let next = self.files.iter().map(|r| r.next.map(|n| n.1));
@@ -200,7 +199,7 @@ impl Journal {
             let reading = &mut self.files[index];
             let (offset, _) = reading.next.expect("earliest has one");
             match reading.file.entry(offset) {
-                Ok(entry) => send(&self.drops, &entry, loki, positions),
+                Ok(entry) => send(&self.source, &entry, logs, positions),
                 Err(error) => eprintln!("Journal: entry {offset}: {error}"),
             }
             reading.file.advance(1);
@@ -212,7 +211,7 @@ impl Journal {
 
 impl Part for Journal {
     /// The first time: the files from the saved cursor, or from
-    /// `journal_max_age` ago.
+    /// `max_age` ago.
     fn prepare(&mut self, positions: &Positions) {
         if self.start.is_some() {
             return;
@@ -220,7 +219,7 @@ impl Part for Journal {
         let cursor = positions.journal.as_deref().and_then(parse_cursor);
         self.start = Some(cursor.unwrap_or_else(|| {
             let now_us = crate::time::now_ns() as u64 / 1000;
-            let age_us = seconds(&self.max_age) * 1_000_000;
+            let age_us = self.max_age.as_micros() as u64;
             Start::Since(now_us.saturating_sub(age_us))
         }));
         self.open_new();
@@ -230,10 +229,10 @@ impl Part for Journal {
         vec![self.inotify.as_raw_fd(), self.behind.as_raw_fd()]
     }
 
-    fn read(&mut self, _index: usize, loki: &mut Loki, p: &mut Positions) {
+    fn read(&mut self, _index: usize, logs: &mut Logs, p: &mut Positions) {
         drain(&self.inotify);
         self.open_new();
-        if self.read_entries(loki, p) {
+        if self.read_entries(logs, p) {
             drain(&self.behind);
         } else {
             signal(&self.behind);
@@ -249,24 +248,20 @@ fn earliest(places: impl Iterator<Item = Option<Place>>) -> Option<usize> {
 }
 
 fn send(
-    drops: &[Regex],
+    source: &Source,
     entry: &format::Entry,
-    loki: &mut Loki,
+    logs: &mut Logs,
     p: &mut Positions,
 ) {
-    let field = |name: &[u8]| {
-        entry.fields.iter().find_map(|f| {
-            f.strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix(b"="))
-        })
-    };
+    let pairs = entry.fields.iter().filter_map(|f| {
+        let eq = f.iter().position(|&b| b == b'=')?;
+        Some((&f[..eq], &f[eq + 1..]))
+    });
     let fields = Fields {
         realtime_us: i64::try_from(entry.realtime).ok(),
-        message: field(b"MESSAGE"),
-        priority: field(b"PRIORITY"),
-        unit: field(b"_SYSTEMD_UNIT"),
+        pairs: pairs.collect(),
     };
-    deliver(drops, &fields, loki);
+    deliver(source, &fields, logs);
     p.journal = Some(cursor(entry));
     p.touch();
 }
@@ -302,19 +297,6 @@ fn parse_cursor(cursor: &str) -> Option<Start> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// journalctl's `--since=-12h`: seconds, minutes, hours or days.
-fn seconds(age: &str) -> u64 {
-    let split = age.find(|c: char| !c.is_ascii_digit()).unwrap_or(age.len());
-    let number: u64 = age[..split].parse().unwrap_or(0);
-    let unit = match &age[split..] {
-        "m" | "min" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => 1,
-    };
-    number * unit
 }
 
 /// An inotify descriptor on the directories: journald writing,
@@ -370,7 +352,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_cursors_and_ages() {
+    fn reads_cursors() {
         let cursor = "s=0123456789abcdef0123456789abcdef;i=1f;\
                       b=00;m=5;t=64;x=9";
         let Some(Start::After(id, seqnum, realtime)) = parse_cursor(cursor)
@@ -383,7 +365,6 @@ mod tests {
         assert!(start.covers((id, 31, 500)));
         assert!(!start.covers((id, 32, 50)));
         assert!(start.covers(([0; 16], 99, 100)));
-        assert_eq!(seconds("12h"), 43200);
     }
 
     #[test]

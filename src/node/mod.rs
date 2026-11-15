@@ -1,6 +1,7 @@
-//! The host's own metrics under node_exporter's names and labels, job
-//! `node`: the collectors the homelab's dashboards and alerts read, with
-//! the filters of Alloy's unix exporter (it keeps tmpfs and zram). Each
+//! The host's own metrics under node_exporter's names and labels, as
+//! Alloy's prometheus.exporter.unix gives them: the collectors the
+//! homelab's dashboards and alerts read, with the filters of Alloy's
+//! unix exporter (it keeps tmpfs and zram). Each
 //! reports `node_scrape_collector_success` and its duration; one whose
 //! source this host lacks (no NFS, no bonding) fails, as Alloy's does.
 
@@ -76,10 +77,27 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("zfs", zfs::collect),
 ];
 
+/// prometheus.exporter.unix's collector settings.
+#[derive(Default)]
+pub struct Settings {
+    pub enable: Vec<String>,
+    pub disable: Vec<String>,
+    /// In place of the default collectors.
+    pub set: Option<Vec<String>>,
+    pub textfile_dir: Option<PathBuf>,
+}
+
+/// Collectors node_exporter runs only when asked.
+const OFF_BY_DEFAULT: [&str; 1] = ["systemd"];
+
+/// Whether this agent has the collector.
+pub fn has_collector(name: &str) -> bool {
+    COLLECTORS.iter().any(|(n, _)| *n == name)
+}
+
 pub struct Node {
-    disabled: Vec<String>,
+    settings: Settings,
     service_types: RefCell<systemd::ServiceTypes>,
-    textfile_dir: Option<PathBuf>,
     netstat_fields: Regex,
     vmstat_fields: Regex,
     fs_mount_points: Regex,
@@ -88,12 +106,11 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(disabled: Vec<String>, textfile_dir: Option<PathBuf>) -> Node {
+    pub fn new(settings: Settings) -> Node {
         let regex = |text: &str| Regex::new(text).expect("a valid default");
         Node {
-            disabled,
+            settings,
             service_types: RefCell::default(),
-            textfile_dir,
             netstat_fields: regex(
                 "^(.*_(InErrors|InErrs)|Ip_Forwarding|Ip(6|Ext)_(InOctets\
                  |OutOctets)|Icmp6?_(InMsgs|OutMsgs)|TcpExt_(Listen.*\
@@ -119,12 +136,26 @@ impl Node {
         }
     }
 
+    fn runs(&self, name: &str) -> bool {
+        let s = &self.settings;
+        let listed = |names: &[String]| names.iter().any(|n| n == name);
+        let chosen = match &s.set {
+            Some(set) => listed(set),
+            None => !OFF_BY_DEFAULT.contains(&name) || listed(&s.enable),
+        };
+        chosen && !listed(&s.disable)
+    }
+
     pub fn collect(&self, w: &mut Writer) {
-        w.target("node", &[]);
-        w.up(true);
         crate::agent::build_info(w, "node_exporter_build_info");
+        // node_exporter's handler counts its own failures; a round has
+        // none to count.
+        for cause in ["encoding", "gathering"] {
+            let labels = [("cause", cause)];
+            w.add("promhttp_metric_handler_errors_total", &labels, 0.0);
+        }
         for (name, collect) in COLLECTORS {
-            if self.disabled.iter().any(|d| d == name) {
+            if !self.runs(name) {
                 continue;
             }
             let start = Instant::now();
@@ -193,7 +224,8 @@ mod tests {
 
     #[test]
     fn default_filters_compile_and_match_alloys() {
-        let node = Node::new(Vec::new(), None);
+        let node = Node::new(Settings::default());
+        assert!(node.runs("cpu") && !node.runs("systemd"));
         assert!(node.netstat_fields.is_match("Tcp_CurrEstab"));
         assert!(node.netstat_fields.is_match("Udp6_InErrors"));
         assert!(!node.netstat_fields.is_match("TcpExt_TCPOFOQueue"));
