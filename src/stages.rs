@@ -7,8 +7,15 @@ use crate::logs::Entry;
 use crate::relabel::Labels;
 use crate::template::Template;
 use crate::time;
+use crate::zone::Zone;
 use regex_lite::Regex;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
+
+/// Streams whose last time stage.timestamp keeps for `fudge`, as
+/// Promtail's cache holds them.
+const FUDGED_STREAMS: usize = 10_000;
 
 pub enum Stage {
     Regex(Regex, Option<String>),
@@ -24,8 +31,7 @@ pub enum Stage {
     /// Values to extract and the paths or keys they are read from.
     Json(Option<String>, Vec<(String, String)>),
     Logfmt(Option<String>, Vec<(String, String)>),
-    /// The source and the formats tried in turn.
-    Timestamp(String, Vec<String>),
+    Timestamp(Timestamp),
     Output(String),
     Match(Selector, Action),
 }
@@ -33,6 +39,44 @@ pub enum Stage {
 pub enum Action {
     Drop,
     Keep(Vec<Stage>),
+}
+
+/// stage.timestamp: the source, the formats tried in turn, the zone of
+/// a time without one; with `fudge`, a line whose time cannot be read
+/// gets its stream's last one plus 1 ns.
+pub struct Timestamp {
+    pub source: String,
+    pub formats: Vec<String>,
+    pub zone: Option<Zone>,
+    pub fudge: bool,
+    pub last: RefCell<HashMap<String, i64>>,
+}
+
+impl Timestamp {
+    fn apply(&self, entry: &mut Entry, x: &Labels) {
+        let value = get(x, &self.source);
+        let parsed = value.and_then(|v| {
+            let zone = self.zone.as_ref();
+            self.formats.iter().find_map(|f| timestamp(f, v, zone))
+        });
+        if parsed.is_none() && !self.fudge {
+            return;
+        }
+        let mut last = self.last.borrow_mut();
+        let stream = format!("{:?}", entry.labels);
+        let ns = match parsed {
+            Some(ns) => ns,
+            None => match last.get(&stream) {
+                Some(ns) => ns + 1,
+                None => return,
+            },
+        };
+        entry.ns = ns;
+        if last.len() >= FUDGED_STREAMS && !last.contains_key(&stream) {
+            last.clear();
+        }
+        last.insert(stream, ns);
+    }
 }
 
 /// Drops a line that meets every condition given.
@@ -131,14 +175,7 @@ impl Stage {
             Stage::LabelKeep(names) => {
                 entry.labels.retain(|(k, _)| names.contains(k))
             }
-            Stage::Timestamp(source, formats) => {
-                let value = get(x, source);
-                let parsed = value
-                    .and_then(|v| formats.iter().find_map(|f| timestamp(f, v)));
-                if let Some(ns) = parsed {
-                    entry.ns = ns;
-                }
-            }
+            Stage::Timestamp(stage) => stage.apply(entry, x),
             Stage::Output(source) => {
                 if let Some(value) = get(x, source) {
                     entry.line = value.to_owned();
@@ -304,14 +341,14 @@ fn logfmt_value(text: &str) -> (String, &str) {
     (value, "")
 }
 
-fn timestamp(format: &str, value: &str) -> Option<i64> {
+fn timestamp(format: &str, value: &str, zone: Option<&Zone>) -> Option<i64> {
     let number = |scale: i64| value.parse::<i64>().ok().map(|n| n * scale);
     match format {
         "Unix" => value.parse::<f64>().ok().map(|s| (s * 1e9) as i64),
         "UnixMs" => number(1_000_000),
         "UnixUs" => number(1_000),
         "UnixNs" => number(1),
-        layout => time::parse_layout(time::named_layout(layout), value),
+        layout => time::parse_layout(time::named_layout(layout), value, zone),
     }
 }
 
@@ -498,12 +535,21 @@ mod tests {
         ];
         assert!(run(&stages, &mut parsed));
         assert_eq!(parsed.line, "x");
-        let mut timed = entry(r#"t="1970-01-01T00:00:01Z" msg=hi"#);
         let stages = [
             Stage::Logfmt(None, vec![("t".into(), String::new())]),
-            Stage::Timestamp("t".into(), vec!["RFC3339".into()]),
+            Stage::Timestamp(Timestamp {
+                source: "t".into(),
+                formats: vec!["2006-01-02 15:04:05".into()],
+                zone: None,
+                fudge: true,
+                last: RefCell::default(),
+            }),
         ];
+        let mut timed = entry(r#"t="1970-01-01 00:00:01" msg=hi"#);
         assert!(run(&stages, &mut timed));
         assert_eq!(timed.ns, 1_000_000_000);
+        let mut unreadable = entry("t=never");
+        assert!(run(&stages, &mut unreadable));
+        assert_eq!(unreadable.ns, 1_000_000_001);
     }
 }

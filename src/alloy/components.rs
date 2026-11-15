@@ -1,7 +1,9 @@
 //! The components this agent has: each block built into the plan, its
 //! exports returned for the components after it.
 
-use super::compile::{Body, Exporter, Otel, Plan, ScrapeJob, export};
+use super::compile::{
+    Body, Exporter, Otel, Plan, ScrapeJob, SyslogListener, export,
+};
 use super::value::{Capsule, Value};
 use crate::files::Files;
 use crate::logs::{self, Source};
@@ -28,6 +30,7 @@ pub fn build(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         "discovery.relabel" => discovery_relabel(body),
         "discovery.docker" => discovery_docker(body, plan),
         "discovery.file" => discovery_file(body),
+        "local.file_match" => file_match(body),
         "loki.write" => loki_write(body, plan),
         "loki.relabel" => loki_relabel(body, plan),
         "loki.process" => loki_process(body, plan),
@@ -323,6 +326,22 @@ fn discovery_file(body: &Body) -> Result<Value, String> {
     )]))
 }
 
+fn file_match(body: &Body) -> Result<Value, String> {
+    let attrs = ["path_targets", "sync_period", "ignore_older_than"];
+    body.check(&attrs, &[])?;
+    let older = match body.value("ignore_older_than")? {
+        Some(_) => Some(body.duration_or("ignore_older_than", "")?),
+        None => None,
+    };
+    let older = older.filter(|d| !d.is_zero());
+    let input = Box::new(body.targets("path_targets")?);
+    let targets = Targets::FileMatch(input, older);
+    Ok(export(vec![(
+        "targets",
+        Value::Capsule(Capsule::Targets(targets)),
+    )]))
+}
+
 fn loki_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["external_labels"], &["endpoint"])?;
     let external = body.labels("external_labels")?;
@@ -376,10 +395,9 @@ fn source(body: &Body) -> Result<Source, String> {
 fn journal(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "journal", cfg!(feature = "journal"))?;
     body.check(&["max_age", "labels", "relabel_rules", "forward_to"], &[])?;
-    if plan.journal.is_some() {
-        return Err(body.error(body.block.pos, "one loki.source.journal only"));
-    }
-    plan.journal = Some((body.duration_or("max_age", "7h")?, source(body)?));
+    let max_age = body.duration_or("max_age", "7h")?;
+    plan.journal
+        .push((body.id.to_owned(), max_age, source(body)?));
     Ok(export(Vec::new()))
 }
 
@@ -398,11 +416,10 @@ fn docker_logs(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         &[],
     )?;
     docker_host(body)?;
-    if plan.docker_logs.is_some() {
-        return Err(body.error(body.block.pos, "one loki.source.docker only"));
-    }
     plan.docker = true;
-    plan.docker_logs = Some((body.targets("targets")?, source(body)?));
+    let targets = body.targets("targets")?;
+    plan.docker_logs
+        .push((body.id.to_owned(), targets, source(body)?));
     Ok(export(Vec::new()))
 }
 
@@ -411,22 +428,61 @@ fn syslog(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["relabel_rules", "forward_to"], &["listener"])?;
     let shared = source(body)?;
     for listener in body.blocks("listener") {
-        let attrs = ["address", "protocol", "syslog_format", "labels"];
-        listener.check(&attrs, &[])?;
-        let pos = listener.block.pos;
-        if listener.string_or("protocol", "tcp")? != "udp" {
-            return Err(listener.error(pos, "only protocol = \"udp\""));
-        }
-        if listener.string_or("syslog_format", "rfc5424")? != "rfc3164" {
-            return Err(listener.error(pos, "only syslog_format = \"rfc3164\""));
-        }
-        let source = Source {
-            labels: listener.labels("labels")?,
-            ..shared.clone()
-        };
-        plan.syslogs.push((listener.required("address")?, source));
+        plan.syslogs.push(syslog_listener(&listener, &shared)?);
     }
     Ok(export(Vec::new()))
+}
+
+// Longer than 40 lines: Alloy's attributes, one per line.
+fn syslog_listener(
+    listener: &Body,
+    shared: &Source,
+) -> Result<SyslogListener, String> {
+    let attrs = [
+        "address",
+        "protocol",
+        "idle_timeout",
+        "label_structured_data",
+        "labels",
+        "use_incoming_timestamp",
+        "use_rfc5424_message",
+        "max_message_length",
+        "syslog_format",
+        "rfc3164_default_to_current_year",
+    ];
+    listener.check(&attrs, &[])?;
+    let pos = listener.block.pos;
+    let one_of = |name: &str, default: &str, values: [&str; 2]| {
+        let value = listener.string_or(name, default)?;
+        match values.iter().position(|v| *v == value) {
+            Some(index) => Ok(index == 0),
+            None => Err(listener.error(pos, &format!("{name} `{value}`"))),
+        }
+    };
+    let length = listener.value("max_message_length")?;
+    let max_message_length = match length {
+        Some((Value::Number(n), _)) if n >= 1.0 => n as usize,
+        Some((_, pos)) => {
+            return Err(listener.error(pos, "max_message_length: a number"));
+        }
+        None => 8192,
+    };
+    Ok(SyslogListener {
+        address: listener.required("address")?,
+        tcp: one_of("protocol", "tcp", ["tcp", "udp"])?,
+        rfc5424: one_of("syslog_format", "rfc5424", ["rfc5424", "rfc3164"])?,
+        idle_timeout: listener.duration_or("idle_timeout", "120s")?,
+        label_structured_data: listener
+            .bool_or("label_structured_data", false)?,
+        use_incoming_timestamp: listener
+            .bool_or("use_incoming_timestamp", false)?,
+        use_rfc5424_message: listener.bool_or("use_rfc5424_message", false)?,
+        max_message_length,
+        source: Source {
+            labels: listener.labels("labels")?,
+            ..shared.clone()
+        },
+    })
 }
 
 /// An `output` block's components for each signal.
@@ -490,16 +546,9 @@ fn otlp_receiver(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     for (signal, next) in otel_output(body)? {
         let mut urls = Vec::new();
         ends(&plan.otel, &signal, &next, &mut urls);
-        if urls.len() > 1 {
-            let message = format!("{signal} to more than one exporter");
-            return Err(body.error(pos, &message));
-        }
         forwards.extend(urls.into_iter().map(|url| (signal.clone(), url)));
     }
-    if plan.otlp.is_some() {
-        return Err(body.error(pos, "one otelcol.receiver.otlp only"));
-    }
-    plan.otlp = Some((address, forwards));
+    plan.otlp.push((address, forwards));
     Ok(export(Vec::new()))
 }
 

@@ -57,8 +57,9 @@ pub struct Docker {
     pub containers: Vec<Container>,
     /// Whether Docker answered the last listing.
     pub up: bool,
-    /// loki.source.docker's targets and what it does with lines.
-    logs: Option<(Targets, Source)>,
+    /// Each loki.source.docker: its id, targets and what it does with
+    /// lines.
+    logs: Vec<(String, Targets, Source)>,
     streams: Vec<LogStream>,
     /// Containers started after this are read from their start.
     since_ns: i64,
@@ -66,7 +67,7 @@ pub struct Docker {
 
 impl Docker {
     /// Docker on its socket, whether it runs yet or not.
-    pub fn new(logs: Option<(Targets, Source)>) -> Docker {
+    pub fn new(logs: Vec<(String, Targets, Source)>) -> Docker {
         Docker {
             socket: PathBuf::from(SOCKET),
             details: HashMap::new(),
@@ -168,60 +169,64 @@ impl Docker {
         })
     }
 
-    /// The positions of containers no longer targeted, forgotten.
-    fn forget_gone(positions: &mut Positions, wanted: &[(String, Labels)]) {
+    /// The positions of streams no source reads, forgotten.
+    fn forget_gone(positions: &mut Positions, keys: &[String]) {
         let before = positions.docker.len();
-        positions
-            .docker
-            .retain(|id, _| wanted.iter().any(|(w, _)| w == id));
+        positions.docker.retain(|key, _| keys.contains(key));
         if positions.docker.len() != before {
             positions.touch();
         }
     }
 
-    /// Each container targeted, by id, with its first target.
-    fn wanted(&self, targets: &Targets) -> Vec<(String, Labels)> {
-        let mut wanted: Vec<(String, Labels)> = Vec::new();
-        for target in targets.resolve(&self.targets()) {
-            let id = targets::get(&target, "__meta_docker_container_id");
-            if !id.is_empty() && !wanted.iter().any(|(w, _)| w == id) {
-                wanted.push((id.to_owned(), target));
+    /// Each source's containers, by id, each with its first target.
+    fn wanted(&self) -> Vec<(usize, String, Labels)> {
+        let found = self.targets();
+        let mut wanted: Vec<(usize, String, Labels)> = Vec::new();
+        for (index, (_, targets, _)) in self.logs.iter().enumerate() {
+            for target in targets.resolve(&found) {
+                let id = targets::get(&target, "__meta_docker_container_id");
+                let seen =
+                    wanted.iter().any(|(i, w, _)| *i == index && w == id);
+                if !id.is_empty() && !seen {
+                    wanted.push((index, id.to_owned(), target));
+                }
             }
         }
         wanted
     }
 
-    /// Opens a log stream for each container targeted that has none,
-    /// and forgets the positions of containers gone.
+    /// Opens a log stream for each container a source targets that has
+    /// none, and forgets the positions of streams gone. A position is
+    /// kept by source and container; one by container alone is the
+    /// single source's of before.
     pub fn follow_logs(&mut self, logs: &mut Logs, positions: &mut Positions) {
-        let Some((targets, source)) = &self.logs else {
-            return;
-        };
-        let wanted = self.wanted(targets);
-        self.streams
-            .retain(|s| wanted.iter().any(|(id, _)| *id == s.id));
-        Self::forget_gone(positions, &wanted);
-        for (id, target) in wanted {
+        let wanted = self.wanted();
+        let keys: Vec<String> = wanted
+            .iter()
+            .map(|(index, id, _)| format!("{}/{id}", self.logs[*index].0))
+            .collect();
+        self.streams.retain(|s| keys.contains(&s.key));
+        for ((index, id, target), key) in wanted.into_iter().zip(&keys) {
             let container = self.containers.iter().find(|c| c.id == id);
             let Some(container) = container else {
                 continue;
             };
-            if self.streams.iter().any(|s| s.id == id) {
+            if self.streams.iter().any(|s| s.key == *key) {
                 continue;
             }
+            let source = &self.logs[index].2;
             let Some(labels) = source.labels_for(target) else {
                 continue;
             };
-            let since = positions.docker.get(&id).copied();
-            let start = container.details.started_ns;
-            let since = since.unwrap_or(if start > self.since_ns {
-                start - 1_000_000_000
-            } else {
-                time::now_ns()
-            });
-            match LogStream::open(&self.socket, container, since, labels) {
+            let saved = positions.docker.get(key).or(positions.docker.get(&id));
+            let since = saved.copied().unwrap_or_else(|| self.since(container));
+            let opened =
+                LogStream::open(&self.socket, container, since, labels);
+            match opened {
                 // Lines that came with the headers wait for no poll.
                 Ok(mut stream) => {
+                    stream.key.clone_from(key);
+                    stream.source = index;
                     if stream.read(source, logs, positions) {
                         self.streams.push(stream);
                     }
@@ -230,6 +235,18 @@ impl Docker {
                     eprintln!("Docker: logs of {}: {error}", container.name)
                 }
             }
+        }
+        Self::forget_gone(positions, &keys);
+    }
+
+    /// Where a container's log is first read: from its start if it
+    /// started after the agent, else from now.
+    fn since(&self, container: &Container) -> i64 {
+        let start = container.details.started_ns;
+        if start > self.since_ns {
+            start - 1_000_000_000
+        } else {
+            time::now_ns()
         }
     }
 
@@ -241,9 +258,10 @@ impl Docker {
         logs: &mut Logs,
         positions: &mut Positions,
     ) {
-        let (Some(stream), Some((_, source))) =
-            (self.streams.get_mut(index), &self.logs)
-        else {
+        let Some(stream) = self.streams.get_mut(index) else {
+            return;
+        };
+        let Some((_, _, source)) = self.logs.get(stream.source) else {
             return;
         };
         if !stream.read(source, logs, positions) {
@@ -350,7 +368,10 @@ fn get_json(socket: &Path, path: &str) -> io::Result<Json> {
 /// frames of an 8-byte header (stream, 0, 0, 0, size big-endian) and a
 /// line that starts with its RFC 3339 time.
 struct LogStream {
-    id: String,
+    /// Where its position is kept: the source's id and the container's.
+    key: String,
+    /// Its source, in Docker's `logs`.
+    source: usize,
     labels: Labels,
     socket: UnixStream,
     tty: bool,
@@ -384,7 +405,8 @@ impl LogStream {
         let raw = read_head(&mut stream)?;
         stream.set_nonblocking(true)?;
         Ok(LogStream {
-            id: container.id.clone(),
+            key: container.id.clone(),
+            source: 0,
             labels,
             socket: stream,
             tty: container.details.tty,
@@ -418,8 +440,8 @@ impl LogStream {
             self.take_frames(source, logs)
         };
         self.data.drain(..used);
-        if positions.docker.get(&self.id) != Some(&self.last_ns) {
-            positions.docker.insert(self.id.clone(), self.last_ns);
+        if positions.docker.get(&self.key) != Some(&self.last_ns) {
+            positions.docker.insert(self.key.clone(), self.last_ns);
             positions.touch();
         }
         open && !self.dechunk.done()
@@ -528,7 +550,7 @@ mod tests {
         assert_eq!(c.name, "crafty-crafty-1");
         let docker = Docker {
             containers: vec![c],
-            ..Docker::new(None)
+            ..Docker::new(Vec::new())
         };
         let targets = docker.targets();
         assert_eq!(targets.len(), 2);

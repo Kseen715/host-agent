@@ -9,7 +9,7 @@ mod snmp;
 pub mod syntax;
 mod value;
 
-pub use compile::{Exporter, Plan, ScrapeJob, compile};
+pub use compile::{Exporter, Plan, ScrapeJob, SyslogListener, compile};
 pub use components::INTERNAL;
 
 use std::fs;

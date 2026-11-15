@@ -51,6 +51,19 @@ pub enum Otel {
     Export(Vec<(String, String)>),
 }
 
+/// A loki.source.syslog `listener`, with its component's source.
+pub struct SyslogListener {
+    pub address: String,
+    pub tcp: bool,
+    pub rfc5424: bool,
+    pub idle_timeout: Duration,
+    pub label_structured_data: bool,
+    pub use_incoming_timestamp: bool,
+    pub use_rfc5424_message: bool,
+    pub max_message_length: usize,
+    pub source: Source,
+}
+
 #[derive(Default)]
 pub struct Plan {
     pub metrics: Metrics,
@@ -59,15 +72,16 @@ pub struct Plan {
     pub exporters: Vec<(String, Exporter)>,
     /// prometheus.exporter.unix's rootfs_path (crate::host).
     pub root: Option<PathBuf>,
-    pub journal: Option<(Duration, Source)>,
+    /// Each loki.source.journal: its id, max_age and source.
+    pub journal: Vec<(String, Duration, Source)>,
     pub files: Vec<Files>,
-    pub docker_logs: Option<(Targets, Source)>,
+    /// Each loki.source.docker: its id, targets and source.
+    pub docker_logs: Vec<(String, Targets, Source)>,
     /// Whether a component reads Docker.
     pub docker: bool,
-    /// loki.source.syslog's listeners: address and source.
-    pub syslogs: Vec<(String, Source)>,
-    /// otelcol.receiver.otlp's address and each signal's URL.
-    pub otlp: Option<(String, Vec<(String, String)>)>,
+    pub syslogs: Vec<SyslogListener>,
+    /// Each otelcol.receiver.otlp's address and each signal's URLs.
+    pub otlp: Vec<(String, Vec<(String, String)>)>,
     pub otel: Vec<Otel>,
     /// --print: one round to stdout.
     pub print: bool,

@@ -37,6 +37,8 @@ pub struct Journal {
     start: Option<Start>,
     max_age: Duration,
     source: Source,
+    /// The component's id: where its cursor is kept.
+    id: String,
 }
 
 /// An entry's seqnum_id, seqnum and realtime.
@@ -89,7 +91,11 @@ impl Start {
 
 impl Journal {
     /// None on a host without journal directories.
-    pub fn new(max_age: Duration, source: Source) -> Option<Journal> {
+    pub fn new(
+        id: String,
+        max_age: Duration,
+        source: Source,
+    ) -> Option<Journal> {
         let machine = fs::read_to_string(host::path("/etc/machine-id")).ok()?;
         let dirs: Vec<PathBuf> = ["/var/log/journal", "/run/log/journal"]
             .iter()
@@ -108,6 +114,7 @@ impl Journal {
             start: None,
             max_age,
             source,
+            id,
         })
     }
 
@@ -199,7 +206,9 @@ impl Journal {
             let reading = &mut self.files[index];
             let (offset, _) = reading.next.expect("earliest has one");
             match reading.file.entry(offset) {
-                Ok(entry) => send(&self.source, &entry, logs, positions),
+                Ok(entry) => {
+                    send((&self.source, &self.id), &entry, logs, positions)
+                }
                 Err(error) => eprintln!("Journal: entry {offset}: {error}"),
             }
             reading.file.advance(1);
@@ -216,7 +225,7 @@ impl Part for Journal {
         if self.start.is_some() {
             return;
         }
-        let cursor = positions.journal.as_deref().and_then(parse_cursor);
+        let cursor = positions.cursor(&self.id).and_then(parse_cursor);
         self.start = Some(cursor.unwrap_or_else(|| {
             let now_us = crate::time::now_ns() as u64 / 1000;
             let age_us = self.max_age.as_micros() as u64;
@@ -248,7 +257,7 @@ fn earliest(places: impl Iterator<Item = Option<Place>>) -> Option<usize> {
 }
 
 fn send(
-    source: &Source,
+    (source, id): (&Source, &str),
     entry: &format::Entry,
     logs: &mut Logs,
     p: &mut Positions,
@@ -262,8 +271,7 @@ fn send(
         pairs: pairs.collect(),
     };
     deliver(source, &fields, logs);
-    p.journal = Some(cursor(entry));
-    p.touch();
+    p.set_cursor(id, cursor(entry));
 }
 
 /// journalctl's cursor for an entry.

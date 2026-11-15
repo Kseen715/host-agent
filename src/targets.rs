@@ -9,6 +9,7 @@ use crate::json::Json;
 use crate::relabel::{self, Labels, Rule};
 use std::fs;
 use std::rc::Rc;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone)]
 pub enum Targets {
@@ -20,6 +21,9 @@ pub enum Targets {
     /// discovery.relabel's output.
     Relabel(Box<Targets>, Rc<Vec<Rule>>),
     Concat(Vec<Targets>),
+    /// local.file_match's: a target per file its `__path__` matches,
+    /// less those modified longer ago than the duration.
+    FileMatch(Box<Targets>, Option<Duration>),
 }
 
 impl Targets {
@@ -37,8 +41,51 @@ impl Targets {
             Targets::Concat(parts) => {
                 parts.iter().flat_map(|p| p.resolve(docker)).collect()
             }
+            Targets::FileMatch(inner, older) => inner
+                .resolve(docker)
+                .iter()
+                .flat_map(|target| file_match(target, *older))
+                .collect(),
         }
     }
+}
+
+fn file_match(target: &Labels, older: Option<Duration>) -> Vec<Labels> {
+    let recent = |meta: &fs::Metadata| match (older, meta.modified()) {
+        (Some(older), Ok(at)) => {
+            SystemTime::now().duration_since(at).unwrap_or_default() <= older
+        }
+        _ => true,
+    };
+    let files = paths(target).into_iter().filter(|path| {
+        let meta = fs::metadata(host::path(path));
+        meta.is_ok_and(|meta| meta.is_file() && recent(&meta))
+    });
+    files
+        .map(|path| {
+            let mut found = target.clone();
+            found.retain(|(k, _)| k != "__path__");
+            found.push(("__path__".into(), path));
+            found
+        })
+        .collect()
+}
+
+/// The paths a target's `__path__` names or matches (a glob), less
+/// those its `__path_exclude__` matches.
+pub fn paths(target: &Labels) -> Vec<String> {
+    let path = get(target, "__path__");
+    let exclude = get(target, "__path_exclude__");
+    let paths = if glob::is_pattern(path) {
+        glob::expand(path)
+    } else {
+        vec![path.to_owned()]
+    };
+    let excluded = |p: &str| !exclude.is_empty() && glob::matches(exclude, p);
+    paths
+        .into_iter()
+        .filter(|p| !p.is_empty() && !excluded(p))
+        .collect()
 }
 
 /// Prometheus's file_sd in JSON: a target per entry of each group's
@@ -116,6 +163,15 @@ mod tests {
         assert_eq!(get(&found[0], "__address__"), "a:1");
         assert_eq!(get(&found[0], "job"), "x");
         assert!(get(&found[0], "__meta_filepath").ends_with("t.json"));
+        let pattern = format!("{}/*.json", dir.display());
+        let target = vec![("__path__".to_owned(), pattern)];
+        let matched = Targets::FileMatch(
+            Box::new(Targets::Static(vec![target])),
+            Some(Duration::from_secs(60)),
+        );
+        let found = matched.resolve(&[]);
+        assert_eq!(found.len(), 1);
+        assert!(get(&found[0], "__path__").ends_with("/t.json"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

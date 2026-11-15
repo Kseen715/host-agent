@@ -17,7 +17,7 @@ used, in about 1 MiB of memory instead of about 100.
   `journalctl --output=export` without feature `journal-files`),
   every running Docker container's output, files from static targets
   and from file_sd JSON files (`__path__` may be a glob, `**` included),
-  network devices' syslog over UDP (RFC 3164).
+  syslog over UDP or TCP (RFC 5424 or 3164).
   Labels from the journal's fields and syslog's header, for
   `loki.relabel` and `loki.process` to shape.
 - Alloy's configuration: it reads `config.alloy` and does what its
@@ -83,17 +83,20 @@ Alloy's syntax: blocks, attributes, references between components
 
 - `prometheus.exporter.unix`, `.self`, `.cadvisor`, `.snmp`;
   `prometheus.scrape`, `prometheus.relabel`, `prometheus.remote_write`;
-- `discovery.docker`, `discovery.file`, `discovery.relabel`;
-- `loki.source.journal`, `.file`, `.docker`, `.syslog` (UDP, RFC
-  3164); `loki.relabel`, `loki.write`, `loki.process` with the stages
-  `regex`, `template`, `replace`, `labels`, `static_labels`,
-  `label_drop`, `label_keep`, `drop`, `json`, `logfmt`, `timestamp`
-  (UTC), `output`, `match`;
+- `discovery.docker`, `discovery.file`, `discovery.relabel`,
+  `local.file_match`;
+- `loki.source.journal`, `.file`, `.docker`, `.syslog` (UDP or TCP,
+  RFC 5424 or 3164); `loki.relabel`, `loki.write`, `loki.process`
+  with the stages `regex`, `template`, `replace`, `labels`,
+  `static_labels`, `label_drop`, `label_keep`, `drop`, `json`,
+  `logfmt`, `timestamp` (zones from the host's tz database),
+  `output`, `match`;
 - `otelcol.receiver.otlp` into `otelcol.exporter.otlphttp` (passed on
-  unchanged; `otelcol.processor.batch` in between is let through).
+  unchanged, to every exporter a signal reaches;
+  `otelcol.processor.batch` in between is let through).
 
 What it cannot do as Alloy would (another component, attribute or
-block, a second journal, Docker or OTLP receiver source) is refused
+block, such as syslog over TLS or the journal's `matches`) is refused
 with its position in the file, never ignored. `logging`,
 `livedebugging` and `tracing` are accepted and ignored.
 

@@ -1,11 +1,10 @@
 //! loki.source.file: the files its targets' `__path__` name or match
 //! (crate::glob), less those `__path_exclude__` matches; a target's
 //! other labels go with its lines, plus `filename`. With
-//! `tail_from_end`, a file there at the first start is first read from
-//! its end; one that appears later, a new inode or a shorter file
-//! (rotation) from its start.
+//! `tail_from_end`, a file without a saved position is first read from
+//! the start of its last line, as Alloy reads it, also one that appears
+//! later; a new inode or a shorter file (rotation) from its start.
 
-use crate::glob;
 use crate::host;
 use crate::logs::{Logs, Source};
 use crate::relabel::Labels;
@@ -35,7 +34,6 @@ pub struct Files {
     tail_from_end: bool,
     source: Source,
     tails: Vec<Tail>,
-    refreshed: bool,
 }
 
 impl Files {
@@ -45,7 +43,6 @@ impl Files {
             tail_from_end,
             source,
             tails: Vec::new(),
-            refreshed: false,
         }
     }
 
@@ -64,20 +61,16 @@ impl Files {
                 Some(tail) => tail.labels = labels,
                 None => {
                     let pos = positions.files.get(&path).copied();
-                    let from_start = !self.tail_from_end
-                        || self.refreshed
-                        || !host::path(&path).exists();
                     self.tails.push(Tail {
                         path,
                         labels,
                         pos,
-                        from_start,
+                        from_start: !self.tail_from_end,
                         partial: Vec::new(),
                     });
                 }
             }
         }
-        self.refreshed = true;
     }
 
     /// Reads what the files gained since the last call.
@@ -121,7 +114,7 @@ impl Tail {
         let (dev, ino, len) = (meta.dev(), meta.ino(), meta.len());
         let offset = match self.pos {
             None if self.from_start => 0,
-            None => len,
+            None => last_line(&self.path, len)?,
             Some(p) if p.dev != dev || p.ino != ino || p.offset > len => 0,
             Some(p) => p.offset,
         };
@@ -171,25 +164,31 @@ impl Tail {
     }
 }
 
+/// Where the file's last line starts: after its last newline, or 0.
+fn last_line(path: &str, len: u64) -> std::io::Result<u64> {
+    let mut file = File::open(host::path(path))?;
+    let mut end = len;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(READ_AT_ONCE);
+        file.seek(SeekFrom::Start(start))?;
+        buf.clear();
+        (&mut file).take(end - start).read_to_end(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
 /// Each file the targets name or match, with its target's labels; the
 /// first target to name a file wins.
 fn files(targets: Vec<Labels>) -> Vec<(String, Labels)> {
     let mut files: Vec<(String, Labels)> = Vec::new();
     for target in targets {
-        let path = targets::get(&target, "__path__");
-        let exclude = targets::get(&target, "__path_exclude__");
-        let paths = if glob::is_pattern(path) {
-            glob::expand(path)
-        } else {
-            vec![path.to_owned()]
-        };
-        let excluded =
-            |p: &str| !exclude.is_empty() && glob::matches(exclude, p);
-        for found in paths {
-            if !found.is_empty()
-                && !excluded(&found)
-                && !files.iter().any(|(p, _)| *p == found)
-            {
+        for found in targets::paths(&target) {
+            if !files.iter().any(|(p, _)| *p == found) {
                 files.push((found, target.clone()));
             }
         }
@@ -210,7 +209,7 @@ mod tests {
             .join(format!("ha-files-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("latest.log");
-        fs::write(&log, "old line\n").unwrap();
+        fs::write(&log, "old line\nhalf").unwrap();
         let target = format!(
             r#"[{{"targets":["localhost"],"labels":
                 {{"__path__":"{}/*.log","job":"minecraft"}}}}]"#,
@@ -237,10 +236,11 @@ mod tests {
         let mut files = Files::new(targets, true, source);
         files.refresh(&[], &mut positions);
         files.read(&mut logs, &mut positions);
-        fs::write(&log, "old line\nnew [WARN] one\npart").unwrap();
+        fs::write(&log, "old line\nhalf\nnew [WARN] one\npart").unwrap();
         files.read(&mut logs, &mut positions);
         let pos = positions.files[&log.display().to_string()];
-        assert_eq!(pos.offset, "old line\nnew [WARN] one\n".len() as u64);
+        let read = "old line\nhalf\nnew [WARN] one\n";
+        assert_eq!(pos.offset, read.len() as u64);
 
         fs::remove_file(&log).unwrap();
         fs::write(&log, "rotated\n").unwrap();
@@ -251,7 +251,7 @@ mod tests {
         assert!(
             values.contains("new [WARN] one") && values.contains("rotated")
         );
-        assert!(values.contains("appeared"));
+        assert!(values.contains("half") && !values.contains("appeared"));
         assert!(!values.contains("old line") && !values.contains("part"));
         fs::remove_dir_all(dir).unwrap();
     }

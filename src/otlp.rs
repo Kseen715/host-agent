@@ -1,10 +1,10 @@
 //! otelcol.receiver.otlp's HTTP endpoint (such as 127.0.0.1:4318),
 //! which passes each request on as it came to its signal's backend,
-//! the otelcol.exporter.otlphttp its output leads to: Loki and
-//! Prometheus take OTLP themselves. The client
-//! gets the backend's answer, so its own retries cover an outage, and
-//! nothing waits here. One request per connection, read whole: the
-//! clients are local.
+//! each otelcol.exporter.otlphttp its output leads to: Loki and
+//! Prometheus take OTLP themselves. The client gets the backend's
+//! answer (a failure's if one of several failed, as Alloy's fan-out
+//! fails), so its own retries cover an outage, and nothing waits here.
+//! One request per connection, read whole: the clients are local.
 
 use crate::http::{self, Url};
 use crate::logs::Logs;
@@ -95,12 +95,22 @@ impl Otlp {
         stream.write_all(&body)
     }
 
-    /// The backend's status and body, under the request's content type.
+    /// The backends' status and body: the first failure's, else the
+    /// last answer's.
     fn forward(&self, request: &Request) -> (u16, String, Vec<u8>) {
-        let route = self.routes.iter().find(|(path, _)| *path == request.path);
-        let Some((_, url)) = route else {
-            return (404, String::new(), Vec::new());
-        };
+        let mut answer: Option<(u16, String, Vec<u8>)> = None;
+        for (path, url) in &self.routes {
+            if *path == request.path
+                && answer.as_ref().is_none_or(|(status, ..)| *status < 300)
+            {
+                answer = Some(Self::send(url, request));
+            }
+        }
+        answer.unwrap_or((404, String::new(), Vec::new()))
+    }
+
+    /// The backend's status and body, under the request's content type.
+    fn send(url: &Url, request: &Request) -> (u16, String, Vec<u8>) {
         match http::post(url, &request.headers, &request.body) {
             Ok(response) => {
                 let kind = request.headers.lines().find(|line| {

@@ -79,9 +79,9 @@ impl Agent {
         }
         let parts = parts::build(&mut plan)?;
         #[cfg(feature = "docker")]
-        let docker = plan
-            .docker
-            .then(|| crate::docker::Docker::new(plan.docker_logs.take()));
+        let docker = plan.docker.then(|| {
+            crate::docker::Docker::new(std::mem::take(&mut plan.docker_logs))
+        });
         let now = Instant::now();
         let scrapes = plan.scrapes.into_iter().map(|s| (s, now)).collect();
         Ok(Agent {

@@ -62,6 +62,7 @@ mod tap;
 mod targets;
 mod template;
 mod time;
+mod zone;
 
 use std::process::ExitCode;
 

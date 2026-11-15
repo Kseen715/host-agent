@@ -30,20 +30,21 @@ pub fn build(plan: &mut Plan) -> Result<Vec<Box<dyn Part>>, String> {
         return Ok(parts);
     }
     #[cfg(feature = "journal")]
-    if let Some((max_age, source)) = plan.journal.take() {
-        match crate::journal::Journal::new(max_age, source) {
+    for (id, max_age, source) in std::mem::take(&mut plan.journal) {
+        match crate::journal::Journal::new(id, max_age, source) {
             Some(journal) => parts.push(Box::new(journal)),
             None => eprintln!("Journal: this host has none"),
         }
     }
     #[cfg(feature = "syslog")]
-    for (address, source) in std::mem::take(&mut plan.syslogs) {
-        let syslog = crate::syslog::Syslog::bind(&address, source)
+    for listener in std::mem::take(&mut plan.syslogs) {
+        let address = listener.address.clone();
+        let syslog = crate::syslog::Syslog::bind(listener)
             .map_err(|e| format!("syslog on {address}: {e}"))?;
         parts.push(Box::new(syslog));
     }
     #[cfg(feature = "otlp")]
-    if let Some((address, forwards)) = plan.otlp.take() {
+    for (address, forwards) in std::mem::take(&mut plan.otlp) {
         let otlp = crate::otlp::Otlp::bind(&address, &forwards)?;
         parts.push(Box::new(otlp));
     }

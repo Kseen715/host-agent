@@ -1,8 +1,9 @@
 //! loki.process's `stage.*` blocks, built into crate::stages.
 
 use super::compile::Body;
-use crate::stages::{Action, Drop, Selector, Stage};
+use crate::stages::{Action, Drop, Selector, Stage, Timestamp};
 use crate::template::Template;
+use crate::zone::Zone;
 use regex_lite::Regex;
 
 pub const STAGES: [&str; 13] = [
@@ -168,13 +169,28 @@ fn timestamp(body: &Body) -> Result<Stage, String> {
         "action_on_failure",
     ];
     body.check(&attrs, &[])?;
-    let location = body.string_or("location", "UTC")?;
-    if !["UTC", "Etc/UTC"].contains(&location.as_str()) {
-        return Err(body.error(body.block.pos, "location: UTC only"));
-    }
+    let pos = body.block.pos;
+    let zone = match body.string("location")? {
+        Some(name) => Some(Zone::load(&name).map_err(|e| body.error(pos, &e))?),
+        None => None,
+    };
+    let fudge = match body.string_or("action_on_failure", "fudge")?.as_str() {
+        "fudge" => true,
+        "skip" => false,
+        other => {
+            let message = format!("action_on_failure `{other}`");
+            return Err(body.error(pos, &message));
+        }
+    };
     let mut formats = vec![body.required("format")?];
     formats.extend(body.strings("fallback_formats")?);
-    Ok(Stage::Timestamp(body.required("source")?, formats))
+    Ok(Stage::Timestamp(Timestamp {
+        source: body.required("source")?,
+        formats,
+        zone,
+        fudge,
+        last: Default::default(),
+    }))
 }
 
 fn matched(body: &Body) -> Result<Stage, String> {

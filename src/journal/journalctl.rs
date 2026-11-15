@@ -24,6 +24,8 @@ pub struct Journal {
     restart_at: Instant,
     max_age: Duration,
     source: Source,
+    /// The component's id: where its cursor is kept.
+    id: String,
 }
 
 /// An entry's cursor and the fields sent.
@@ -35,7 +37,11 @@ struct Entry<'a> {
 
 impl Journal {
     /// None on a host without systemd.
-    pub fn new(max_age: Duration, source: Source) -> Option<Journal> {
+    pub fn new(
+        id: String,
+        max_age: Duration,
+        source: Source,
+    ) -> Option<Journal> {
         host::path("/run/systemd/system").is_dir().then(|| Journal {
             child: None,
             read_any: false,
@@ -43,6 +49,7 @@ impl Journal {
             restart_at: Instant::now(),
             max_age,
             source,
+            id,
         })
     }
 
@@ -110,8 +117,8 @@ impl Journal {
             let status = child.wait();
             eprintln!("Journal: journalctl stopped: {status:?}");
             let failed = !status.is_ok_and(|status| status.success());
-            if failed && !self.read_any && positions.journal.take().is_some() {
-                positions.touch();
+            if failed && !self.read_any {
+                positions.forget_cursor(&self.id);
             }
         }
         self.buf.clear();
@@ -125,8 +132,7 @@ impl Journal {
             self.read_any = true;
             if let Some(cursor) = entry.cursor {
                 let cursor = String::from_utf8_lossy(cursor).into_owned();
-                positions.journal = Some(cursor);
-                positions.touch();
+                positions.set_cursor(&self.id, cursor);
             }
             deliver(&self.source, &entry.fields, logs);
         }
@@ -141,7 +147,7 @@ impl Journal {
 
 impl Part for Journal {
     fn prepare(&mut self, positions: &Positions) {
-        self.ensure_running(positions.journal.as_deref());
+        self.ensure_running(positions.cursor(&self.id));
     }
 
     fn fds(&self) -> Vec<RawFd> {

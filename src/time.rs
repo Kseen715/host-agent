@@ -1,6 +1,7 @@
 //! Wall-clock time as Prometheus and Loki take it, and Docker's
 //! RFC 3339 timestamps read without a date library.
 
+use crate::zone::Zone;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn now_ns() -> i64 {
@@ -54,7 +55,7 @@ fn offset_seconds(text: &str) -> Option<i64> {
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Howard
 /// Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
@@ -63,6 +64,19 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_era =
         year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+/// The year of `seconds` since the epoch.
+pub fn year_of(seconds: i64) -> i64 {
+    let days = seconds.div_euclid(86_400);
+    let mut year = 1970 + days * 400 / 146_097;
+    while days_from_civil(year, 1, 1) > days {
+        year -= 1;
+    }
+    while days_from_civil(year + 1, 1, 1) <= days {
+        year += 1;
+    }
+    year
 }
 
 /// A Go or Prometheus duration: `90s`, `1h30m`, `500ms`, `7d`.
@@ -155,12 +169,20 @@ struct Read {
     second: i64,
     nanos: i64,
     pm: Option<bool>,
-    offset: i64,
+    /// A numeric offset read: it wins over the location.
+    offset: Option<i64>,
+    abbreviation: Option<String>,
 }
 
 /// `text` read with a Go layout (`2006-01-02 15:04:05`), as
-/// nanoseconds since the epoch; a zone name counts as UTC.
-pub fn parse_layout(layout: &str, text: &str) -> Option<i64> {
+/// nanoseconds since the epoch, as Go's ParseInLocation reads it: a
+/// time without an offset is in `zone` (UTC without), an abbreviation
+/// one the zone uses or else UTC.
+pub fn parse_layout(
+    layout: &str,
+    text: &str,
+    zone: Option<&Zone>,
+) -> Option<i64> {
     let (mut layout, mut text) = (layout, text);
     let mut read = Read {
         month: 1,
@@ -192,7 +214,7 @@ pub fn parse_layout(layout: &str, text: &str) -> Option<i64> {
     if !text.is_empty() {
         return None;
     }
-    read.nanos()
+    read.nanos(zone)
 }
 
 impl Read {
@@ -202,7 +224,11 @@ impl Read {
             "January" | "Jan" => return self.month_name(text, element.len()),
             "Monday" | "Mon" | "MST" => {
                 let n = text.bytes().take_while(u8::is_ascii_alphabetic);
-                return Some(&text[n.count()..]);
+                let (name, rest) = text.split_at(n.count());
+                if element == "MST" {
+                    self.abbreviation = Some(name.to_owned());
+                }
+                return Some(rest);
             }
             "PM" | "pm" => {
                 let (head, rest) = (text.get(..2)?, &text[2..]);
@@ -247,6 +273,7 @@ impl Read {
     fn zone<'a>(&mut self, element: &str, text: &'a str) -> Option<&'a str> {
         if element.starts_with('Z') {
             if let Some(rest) = text.strip_prefix('Z') {
+                self.offset = Some(0);
                 return Some(rest);
             }
         }
@@ -264,7 +291,7 @@ impl Read {
                 .unwrap_or(rest);
             (minutes, rest) = digits(rest, 2, 2)?;
         }
-        self.offset = sign * (hours * 3600 + minutes * 60);
+        self.offset = Some(sign * (hours * 3600 + minutes * 60));
         Some(rest)
     }
 
@@ -290,7 +317,7 @@ impl Read {
         Some(&after[count..])
     }
 
-    fn nanos(&self) -> Option<i64> {
+    fn nanos(&self, zone: Option<&Zone>) -> Option<i64> {
         let year = self.year.unwrap_or_else(|| {
             1970 + now_ns().div_euclid(31_556_952_000_000_000)
         });
@@ -300,8 +327,15 @@ impl Read {
             _ => self.hour,
         };
         let days = days_from_civil(year, self.month, self.day);
-        let seconds = days * 86_400 + hour * 3600 + self.minute * 60;
-        Some((seconds + self.second - self.offset) * 1_000_000_000 + self.nanos)
+        let wall = days * 86_400 + hour * 3600 + self.minute * 60 + self.second;
+        let named = |z: &Zone| z.named(self.abbreviation.as_deref()?);
+        let offset = match (self.offset, &self.abbreviation, zone) {
+            (Some(offset), ..) => offset,
+            (None, Some(_), Some(zone)) => named(zone).unwrap_or(0),
+            (None, None, Some(zone)) => zone.offset_of_local(wall),
+            _ => 0,
+        };
+        Some((wall - offset) * 1_000_000_000 + self.nanos)
     }
 }
 
@@ -345,18 +379,18 @@ mod tests {
     #[test]
     fn reads_go_layouts() {
         let rfc = named_layout("RFC3339Nano");
-        let ns = parse_layout(rfc, "2026-10-25T17:29:39.083219699Z");
+        let ns = parse_layout(rfc, "2026-10-25T17:29:39.083219699Z", None);
         assert_eq!(ns, Some(1_792_949_379_083_219_699));
-        let east = parse_layout(rfc, "1970-01-01T03:00:00+03:00");
+        let east = parse_layout(rfc, "1970-01-01T03:00:00+03:00", None);
         assert_eq!(east, Some(0));
         let ruby = named_layout("RubyDate");
-        let ns = parse_layout(ruby, "Thu Jan 01 01:00:01 +0100 1970");
+        let ns = parse_layout(ruby, "Thu Jan 01 01:00:01 +0100 1970", None);
         assert_eq!(ns, Some(1_000_000_000));
         let custom = "02/Jan/2006:15:04:05 -0700";
-        let ns = parse_layout(custom, "01/Jan/1970:00:00:02.5 +0000");
+        let ns = parse_layout(custom, "01/Jan/1970:00:00:02.5 +0000", None);
         assert_eq!(ns, Some(2_500_000_000));
-        let midnight = parse_layout("3:04PM", "12:00AM");
+        let midnight = parse_layout("3:04PM", "12:00AM", None);
         assert_eq!(midnight.map(|n| n / 1_000_000_000 % 86_400), Some(0));
-        assert_eq!(parse_layout("2006-01-02", "1970-01-0x"), None);
+        assert_eq!(parse_layout("2006-01-02", "1970-01-0x", None), None);
     }
 }
