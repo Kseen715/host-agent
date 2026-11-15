@@ -4,7 +4,8 @@
 
 use crate::host;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 /// v1 counts CPU time in USER_HZ ticks, 100 a second.
 const TICKS: f64 = 100.0;
@@ -87,6 +88,36 @@ impl Cgroup {
             return Cgroup::V2(host::path("/sys/fs/cgroup"));
         }
         Cgroup::V1(v1_dirs(&read(host::path("/proc/1/cgroup")), true))
+    }
+
+    /// Every cgroup under the root but itself, by path (cAdvisor's
+    /// `id`), parents first: those of the memory controller on v1.
+    pub fn all() -> Vec<(String, Cgroup)> {
+        let root = Cgroup::root();
+        let mut paths = Vec::new();
+        below(&root.file("memory", ""), "", &mut paths);
+        paths
+            .into_iter()
+            .map(|path| {
+                let under = |dir: &PathBuf| dir.join(&path[1..]);
+                let cgroup = match &root {
+                    Cgroup::V2(dir) => Cgroup::V2(under(dir)),
+                    Cgroup::V1(dirs) => Cgroup::V1(
+                        dirs.iter()
+                            .map(|(c, d)| (c.clone(), under(d)))
+                            .collect(),
+                    ),
+                };
+                (path, cgroup)
+            })
+            .collect()
+    }
+
+    /// When the cgroup was made, as cAdvisor's raw handler takes it: its
+    /// directory's modification time, in seconds.
+    pub fn created(&self) -> f64 {
+        let meta = fs::metadata(self.file("memory", ""));
+        meta.map_or(0.0, |m| m.mtime() as f64)
     }
 
     /// The process's cgroup path (cAdvisor's `id`) and its cgroup. A
@@ -357,6 +388,23 @@ fn fields(line: &str) -> Option<[&str; 3]> {
 /// Each v1 controller's directory, from /proc/<pid>/cgroup: each
 /// hierarchy is mounted under its controllers' names (`cpu,cpuacct`).
 /// `root`: the hierarchies' roots instead of the process's cgroups.
+fn below(dir: &Path, path: &str, found: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    children.sort();
+    for child in children {
+        let path = format!("{path}/{child}");
+        found.push(path.clone());
+        below(&dir.join(&child), &path, found);
+    }
+}
+
 fn v1_dirs(text: &str, root: bool) -> Vec<(String, PathBuf)> {
     let mut dirs = Vec::new();
     for [_, controllers, path] in text.lines().filter_map(fields) {

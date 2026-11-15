@@ -51,8 +51,9 @@ journalctl), `journal-files` (from the files, without journalctl),
 Off by default: `journal-xz` (fields journald compressed with xz,
 before systemd 246), `tokio` (SNMP devices polled by tasks on one
 thread instead of a thread each), `tls` (HTTPS for scrapes, remote
-write, Loki and OAuth2 tokens, and syslog over TLS: rustls on ring,
-+0.9 MB, and a C compiler for the target), `decompression`
+write, Loki and OAuth2 tokens, syslog over TLS and `google_iam`'s
+signed tokens: rustls on ring, +0.9 MB, and a C compiler for the
+target), `yaml` (`encoding.from_yaml`: yaml-rust2), `decompression`
 (`loki.source.file`'s gzip, zlib, bzip2: pure Rust), `encodings`
 (its encodings other than UTF-8, UTF-16 and Latin-1, by WHATWG's
 labels: encoding_rs). A smaller build:
@@ -85,12 +86,16 @@ Docker's socket and the containers' `/proc` need it.
 Alloy's syntax: blocks, attributes, references between components
 (`prometheus.remote_write.default.receiver`), `constants.*` and
 Alloy's standard library: `sys.env`, `convert.nonsensitive`,
-`string.*`, `encoding.*` but `from_yaml`, `array.concat`,
-`.combine_maps` (on targets that change too), `.group_by`,
-`file.path_join`, `coalesce`, `json_path` (`$`, `.name`, `..`, `*`,
-`[n]`, `['name']`), and the deprecated names. Components:
+`string.*`, `encoding.*` (`from_yaml` with feature `yaml`),
+`array.concat`, `.combine_maps` (on targets that change too),
+`.group_by` (its groups sorted: Alloy's order is random),
+`file.path_join`, `coalesce`, `json_path` (as ojg's jp: paths,
+wildcards, slices, unions, filters), and the deprecated names. Numbers
+keep their kind: `7 / 2` is `3`, `string.format("%f", 1.0)` is
+`1.000000`. Components:
 
-- `prometheus.exporter.unix`, `.self`, `.cadvisor`, `.snmp`;
+- `prometheus.exporter.unix`, `.self`, `.cadvisor` (raw cgroups too,
+  by `raw_cgroup_prefix_allowlist`, unless `docker_only`), `.snmp`;
   `prometheus.scrape`, `prometheus.relabel`, `prometheus.remote_write`;
 - `discovery.docker`, `discovery.file`, `discovery.relabel`,
   `local.file_match`;
@@ -110,21 +115,26 @@ take Prometheus's client settings: `basic_auth`, `authorization`,
 `bearer_token[_file]`, `oauth2` (client credentials), `tls_config`,
 `proxy_url`, `no_proxy`, `proxy_from_environment`,
 `proxy_connect_header`, `http_headers`, `follow_redirects`, with
-Prometheus's checks; HTTP/1.1 only. The unix exporter takes each
-collector's block, `cpu`'s info, flags and bugs included; `processes`
-and `systemd` are off unless enabled, as in Alloy. Templates are Go's
-text/template with Promtail's functions and the string and number
-functions of sprig; an unknown function is refused when read.
+Prometheus's checks; HTTP/1.1 only. `remote_write` endpoints also sign
+in to clouds: `sigv4` (keys from the config, the environment, the
+shared file, web identity, ECS, EC2; `role_arn`), `azuread` (managed
+or workload identity, client secret, the SDK's chain), `google_iam`
+(a credentials file or the default ones; feature `tls`). The unix
+exporter takes each collector's block, `cpu`'s info, flags and bugs
+included; `processes` and `systemd` are off unless enabled, as in
+Alloy. Templates are Go's text/template with Promtail's functions and
+the string and number functions of sprig; an unknown function is refused when read.
 
-Settings that change how, not what, is sent (queue shards and
-capacities, the WAL's, cache sizes, refresh intervals,
-`max_backoff_retries`: the agent waits instead of dropping) are
-checked for their type and have no effect. What it cannot do as Alloy
-would (another component, attribute or block, such as
-`loki.source.kafka`, `sigv4`, `encoding.from_yaml`, cAdvisor's
-`docker_only = false`) is refused with its position in the file, never
-ignored. `logging`, `livedebugging` and `tracing` are accepted and
-ignored.
+Honored as in Alloy: `max_samples_per_send`, `sample_age_limit`, the
+WAL's `max_keepalive_time` (how long unsent chunks wait on disk),
+`loki.write`'s `max_streams` and `max_backoff_retries` (0: forever),
+`refresh_interval` and `sync_period`. Settings for concurrency or
+memory only (queue shards and capacities, the WAL's truncation, cache
+sizes, `enable_http2`: HTTP/1.1 only) are checked for their type and
+have no effect. What it cannot do as Alloy would (another component,
+attribute or block, such as `loki.source.kafka`) is refused with its
+position in the file, never ignored. `logging`, `livedebugging` and
+`tracing` are accepted and ignored.
 
 ## Docker
 

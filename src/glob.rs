@@ -122,6 +122,28 @@ fn class(pattern: &[u8], byte: u8) -> Option<(bool, &[u8])> {
     Some((found != negated, &body[end + 1..]))
 }
 
+/// Go's path.Clean.
+pub fn clean(path: &str) -> String {
+    let rooted = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != "..") => {
+                parts.pop();
+            }
+            ".." if rooted => {}
+            part => parts.push(part),
+        }
+    }
+    let body = parts.join("/");
+    match (rooted, body.is_empty()) {
+        (true, _) => format!("/{body}"),
+        (false, true) => ".".into(),
+        (false, false) => body,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

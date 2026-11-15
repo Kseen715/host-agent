@@ -7,9 +7,10 @@ use crate::glob;
 use crate::host;
 use crate::json::Json;
 use crate::relabel::{self, Labels, Rule};
+use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
 pub enum Targets {
@@ -27,6 +28,17 @@ pub enum Targets {
     /// local.file_match's: a target per file its `__path__` matches,
     /// less those modified longer ago than the duration.
     FileMatch(Box<Targets>, Option<Duration>),
+    /// Its targets resolved again only once the duration has passed:
+    /// discovery's refresh_interval, file_match's sync_period.
+    Cached(Box<Targets>, Duration, Rc<RefCell<Option<Resolved>>>),
+}
+
+/// Targets as last resolved, and when.
+type Resolved = (Instant, Vec<Labels>);
+
+/// `inner`, resolved at most once every `every`.
+pub fn cached(inner: Targets, every: Duration) -> Targets {
+    Targets::Cached(Box::new(inner), every, Rc::default())
 }
 
 impl Targets {
@@ -55,6 +67,19 @@ impl Targets {
                 .iter()
                 .flat_map(|target| file_match(target, *older))
                 .collect(),
+            Targets::Cached(inner, every, kept) => {
+                let mut kept = kept.borrow_mut();
+                match kept.as_ref() {
+                    Some((at, targets)) if at.elapsed() < *every => {
+                        targets.clone()
+                    }
+                    _ => {
+                        let targets = inner.resolve(docker);
+                        *kept = Some((Instant::now(), targets.clone()));
+                        targets
+                    }
+                }
+            }
         }
     }
 }
@@ -220,6 +245,10 @@ mod tests {
         let found = matched.resolve(&[]);
         assert_eq!(found.len(), 1);
         assert!(get(&found[0], "__path__").ends_with("/t.json"));
+        let kept = cached(matched, Duration::from_secs(60));
+        assert_eq!(kept.resolve(&[]).len(), 1);
+        fs::write(dir.join("u.json"), groups).unwrap();
+        assert_eq!(kept.resolve(&[]).len(), 1, "resolved again too soon");
         fs::remove_dir_all(dir).unwrap();
     }
 }

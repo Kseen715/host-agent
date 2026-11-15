@@ -66,6 +66,33 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
+/// `seconds` since the epoch as UTC's year, month, day, hour, minute,
+/// second (Howard Hinnant's civil_from_days).
+pub fn civil(seconds: i64) -> [i64; 6] {
+    let days = seconds.div_euclid(86_400);
+    let of_day = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = (month_from_march + 2) % 12 + 1;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    [
+        year,
+        month,
+        day,
+        of_day / 3600,
+        of_day / 60 % 60,
+        of_day % 60,
+    ]
+}
+
 /// The year of `seconds` since the epoch.
 pub fn year_of(seconds: i64) -> i64 {
     let days = seconds.div_euclid(86_400);
@@ -355,6 +382,13 @@ fn digits(text: &str, min: usize, max: usize) -> Option<(i64, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_seconds_into_dates() {
+        let at = parse_rfc3339("2024-02-29T23:59:58Z").unwrap() / 1_000_000_000;
+        assert_eq!(civil(at), [2024, 2, 29, 23, 59, 58]);
+        assert_eq!(civil(0), [1970, 1, 1, 0, 0, 0]);
+    }
 
     #[test]
     fn reads_docker_timestamps() {

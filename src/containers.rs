@@ -24,7 +24,14 @@ const TASK_STATES: [&str; 5] = [
     "uninterruptible",
 ];
 
-pub fn collect(w: &mut Writer, containers: &[Container], now_s: f64) {
+/// `raw`: the prefixes of other cgroups to report, as cAdvisor's raw
+/// factory does, with `id` alone.
+pub fn collect(
+    w: &mut Writer,
+    containers: &[Container],
+    raw: &[String],
+    now_s: f64,
+) {
     machine::collect(w);
     let boot = host::boot_time();
     let root = [("id", "/")];
@@ -46,11 +53,13 @@ pub fn collect(w: &mut Writer, containers: &[Container], now_s: f64) {
     w.add("container_health_state", &root, -1.0);
     w.add("container_last_seen", &root, now_s);
 
+    let mut engines = Vec::new();
     for container in containers {
         let pid = container.details.pid;
         let Some((id, cgroup)) = Cgroup::of(pid, &container.id) else {
             continue;
         };
+        engines.push(id.clone());
         let mut labels = vec![
             ("id", id.as_str()),
             ("image", container.image.as_str()),
@@ -69,7 +78,29 @@ pub fn collect(w: &mut Writer, containers: &[Container], now_s: f64) {
         w.add("container_health_state", &labels, container.health);
         w.add("container_last_seen", &labels, now_s);
     }
+    if !raw.is_empty() {
+        raw_cgroups(w, raw, &engines, now_s);
+    }
     w.add("container_scrape_error", &[], 0.0);
+}
+
+/// Cgroups no engine made: no network (cAdvisor reads it only for the
+/// root), no file systems.
+fn raw_cgroups(w: &mut Writer, raw: &[String], engines: &[String], now_s: f64) {
+    for (id, cgroup) in Cgroup::all() {
+        let taken = raw.iter().any(|prefix| id.starts_with(prefix.as_str()));
+        if !taken || engines.contains(&id) {
+            continue;
+        }
+        let labels = [("id", id.as_str())];
+        resources(w, &labels, &cgroup, None);
+        spec(w, &labels, &cgroup.spec(), None);
+        let created = cgroup.created();
+        w.add("container_start_time_seconds", &labels, created);
+        w.add("container_creation_time_seconds", &labels, created);
+        w.add("container_health_state", &labels, -1.0);
+        w.add("container_last_seen", &labels, now_s);
+    }
 }
 
 /// One cgroup's numbers; its network's from `net_pid`'s /proc.

@@ -1,6 +1,7 @@
 //! Just enough JSON: Docker's API answers and file_sd target lists are
 //! read into a tree, Loki's push body is written with `escape`.
 
+#[derive(Clone)]
 pub enum Json {
     Null,
     Bool(bool),

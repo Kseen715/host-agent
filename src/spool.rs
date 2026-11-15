@@ -2,10 +2,9 @@
 //! Alloy's WAL keeps them: one file per compressed chunk in
 //! `state_dir/spool`, named `<sequence>-<samples>-<newest ms>`. Sent
 //! oldest first, and new chunks wait behind them, so each series'
-//! samples arrive in order. Chunks older than MAX_AGE, or past the size
-//! cap, are dropped: Prometheus takes samples no older than an hour
-//! behind its newest (without an out-of-order window), so older ones
-//! would be refused anyway.
+//! samples arrive in order. Chunks older than the WAL's
+//! max_keepalive_time (or queue_config's sample_age_limit), or past the
+//! size cap, are dropped.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -13,7 +12,6 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const MAX_AGE_MS: i64 = 2 * 3600 * 1000;
 /// Time a flush may spend sending kept chunks: the loop has logs to
 /// read too.
 const DRAIN_FOR: Duration = Duration::from_secs(5);
@@ -28,6 +26,7 @@ pub struct Chunk {
 pub struct Spool {
     dir: PathBuf,
     max_bytes: u64,
+    max_age_ms: i64,
     chunks: VecDeque<Chunk>,
     next: u64,
 }
@@ -42,7 +41,11 @@ pub enum Sent {
 }
 
 impl Spool {
-    pub fn open(dir: PathBuf, max_bytes: u64) -> io::Result<Spool> {
+    pub fn open(
+        dir: PathBuf,
+        max_bytes: u64,
+        max_age: Duration,
+    ) -> io::Result<Spool> {
         fs::create_dir_all(&dir)?;
         let mut chunks: Vec<(u64, Chunk)> = fs::read_dir(&dir)?
             .flatten()
@@ -69,6 +72,7 @@ impl Spool {
         Ok(Spool {
             dir,
             max_bytes,
+            max_age_ms: max_age.as_millis() as i64,
             chunks: chunks.into_iter().map(|(_, chunk)| chunk).collect(),
             next,
         })
@@ -106,7 +110,7 @@ impl Spool {
         let mut dropped = 0;
         let mut total: u64 = self.chunks.iter().map(|c| c.bytes).sum();
         while let Some(oldest) = self.chunks.front() {
-            let old = now_ms - oldest.newest_ms > MAX_AGE_MS;
+            let old = now_ms - oldest.newest_ms > self.max_age_ms;
             if !old && total <= self.max_bytes {
                 break;
             }
@@ -162,13 +166,14 @@ mod tests {
     fn keeps_order_and_caps() {
         let dir =
             std::env::temp_dir().join(format!("spool-{}", std::process::id()));
-        let mut spool = Spool::open(dir.clone(), 10).unwrap();
+        let hour = Duration::from_secs(3600);
+        let mut spool = Spool::open(dir.clone(), 10, hour).unwrap();
         assert_eq!(spool.push(b"aaaa", 1, 1000), 0);
         assert_eq!(spool.push(b"bbbb", 2, 2000), 0);
         // Past 10 bytes: the oldest goes.
         assert_eq!(spool.push(b"cccc", 3, 3000), 1);
 
-        let mut spool = Spool::open(dir.clone(), 10).unwrap();
+        let mut spool = Spool::open(dir.clone(), 10, hour).unwrap();
         let mut sent = Vec::new();
         let mut taken = 0;
         spool.drain(
@@ -187,8 +192,8 @@ mod tests {
         assert_eq!(taken, 2);
         assert!(!spool.is_empty());
 
-        // Two hours on, what is left is too old.
-        spool.drain(3000 + MAX_AGE_MS + 1, |_| Sent::Done, |_, _| {});
+        // An hour on, what is left is too old.
+        spool.drain(3000 + 3_600_001, |_| Sent::Done, |_, _| {});
         assert!(spool.is_empty());
         fs::remove_dir_all(dir).unwrap();
     }

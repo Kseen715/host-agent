@@ -42,8 +42,11 @@ syslog = []
 # SNMP devices polled by tasks on one thread instead of a thread each.
 tokio = ["snmp", "dep:tokio"]
 # HTTPS for scrapes and pushes, and syslog over TLS (its listeners'
-# tls_config): rustls on ring, +~0.9 MB.
-tls = ["dep:rustls"]
+# tls_config): rustls on ring, +~0.9 MB; ring also signs google_iam's
+# service account tokens.
+tls = ["dep:rustls", "dep:ring"]
+# encoding.from_yaml (yaml-rust2, pure Rust).
+yaml = ["dep:yaml-rust2"]
 
 [dependencies]
 bzip2-rs = { version = "0.1", optional = true }
@@ -57,6 +60,7 @@ lz4_flex = { version = "0.14", optional = true, default-features = false, featur
 ] }
 lzma-rs = { version = "0.3", optional = true }
 regex-lite = "0.1"
+ring = { version = "0.17", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = [
     "ring",
     "std",
@@ -69,6 +73,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
     "rt",
     "time",
 ] }
+yaml-rust2 = { version = "0.13.0", default-features = false, optional = true }
 
 # Small and lean: an agent on every host, idle between rounds, so size
 # and memory count, speed does not.

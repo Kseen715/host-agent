@@ -114,8 +114,7 @@ fn string(name: &str, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-/// Go's fmt.Sprintf. Numbers here do not remember how they were
-/// written: a whole one is an int to it (`%d`), any other a float.
+/// Go's fmt.Sprintf.
 fn format(args: &[Value]) -> Result<Value, String> {
     let Some((Value::String(format), rest)) = args.split_first() else {
         return Err("takes a format string first".into());
@@ -125,7 +124,7 @@ fn format(args: &[Value]) -> Result<Value, String> {
         .map(|value| {
             Ok(match value {
                 Value::String(s) => Val::Str(s.clone()),
-                Value::Number(n) if n.fract() == 0.0 => Val::Int(*n as i64),
+                Value::Int(n) => Val::Int(*n),
                 Value::Number(n) => Val::Float(*n),
                 Value::Bool(b) => Val::Bool(*b),
                 Value::Null => Val::Str("<nil>".into()),
@@ -146,7 +145,8 @@ fn join(args: &[Value]) -> Result<Value, String> {
         .iter()
         .map(|item| match item {
             Value::String(s) => Ok(s.clone()),
-            Value::Number(n) => Ok(n.to_string()),
+            Value::Int(n) => Ok(n.to_string()),
+            Value::Number(n) => Ok(Val::Float(*n).text()),
             other => Err(format!("cannot join a {}", other.kind())),
         })
         .collect();
@@ -184,7 +184,7 @@ fn encode(name: &str, args: &[Value]) -> Result<Value, String> {
             let [s] = texts(args)?;
             text(encoding::unescape(s, true).ok_or("invalid URL escape")?)
         }
-        "from_yaml" => Err("YAML is not read by this agent".into()),
+        "from_yaml" => from_yaml(texts::<1>(args)?[0]),
         _ => unknown(),
     }
 }
@@ -199,6 +199,51 @@ fn decoded(
         .flatten()
         .ok_or("not base64")?;
     Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The first document, as Go's yaml.v3 decodes into `any`.
+#[cfg(feature = "yaml")]
+fn from_yaml(text: &str) -> Result<Value, String> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(text);
+    let docs = docs.map_err(|e| e.to_string())?;
+    Ok(docs.first().map_or(Value::Null, yaml_value))
+}
+
+#[cfg(not(feature = "yaml"))]
+fn from_yaml(_: &str) -> Result<Value, String> {
+    Err("built without feature `yaml`".into())
+}
+
+#[cfg(feature = "yaml")]
+fn yaml_value(yaml: &yaml_rust2::Yaml) -> Value {
+    use yaml_rust2::Yaml;
+    match yaml {
+        Yaml::Integer(n) => Value::Int(*n),
+        Yaml::Real(_) => Value::Number(yaml.as_f64().unwrap_or(f64::NAN)),
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Array(items) => {
+            Value::Array(items.iter().map(yaml_value).collect())
+        }
+        Yaml::Hash(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (yaml_key(k), yaml_value(v)))
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// A key as text: Go's yaml.v3 keeps other keys, Alloy shows them so.
+#[cfg(feature = "yaml")]
+fn yaml_key(key: &yaml_rust2::Yaml) -> String {
+    use yaml_rust2::Yaml;
+    match key {
+        Yaml::String(s) | Yaml::Real(s) => s.clone(),
+        Yaml::Integer(n) => n.to_string(),
+        Yaml::Boolean(b) => b.to_string(),
+        _ => "<nil>".into(),
+    }
 }
 
 fn from_json(json: &Json) -> Value {
@@ -229,6 +274,7 @@ fn json_of(value: &Value) -> Result<Json, String> {
     Ok(match value {
         Value::Null => Json::Null,
         Value::Bool(b) => Json::Bool(*b),
+        Value::Int(n) => Json::Num(*n as f64),
         Value::Number(n) => Json::Num(*n),
         Value::String(s) => Json::Str(s.clone()),
         Value::Array(items) => {
@@ -375,6 +421,7 @@ fn coalesce(args: Vec<Value>) -> Value {
     let empty = |value: &Value| match value {
         Value::Null => true,
         Value::Bool(b) => !b,
+        Value::Int(n) => *n == 0,
         Value::Number(n) => *n == 0.0,
         Value::String(s) => s.is_empty(),
         Value::Array(a) => a.is_empty(),
@@ -397,137 +444,15 @@ fn path_join(args: &[Value]) -> Result<Value, String> {
         .collect::<Result<_, _>>()?;
     match parts.is_empty() {
         true => Ok(Value::String(String::new())),
-        false => Ok(Value::String(clean(&parts.join("/")))),
+        false => Ok(Value::String(crate::glob::clean(&parts.join("/")))),
     }
 }
 
-/// Go's path.Clean.
-fn clean(path: &str) -> String {
-    let rooted = path.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." if parts.last().is_some_and(|p| *p != "..") => {
-                parts.pop();
-            }
-            ".." if rooted => {}
-            part => parts.push(part),
-        }
-    }
-    let body = parts.join("/");
-    match (rooted, body.is_empty()) {
-        (true, _) => format!("/{body}"),
-        (false, true) => ".".into(),
-        (false, false) => body,
-    }
-}
-
-enum Step {
-    Child(String),
-    Index(i64),
-    Wildcard,
-    /// `..`: the node and everything under it.
-    Descend,
-}
-
-/// What `path` finds in the JSON `text`, always an array. Paths take
-/// `$`, `.name`, `..`, `*`, `[n]`, `['name']`; filters, slices and
-/// unions are refused.
+/// What `path` finds in the JSON `text`, always an array.
 fn json_path(text: &str, path: &str) -> Result<Value, String> {
     let json = Json::parse(text).ok_or("not JSON")?;
-    let mut found = vec![&json];
-    for step in steps(path)? {
-        found = found
-            .into_iter()
-            .flat_map(|json| apply(&step, json))
-            .collect();
-    }
+    let found = super::json_path::find(&json, path)?;
     Ok(Value::Array(found.into_iter().map(from_json).collect()))
-}
-
-fn apply<'a>(step: &Step, json: &'a Json) -> Vec<&'a Json> {
-    match (step, json) {
-        (Step::Child(name), Json::Obj(_)) => {
-            json.get(name).into_iter().collect()
-        }
-        (Step::Index(at), Json::Arr(items)) => {
-            let at = if *at < 0 {
-                items.len() as i64 + at
-            } else {
-                *at
-            };
-            usize::try_from(at)
-                .ok()
-                .and_then(|at| items.get(at))
-                .into_iter()
-                .collect()
-        }
-        (Step::Wildcard, Json::Arr(items)) => items.iter().collect(),
-        (Step::Wildcard, Json::Obj(fields)) => {
-            let mut sorted: Vec<_> = fields.iter().collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            sorted.into_iter().map(|(_, v)| v).collect()
-        }
-        (Step::Descend, _) => {
-            let mut all = vec![json];
-            for child in apply(&Step::Wildcard, json) {
-                all.extend(apply(&Step::Descend, child));
-            }
-            all
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn steps(path: &str) -> Result<Vec<Step>, String> {
-    let refused = || format!("`{path}`: only $ . .. * [n] ['name'] here");
-    let mut rest = path.strip_prefix('$').unwrap_or(path);
-    let mut steps = Vec::new();
-    if !rest.is_empty() && !rest.starts_with(['.', '[']) {
-        rest = name_step(rest, &mut steps);
-    }
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix("..") {
-            steps.push(Step::Descend);
-            rest = match after.starts_with('[') {
-                true => after,
-                false => name_step(after, &mut steps),
-            };
-        } else if let Some(after) = rest.strip_prefix('.') {
-            rest = name_step(after, &mut steps);
-        } else if let Some(after) = rest.strip_prefix('[') {
-            let (inside, after) = after.split_once(']').ok_or_else(refused)?;
-            steps.push(bracket(inside.trim()).ok_or_else(refused)?);
-            rest = after;
-        } else {
-            return Err(refused());
-        }
-    }
-    Ok(steps)
-}
-
-/// A name or `*` up to the next `.` or `[`; the rest of the path.
-fn name_step<'a>(text: &'a str, steps: &mut Vec<Step>) -> &'a str {
-    let end = text.find(['.', '[']).unwrap_or(text.len());
-    match &text[..end] {
-        "*" => steps.push(Step::Wildcard),
-        name => steps.push(Step::Child(name.to_owned())),
-    }
-    &text[end..]
-}
-
-fn bracket(inside: &str) -> Option<Step> {
-    if inside == "*" {
-        return Some(Step::Wildcard);
-    }
-    if let Ok(at) = inside.parse() {
-        return Some(Step::Index(at));
-    }
-    let quoted = ['\'', '"']
-        .iter()
-        .find_map(|&q| inside.strip_prefix(q)?.strip_suffix(q))?;
-    (!quoted.contains(['\'', '"'])).then(|| Step::Child(quoted.to_owned()))
 }
 
 #[cfg(test)]
@@ -572,7 +497,7 @@ mod tests {
             assert_eq!(text(call(name, args).unwrap()), want, "{name}");
         }
         assert!(call("encoding.from_base64", vec![s("YQ")]).is_err());
-        let number = Value::Number(9.0);
+        let number = Value::Int(9);
         let formatted = call("format", vec![s("%s:%d"), s("h"), number]);
         assert_eq!(text(formatted.unwrap()), "h:9");
         let parts = call("split", vec![s("a,b"), s(",")]).unwrap();
@@ -585,16 +510,12 @@ mod tests {
         assert!(matches!(last, Ok(Value::Bool(false))));
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
-    fn finds_json_paths() {
-        let doc = r#"{"a":{"b":[{"c":1},{"c":2}]},"d":{"c":3}}"#;
-        let found = |path: &str| json(json_path(doc, path).unwrap());
-        assert_eq!(found("$.a.b[1].c"), "[2]");
-        assert_eq!(found(".a.b[-1]"), r#"[{"c":2}]"#);
-        assert_eq!(found("$..c"), "[1,2,3]");
-        assert_eq!(found("$['d'].*"), "[3]");
-        assert_eq!(found("$.x"), "[]");
-        assert!(json_path(doc, "$.a[?(@.b)]").is_err());
+    fn reads_yaml() {
+        let text = "a: [1, 2.5, x]\nb: {c: true, 3: null}\n";
+        let found = call("encoding.from_yaml", vec![s(text)]).unwrap();
+        assert_eq!(json(found), r#"{"a":[1,2.5,"x"],"b":{"3":null,"c":true}}"#);
     }
 
     #[test]

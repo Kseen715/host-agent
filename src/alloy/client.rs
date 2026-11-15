@@ -6,7 +6,7 @@ use super::compile::Body;
 use crate::http::Client;
 use crate::http::auth::{Auth, OAuth2, Secret};
 use crate::http::proxy::{Proxy, Route};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 const PROXY_ATTRS: [&str; 4] = [
@@ -64,15 +64,12 @@ pub fn http(body: &Body, timeout: Duration) -> Result<Client, String> {
     let mut client = Client {
         timeout,
         headers: header_lines(body, "http_headers")?,
-        auth: auth(body)?,
+        auth: auth(body, timeout)?,
         follow_redirects: body.bool_or("follow_redirects", true)?,
         proxy: proxy(body)?,
         #[cfg(feature = "tls")]
         tls: None,
     };
-    if let Auth::OAuth2(oauth) = &mut client.auth {
-        Arc::get_mut(oauth).expect("not shared yet").client.timeout = timeout;
-    }
     tls(body, &mut client)?;
     Ok(client)
 }
@@ -122,7 +119,7 @@ fn line(
     Ok(format!("{name}: {value}\r\n"))
 }
 
-fn auth(body: &Body) -> Result<Auth, String> {
+fn auth(body: &Body, timeout: Duration) -> Result<Auth, String> {
     let given = [
         body.block("basic_auth").is_some(),
         body.block("authorization").is_some(),
@@ -143,7 +140,7 @@ fn auth(body: &Body) -> Result<Auth, String> {
         });
     }
     if let Some(oauth) = body.block("oauth2") {
-        return oauth2(&oauth);
+        return oauth2(&oauth, timeout);
     }
     let bearer = |credentials| Auth::Header {
         kind: "Bearer".into(),
@@ -176,7 +173,7 @@ fn authorization(body: &Body) -> Result<Auth, String> {
 }
 
 /// A secret given as `text` or in the file `file`, not both.
-fn secret(
+pub fn secret(
     body: &Body,
     text: &str,
     file: &str,
@@ -196,7 +193,7 @@ fn secret(
     }
 }
 
-fn oauth2(body: &Body) -> Result<Auth, String> {
+fn oauth2(body: &Body, timeout: Duration) -> Result<Auth, String> {
     let attrs = [
         "client_id",
         "client_secret",
@@ -218,19 +215,20 @@ fn oauth2(body: &Body) -> Result<Auth, String> {
         body.error(body.attr_pos("token_url"), &unusable_url())
     })?;
     let mut client = Client {
+        timeout,
         proxy: proxy(body)?,
         ..Client::default()
     };
     tls(body, &mut client)?;
-    Ok(Auth::OAuth2(Arc::new(OAuth2 {
+    let oauth = OAuth2 {
         client_id,
         secret,
         scopes: body.strings("scopes")?,
         token_url,
         params: body.labels("endpoint_params")?,
         client,
-        token: Mutex::new(None),
-    })))
+    };
+    Ok(Auth::Token(Arc::new(oauth.tokens())))
 }
 
 /// An oauth2 attribute that may not be empty.
@@ -406,11 +404,37 @@ mod tests {
             (r#"no_proxy = "x""#, "proxy_url must also"),
             (r#"proxy_url = "socks5://p""#, "only http://"),
             (r#"authorization { type = "Basic" }"#, "basic_auth"),
-            (r#"sigv4 { }"#, "not supported"),
         ];
         for (endpoint, error) in refused {
             let found = remote(endpoint).err().unwrap_or_default();
             assert!(found.contains(error), "{endpoint}: {found}");
         }
+    }
+
+    #[test]
+    fn checks_cloud_sign_ins() {
+        let refused = [
+            (r#"sigv4 { access_key = "a" }"#, "access key and secret"),
+            (r#"sigv4 { external_id = "x" }"#, "only be used with role"),
+            (r#"sigv4 { } basic_auth { }"#, "at most one of sigv4"),
+            (r#"azuread { }"#, "must provide an Azure Managed"),
+            (
+                r#"azuread { managed_identity { client_id = "x" } }"#,
+                "client_id is invalid",
+            ),
+            (r#"azuread { cloud = "Mars" }"#, "must provide a cloud"),
+        ];
+        for (endpoint, error) in refused {
+            let found = remote(endpoint).err().unwrap_or_default();
+            assert!(found.contains(error), "{endpoint}: {found}");
+        }
+        let keys =
+            r#"sigv4 { region = "r" access_key = "a" secret_key = "s" }"#;
+        assert!(remote(keys).is_ok());
+        let id = "00000000-1111-2222-3333-444444444444";
+        let azure = format!(
+            "azuread {{ managed_identity {{ client_id = \"{id}\" }} }}"
+        );
+        assert!(remote(&azure).is_ok());
     }
 }

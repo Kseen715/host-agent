@@ -1,7 +1,8 @@
 //! Prometheus remote write: each sample is encoded into the request's
 //! protobuf as it is collected, with no table of series kept between
-//! rounds, and sent in snappy-compressed chunks of `CHUNK` bytes; a
-//! chunk Prometheus does not take now waits on disk (crate::spool).
+//! rounds, and sent in snappy-compressed chunks of queue_config's
+//! max_samples_per_send; a chunk Prometheus does not take now waits on
+//! disk (crate::spool).
 //! Samples reach each prometheus.remote_write through the
 //! prometheus.relabel components their scrape forwards to. `--print`
 //! writes the text exposition format to stdout instead.
@@ -16,7 +17,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-const CHUNK: usize = 256 << 10;
+/// queue_config's max_samples_per_send and the WAL's
+/// max_keepalive_time, unless set.
+const MAX_SAMPLES: u64 = 2000;
+const MAX_AGE: Duration = Duration::from_secs(8 * 3600);
 /// Waits between tries while Prometheus does not answer, unless
 /// queue_config says otherwise: chunks go straight to the spool
 /// meanwhile.
@@ -304,6 +308,9 @@ pub struct RemoteWrite {
     backoff: Duration,
     retry_at: Option<Instant>,
     pub retry: Retry,
+    pub max_samples: u64,
+    /// How long a chunk not taken is kept.
+    pub max_age: Duration,
     pub stats: Stats,
 }
 
@@ -338,6 +345,8 @@ impl RemoteWrite {
                 max: BACKOFF.1,
                 on_429: true,
             },
+            max_samples: MAX_SAMPLES,
+            max_age: MAX_AGE,
             stats: Stats::default(),
         })
     }
@@ -367,7 +376,7 @@ impl RemoteWrite {
         self.body.extend_from_slice(&self.series);
         self.in_body += 1;
         self.body_newest_ms = self.body_newest_ms.max(ms);
-        if self.body.len() >= CHUNK {
+        if self.in_body >= self.max_samples {
             self.flush();
         }
     }

@@ -14,7 +14,7 @@ use crate::logs::{self, Source};
 use crate::loki::Loki;
 use crate::relabel::Labels;
 use crate::remote::{self, RemoteWrite};
-use crate::targets::Targets;
+use crate::targets::{self, Targets};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -97,18 +97,28 @@ fn receiver(capsule: Capsule) -> Value {
     export(vec![("receiver", Value::Capsule(capsule))])
 }
 
+/// The `wal` block's max_keepalive_time, when set: the spool's age.
+fn keepalive(body: &Body) -> Result<Option<Duration>, String> {
+    let Some(wal) = body.block("wal") else {
+        return Ok(None);
+    };
+    let attrs = [
+        "truncate_frequency",
+        "min_keepalive_time",
+        "max_keepalive_time",
+    ];
+    wal.check(&attrs, &[])?;
+    // A spool, not a WAL: chunks go once sent, nothing to truncate.
+    wal.tuning(&attrs[..2], &[])?;
+    match wal.value("max_keepalive_time")? {
+        Some(_) => Ok(Some(wal.duration_or("max_keepalive_time", "8h")?)),
+        None => Ok(None),
+    }
+}
+
 fn remote_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["external_labels"], &["endpoint", "wal"])?;
-    if let Some(wal) = body.block("wal") {
-        let attrs = [
-            "truncate_frequency",
-            "min_keepalive_time",
-            "max_keepalive_time",
-        ];
-        wal.check(&attrs, &[])?;
-        // Kept here in the spool, not a WAL.
-        wal.tuning(&attrs, &[])?;
-    }
+    let keepalive = keepalive(body)?;
     let external = body.labels("external_labels")?;
     let mut writes = Vec::new();
     for (index, endpoint) in body.blocks("endpoint").enumerate() {
@@ -116,7 +126,9 @@ fn remote_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         if index > 0 {
             name = format!("{name}-{index}");
         }
-        let sink = remote_endpoint(&endpoint, &name, external.clone(), plan)?;
+        let mut sink =
+            remote_endpoint(&endpoint, &name, external.clone(), plan)?;
+        sink.max_age = sink.max_age.min(keepalive.unwrap_or(sink.max_age));
         plan.metrics.sinks.push(sink);
         let kind = remote::Kind::Write(plan.metrics.sinks.len() - 1);
         let mut node = metrics_at(plan, kind, Rc::from([]));
@@ -146,8 +158,7 @@ const REMOTE_ATTRS: [&str; 8] = [
     "round_robin_dns",
 ];
 
-/// One remote_write `endpoint`. sigv4, azuread and google_iam are
-/// refused: cloud sign-ins this agent lacks.
+/// One remote_write `endpoint`.
 fn remote_endpoint(
     endpoint: &Body,
     name: &str,
@@ -155,6 +166,7 @@ fn remote_endpoint(
     plan: &Plan,
 ) -> Result<RemoteWrite, String> {
     let own = ["queue_config", "metadata_config", "write_relabel_config"];
+    let own = client::with(&own, &super::cloud::BLOCKS);
     endpoint.check(
         &client::with(&REMOTE_ATTRS, &client::ATTRS),
         &client::with(&own, &client::BLOCKS),
@@ -178,13 +190,14 @@ fn remote_endpoint(
     let name = endpoint.string_or("name", name)?;
     let timeout = endpoint.duration_or("remote_timeout", "30s")?;
     let mut client = client::http(endpoint, timeout)?;
+    super::cloud::auth(endpoint, &mut client)?;
     client.headers.push_str(&endpoint_headers(endpoint)?);
     let sink = RemoteWrite::new(&url, &name, external, client, plan.print);
     let pos = endpoint.attr_pos("url");
     let mut sink =
         sink.ok_or_else(|| endpoint.error(pos, &client::unusable_url()))?;
     if let Some(queue) = endpoint.block("queue_config") {
-        sink.retry = queue_config(&queue, sink.retry)?;
+        queue_config(&queue, &mut sink)?;
     }
     if let Some(metadata) = endpoint.block("metadata_config") {
         let attrs = ["send", "send_interval", "max_samples_per_send"];
@@ -195,29 +208,44 @@ fn remote_endpoint(
     Ok(sink)
 }
 
-/// queue_config: its backoff and retry_on_http_429 apply; the rest
-/// shapes Prometheus's shards, which this agent has not (README).
-fn queue_config(queue: &Body, retry: Retry) -> Result<Retry, String> {
-    let durations = ["batch_send_deadline", "sample_age_limit"];
-    let numbers = [
-        "capacity",
-        "max_shards",
-        "min_shards",
+/// queue_config: the backoff, retries on 429, samples per request and
+/// their age limit apply. batch_send_deadline holds: each round is sent
+/// as it ends. The shards and their capacity are Prometheus's way to
+/// send in parallel; this agent sends in turn (README).
+fn queue_config(queue: &Body, sink: &mut RemoteWrite) -> Result<(), String> {
+    let numbers = ["capacity", "max_shards", "min_shards"];
+    let mut attrs = vec![
+        "min_backoff",
+        "max_backoff",
+        "retry_on_http_429",
         "max_samples_per_send",
+        "sample_age_limit",
+        "batch_send_deadline",
     ];
-    let mut attrs = vec!["min_backoff", "max_backoff", "retry_on_http_429"];
-    attrs.extend(durations.iter().chain(&numbers));
+    attrs.extend(numbers);
     queue.check(&attrs, &[])?;
-    queue.tuning(&durations, &numbers)?;
+    queue.tuning(&["batch_send_deadline"], &numbers)?;
     let given = |name: &str, default| match queue.value(name)? {
         Some(_) => queue.duration_or(name, "0s"),
         None => Ok(default),
     };
-    Ok(Retry {
-        min: given("min_backoff", retry.min)?,
-        max: given("max_backoff", retry.max)?,
+    sink.retry = Retry {
+        min: given("min_backoff", sink.retry.min)?,
+        max: given("max_backoff", sink.retry.max)?,
         on_429: queue.bool_or("retry_on_http_429", true)?,
-    })
+    };
+    if let Some(max) = queue.number("max_samples_per_send")? {
+        if max < 1.0 {
+            let pos = queue.attr_pos("max_samples_per_send");
+            return Err(queue.error(pos, "max_samples_per_send: at least 1"));
+        }
+        sink.max_samples = max as u64;
+    }
+    let limit = queue.duration_or("sample_age_limit", "0s")?;
+    if !limit.is_zero() {
+        sink.max_age = sink.max_age.min(limit);
+    }
+    Ok(())
 }
 
 /// An endpoint's `headers`, as Prometheus checks them.
@@ -363,16 +391,34 @@ fn docker_host(body: &Body, plan: &mut Plan) -> Result<(), String> {
 
 fn cadvisor(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "docker", cfg!(feature = "docker"))?;
-    body.check(&["docker_host", "docker_only", "storage_duration"], &[])?;
-    // Docker's containers and the root: cgroups no engine made are not
-    // reported, as cAdvisor's raw factory would.
-    body.only("docker_only", true, false)?;
+    let attrs = [
+        "docker_host",
+        "docker_only",
+        "raw_cgroup_prefix_allowlist",
+        "storage_duration",
+    ];
+    body.check(&attrs, &[])?;
     body.tuning(&["storage_duration"], &[])?;
     docker_host(body, plan)?;
     #[cfg(feature = "docker")]
     plan.exporters
-        .push((body.id.to_owned(), Exporter::Cadvisor));
+        .push((body.id.to_owned(), Exporter::Cadvisor(raw_cgroups(body)?)));
     Ok(targets_value(vec![internal_target(body.id, "cadvisor")]))
+}
+
+#[cfg(feature = "docker")]
+/// The prefixes of cgroups cAdvisor's raw factory takes: all unless
+/// docker_only, then none unless listed.
+fn raw_cgroups(body: &Body) -> Result<Vec<String>, String> {
+    let mut prefixes = body.strings("raw_cgroup_prefix_allowlist")?;
+    if prefixes.is_empty() {
+        prefixes.push(String::new());
+    }
+    let docker_only = body.bool_or("docker_only", false)?;
+    Ok(match docker_only && prefixes[0].is_empty() {
+        true => Vec::new(),
+        false => prefixes,
+    })
 }
 
 fn discovery_relabel(body: &Body) -> Result<Value, String> {
@@ -389,16 +435,18 @@ fn discovery_relabel(body: &Body) -> Result<Value, String> {
 fn discovery_docker(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "docker", cfg!(feature = "docker"))?;
     body.check(&["host", "refresh_interval"], &[])?;
-    body.tuning(&["refresh_interval"], &[])?;
+    let every = body.duration_or("refresh_interval", "5s")?;
     docker_host(body, plan)?;
-    let targets = Value::Capsule(Capsule::Targets(Targets::Docker));
+    let targets = targets::cached(Targets::Docker, every);
+    let targets = Value::Capsule(Capsule::Targets(targets));
     Ok(export(vec![("targets", targets)]))
 }
 
 fn discovery_file(body: &Body) -> Result<Value, String> {
     body.check(&["files", "refresh_interval"], &[])?;
-    body.tuning(&["refresh_interval"], &[])?;
-    let targets = Targets::Files(body.strings("files")?);
+    let every = body.duration_or("refresh_interval", "5m")?;
+    let targets =
+        targets::cached(Targets::Files(body.strings("files")?), every);
     Ok(export(vec![(
         "targets",
         Value::Capsule(Capsule::Targets(targets)),
@@ -408,14 +456,14 @@ fn discovery_file(body: &Body) -> Result<Value, String> {
 fn file_match(body: &Body) -> Result<Value, String> {
     let attrs = ["path_targets", "sync_period", "ignore_older_than"];
     body.check(&attrs, &[])?;
-    body.tuning(&["sync_period"], &[])?;
+    let every = body.duration_or("sync_period", "10s")?;
     let older = match body.value("ignore_older_than")? {
         Some(_) => Some(body.duration_or("ignore_older_than", "")?),
         None => None,
     };
     let older = older.filter(|d| !d.is_zero());
     let input = Box::new(body.targets("path_targets")?);
-    let targets = Targets::FileMatch(input, older);
+    let targets = targets::cached(Targets::FileMatch(input, older), every);
     Ok(export(vec![(
         "targets",
         Value::Capsule(Capsule::Targets(targets)),
@@ -424,12 +472,13 @@ fn file_match(body: &Body) -> Result<Value, String> {
 
 fn loki_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["external_labels", "max_streams"], &["endpoint"])?;
-    // Streams are not counted here: a batch holds what came.
-    body.tuning(&[], &["max_streams"])?;
+    let max_streams = body.number("max_streams")?.unwrap_or(0.0);
     let external = body.labels("external_labels")?;
     let mut writes = Vec::new();
     for endpoint in body.blocks("endpoint") {
-        let sink = loki_endpoint(&endpoint, body.label(), external.clone())?;
+        let mut sink =
+            loki_endpoint(&endpoint, body.label(), external.clone())?;
+        sink.max_streams = max_streams.max(0.0) as usize;
         plan.logs.sinks.push(sink);
         let kind = logs::Kind::Write(plan.logs.sinks.len() - 1);
         writes.push(logs_at(plan, kind, Rc::from([])));
@@ -496,7 +545,6 @@ fn loki_endpoint(
 ) -> Result<Loki, String> {
     let blocks = client::with(&["queue_config"], &client::BLOCKS);
     endpoint.check(&client::with(&LOKI_ATTRS, &client::ATTRS), &blocks)?;
-    endpoint.tuning(&[], &["max_backoff_retries"])?;
     if let Some(queue) = endpoint.block("queue_config") {
         let attrs = [
             "capacity",
@@ -531,6 +579,9 @@ fn loki_endpoint(
         None => Ok(default),
     };
     sink.wait = given("batch_wait", sink.wait)?;
+    if let Some(retries) = endpoint.number("max_backoff_retries")? {
+        sink.max_retries = retries.max(0.0) as u32;
+    }
     sink.retry = Retry {
         min: given("min_backoff_period", sink.retry.min)?,
         max: given("max_backoff_period", sink.retry.max)?,
@@ -622,8 +673,9 @@ fn file(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         watch.tuning(&attrs, &[])?;
     }
     let mut targets = body.targets("targets")?;
-    if let Some(found) = file_match_block(body)? {
-        targets = Targets::FileMatch(Box::new(targets), found);
+    if let Some((older, every)) = file_match_block(body)? {
+        let found = Targets::FileMatch(Box::new(targets), older);
+        targets = targets::cached(found, every);
     }
     let tail = body.bool_or("tail_from_end", false)?;
     let reading = Reading {
@@ -636,18 +688,22 @@ fn file(body: &Body, plan: &mut Plan) -> Result<Value, String> {
 }
 
 /// The file_match block, if enabled: its ignore_older_than.
-fn file_match_block(body: &Body) -> Result<Option<Option<Duration>>, String> {
+/// When enabled: ignore_older_than, if set, and sync_period.
+fn file_match_block(
+    body: &Body,
+) -> Result<Option<(Option<Duration>, Duration)>, String> {
     let Some(found) = body.block("file_match") else {
         return Ok(None);
     };
     found.check(&["enabled", "sync_period", "ignore_older_than"], &[])?;
-    if found.duration_or("sync_period", "10s")?.is_zero() {
+    let every = found.duration_or("sync_period", "10s")?;
+    if every.is_zero() {
         let message = "sync period must be greater than 0";
         return Err(found.error(found.attr_pos("sync_period"), message));
     }
     let older = found.duration_or("ignore_older_than", "0s")?;
     let older = (!older.is_zero()).then_some(older);
-    Ok(found.bool_or("enabled", false)?.then_some(older))
+    Ok(found.bool_or("enabled", false)?.then_some((older, every)))
 }
 
 fn charset(body: &Body) -> Result<Option<Charset>, String> {
@@ -750,7 +806,9 @@ fn syslog_listener(
     };
     let length = listener.value("max_message_length")?;
     let max_message_length = match length {
-        Some((Value::Number(n), _)) if n >= 1.0 => n as usize,
+        Some((n, _)) if n.number().is_some_and(|n| n >= 1.0) => {
+            n.number().unwrap_or_default() as usize
+        }
         Some((_, pos)) => {
             return Err(listener.error(pos, "max_message_length: a number"));
         }

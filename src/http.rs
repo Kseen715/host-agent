@@ -4,7 +4,11 @@
 //! close`), so a response ends where the stream does.
 
 pub mod auth;
+pub mod azure;
+#[cfg(feature = "tls")]
+pub mod google;
 pub mod proxy;
+pub mod sigv4;
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -183,7 +187,7 @@ pub fn get(url: &Url, client: &Client, accept: &str) -> io::Result<Response> {
 /// One request, and the redirects after it as Go's client follows
 /// them: 307 and 308 keep the method and body, the others turn into a
 /// GET without one.
-fn request(
+pub fn request(
     url: &Url,
     client: &Client,
     method: &str,
@@ -234,11 +238,18 @@ fn once(
         Some(proxy) if !url.tls => proxy.authorization(),
         _ => String::new(),
     };
-    let auth = client.auth.header()?;
+    let headers = format!("{headers}{}", client.headers);
+    let request = auth::Request {
+        method,
+        url,
+        headers: &headers,
+        body,
+    };
+    let auth = client.auth.header(&request)?;
     let head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\n{length}\
-         Connection: close\r\n{headers}{auth}{proxy_auth}{}\r\n",
-        url.host, client.headers,
+         Connection: close\r\n{headers}{auth}{proxy_auth}\r\n",
+        url.host,
     );
     let stream = open(url, client, route.as_ref())?;
     exchange(stream, head.as_bytes(), body)

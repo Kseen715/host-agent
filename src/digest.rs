@@ -167,6 +167,21 @@ pub fn sha3_256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// HMAC-SHA256 (RFC 2104), for AWS's signatures.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    match key.len() > 64 {
+        true => block[..32].copy_from_slice(&sha256(key)),
+        false => block[..key.len()].copy_from_slice(key),
+    }
+    let pad = |byte: u8| block.iter().map(|b| b ^ byte).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(data);
+    let mut outer = pad(0x5c);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -174,6 +189,16 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signs_with_hmac() {
+        // RFC 4231, test case 2.
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
 
     #[test]
     fn digests_known_values() {

@@ -2,15 +2,18 @@
 //! sent after `wait` or at `max_batch` bytes. A batch Loki cannot take
 //! now (429, 5xx, no answer) is kept and retried with backoff; while it
 //! waits the sources are not read, and the journal, Docker and the files
-//! hold the lines instead of this process.
+//! hold the lines instead of this process. After max_backoff_retries
+//! failed tries (0: never) the batch is dropped, as Alloy drops it.
 
 use crate::http::{self, Client, Retry, Url};
 use crate::json::escape;
 use crate::relabel::Labels;
 use std::time::{Duration, Instant};
 
-/// Unless batch_size, batch_wait and the backoff periods say otherwise.
+/// Unless batch_size, batch_wait, the backoff periods and
+/// max_backoff_retries say otherwise.
 const MAX_BATCH: usize = 256 << 10;
+const MAX_RETRIES: u32 = 10;
 const WAIT: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -46,6 +49,10 @@ pub struct Loki {
     pub retry: Retry,
     pub wait: Duration,
     pub max_batch: usize,
+    pub max_retries: u32,
+    /// Lines of a stream past this many in a batch are dropped; 0: none.
+    pub max_streams: usize,
+    failures: u32,
     pub sent: u64,
     pub dropped: u64,
     pub tap: crate::tap::Tap,
@@ -77,6 +84,9 @@ impl Loki {
             },
             wait: WAIT,
             max_batch: MAX_BATCH,
+            max_retries: MAX_RETRIES,
+            max_streams: 0,
+            failures: 0,
             sent: 0,
             dropped: 0,
             tap: crate::tap::Tap::default(),
@@ -91,6 +101,12 @@ impl Loki {
         }
         let index = match self.streams.iter().position(|s| s.labels == key) {
             Some(index) => index,
+            None if self.max_streams > 0
+                && self.streams.len() >= self.max_streams =>
+            {
+                self.dropped += 1;
+                return;
+            }
             None => {
                 let stream = Stream {
                     labels: key,
@@ -157,8 +173,14 @@ impl Loki {
         let count: u64 = self.streams.iter().map(|s| s.count).sum();
         let result =
             http::post(&self.url, &self.client, JSON, self.body().as_bytes());
-        match result {
-            Ok(response) if response.ok() => self.sent += count,
+        let failed = match result {
+            Ok(response) if response.ok() => {
+                if !self.backoff.is_zero() {
+                    eprintln!("Logs: sending again");
+                }
+                self.sent += count;
+                None
+            }
             Ok(response) if !self.retry.again(response.status) => {
                 let text = String::from_utf8_lossy(&response.body);
                 eprintln!(
@@ -167,28 +189,48 @@ impl Loki {
                     text.trim()
                 );
                 self.dropped += count;
+                None
             }
-            Ok(response) => return self.retry(&response.status.to_string()),
-            Err(error) => return self.retry(&error.to_string()),
+            Ok(response) => Some(response.status.to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = failed {
+            if !self.retry(&error) {
+                return Flushed::Kept;
+            }
+            self.dropped += count;
         }
-        if !self.backoff.is_zero() {
-            eprintln!("Logs: sending again");
-        }
+        self.clear();
+        Flushed::Done
+    }
+
+    /// Empty, with no retry pending: after a batch is sent or dropped.
+    fn clear(&mut self) {
         self.streams.clear();
         self.bytes = 0;
         self.first = None;
         self.retry_at = None;
         self.backoff = Duration::ZERO;
-        Flushed::Done
+        self.failures = 0;
     }
 
-    fn retry(&mut self, error: &str) -> Flushed {
+    /// A failed try: kept for another (false), or, past the retries,
+    /// to be dropped (true).
+    fn retry(&mut self, error: &str) -> bool {
+        self.failures += 1;
+        if self.max_retries > 0 && self.failures >= self.max_retries {
+            eprintln!(
+                "Logs: {error}, lines dropped after {} tries",
+                self.failures
+            );
+            return true;
+        }
         if self.backoff.is_zero() {
             eprintln!("Logs: {error}, retrying");
         }
         self.backoff = self.retry.next(self.backoff);
         self.retry_at = Some(Instant::now() + self.backoff);
-        Flushed::Kept
+        false
     }
 
     fn body(&self) -> String {
@@ -254,5 +296,21 @@ mod tests {
         let values = streams[0].get("values").unwrap().arr();
         assert_eq!(values[0].arr()[1].str(), Some("a \"q\""));
         assert_eq!(values[1].arr()[0].str(), Some("3"));
+    }
+
+    #[test]
+    fn drops_past_the_limits() {
+        let url = "http://127.0.0.1:1/push";
+        let new = Loki::new(url, "w", Vec::new(), Default::default());
+        let mut loki = new.unwrap();
+        loki.max_streams = 1;
+        loki.max_retries = 2;
+        let job = |name: &str| vec![("job".to_owned(), name.to_owned())];
+        loki.add(&job("a"), 1, "kept");
+        loki.add(&job("b"), 2, "a second stream");
+        assert_eq!(loki.dropped, 1);
+        assert!(matches!(loki.flush(), Flushed::Kept));
+        assert!(matches!(loki.flush(), Flushed::Done));
+        assert_eq!(loki.dropped, 2);
     }
 }

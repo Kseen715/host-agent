@@ -39,8 +39,9 @@ pub enum Exporter {
     Unix(Box<crate::node::Node>),
     /// prometheus.exporter.self: the agent's own metrics.
     Agent,
+    /// The prefixes of cgroups no engine made to report, if any.
     #[cfg(feature = "docker")]
-    Cadvisor,
+    Cadvisor(Vec<String>),
     #[cfg(feature = "snmp")]
     Snmp(crate::snmp::Snmp),
 }
@@ -347,10 +348,10 @@ impl<'a> Body<'a> {
     pub fn number(&self, name: &str) -> Result<Option<f64>, String> {
         match self.value(name)? {
             None => Ok(None),
-            Some((Value::Number(n), _)) => Ok(Some(n)),
-            Some((other, pos)) => {
-                Err(self.wrong(pos, name, "a number", &other))
-            }
+            Some((value, pos)) => match value.number() {
+                Some(n) => Ok(Some(n)),
+                None => Err(self.wrong(pos, name, "a number", &value)),
+            },
         }
     }
 

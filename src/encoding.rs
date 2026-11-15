@@ -88,6 +88,12 @@ fn escape(text: &str, query: bool) -> String {
     out
 }
 
+/// RFC 3986's percent-encoding: all but the unreserved characters, as
+/// AWS's canonical requests take it.
+pub fn uri_escape(text: &str) -> String {
+    escape(text, false)
+}
+
 /// Go's url.QueryUnescape (`+` is a space) or PathUnescape.
 pub fn unescape(text: &str, query: bool) -> Option<String> {
     let bytes = text.as_bytes();

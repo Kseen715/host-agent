@@ -3,8 +3,10 @@
 //! both.
 
 mod client;
+mod cloud;
 mod compile;
 mod components;
+mod json_path;
 mod process;
 mod snmp;
 mod stdlib;

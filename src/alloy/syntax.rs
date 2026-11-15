@@ -27,6 +27,8 @@ pub struct Expr {
 pub enum Kind {
     Null,
     Bool(bool),
+    /// A literal without a fraction or exponent, as Alloy's int.
+    Int(i64),
     Number(f64),
     Str(String),
     Array(Vec<Expr>),
@@ -67,6 +69,7 @@ pub fn parse(text: &str) -> Result<Vec<Stmt>, String> {
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
     Ident(String),
+    Int(i64),
     Number(f64),
     Str(String),
     Punct(&'static str),
@@ -77,6 +80,7 @@ impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Token::Ident(name) => write!(f, "`{name}`"),
+            Token::Int(n) => write!(f, "number {n}"),
             Token::Number(n) => write!(f, "number {n}"),
             Token::Str(_) => write!(f, "a string"),
             Token::Punct(p) => write!(f, "`{p}`"),
@@ -225,13 +229,16 @@ impl Lexer {
             }
         }
         let clean = text.replace('_', "");
-        let value = match clean.strip_prefix("0x") {
-            Some(hex) => i64::from_str_radix(hex, 16).ok().map(|n| n as f64),
+        let int = match clean.strip_prefix("0x") {
+            Some(hex) => i64::from_str_radix(hex, 16).ok(),
             None => clean.parse().ok(),
         };
-        value
-            .map(Token::Number)
-            .ok_or_else(|| format!("bad number `{text}`"))
+        // shortcut: an integer past i64 is a float here, a uint in Alloy;
+        // add a uint kind if a config needs such numbers exact.
+        let value = int
+            .map(Token::Int)
+            .or_else(|| clean.parse().ok().map(Token::Number));
+        value.ok_or_else(|| format!("bad number `{text}`"))
     }
 
     fn string(&mut self) -> Result<Token, String> {
@@ -427,6 +434,7 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, String> {
         let pos = self.pos();
         let kind = match self.next() {
+            Token::Int(n) => Kind::Int(n),
             Token::Number(n) => Kind::Number(n),
             Token::Str(s) => Kind::Str(s),
             Token::Ident(name) => match name.as_str() {

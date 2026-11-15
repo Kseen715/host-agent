@@ -188,14 +188,15 @@ impl Agent {
                 own.write(w, self.metrics_requests, false);
             }
             #[cfg(feature = "docker")]
-            Exporter::Cadvisor => {
+            Exporter::Cadvisor(raw) => {
                 w.target(visible, to, honor);
                 let docker = self.docker.as_ref();
                 w.up(docker.is_some_and(|d| d.up));
                 build_info(w, "cadvisor_build_info");
                 let containers = docker.map(|d| &d.containers[..]);
                 let now_s = time::now_ms() as f64 / 1e3;
-                crate::containers::collect(w, containers.unwrap_or(&[]), now_s);
+                let containers = containers.unwrap_or(&[]);
+                crate::containers::collect(w, containers, raw, now_s);
             }
             #[cfg(feature = "snmp")]
             Exporter::Snmp(snmp) => {
@@ -531,7 +532,7 @@ fn keep_in_spools(
     for sink in &mut plan.metrics.sinks {
         let dir =
             storage.join(format!("prometheus.remote_write.{}", sink.name));
-        let spool = Spool::open(dir.clone(), SPOOL_MAX)
+        let spool = Spool::open(dir.clone(), SPOOL_MAX, sink.max_age)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         sink.keep_in(spool);
     }

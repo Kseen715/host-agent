@@ -10,6 +10,9 @@ use std::rc::Rc;
 pub enum Value {
     Null,
     Bool(bool),
+    /// Alloy's int: from literals without a fraction, and int arithmetic.
+    Int(i64),
+    /// Alloy's float.
     Number(f64),
     String(String),
     Array(Vec<Value>),
@@ -36,13 +39,22 @@ impl Value {
         match self {
             Value::Null => "null",
             Value::Bool(_) => "bool",
-            Value::Number(_) => "number",
+            Value::Int(_) | Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
             Value::Capsule(Capsule::Targets(_)) => "targets",
             Value::Capsule(Capsule::Rules(_)) => "rules",
             Value::Capsule(_) => "receiver",
+        }
+    }
+
+    /// Either kind of number, as a float.
+    pub fn number(&self) -> Option<f64> {
+        match self {
+            Value::Int(n) => Some(*n as f64),
+            Value::Number(n) => Some(*n),
+            _ => None,
         }
     }
 
@@ -64,6 +76,7 @@ pub fn eval(expr: &Expr, resolve: Resolve) -> Result<Value, String> {
     Ok(match &expr.kind {
         Kind::Null => Value::Null,
         Kind::Bool(b) => Value::Bool(*b),
+        Kind::Int(n) => Value::Int(*n),
         Kind::Number(n) => Value::Number(*n),
         Kind::Str(s) => Value::String(s.clone()),
         Kind::Array(items) => Value::Array(
@@ -167,9 +180,9 @@ fn field_of(value: Value, field: &str, pos: Pos) -> Result<Value, String> {
 
 fn element(inner: Value, index: Value, pos: Pos) -> Result<Value, String> {
     match (inner, index) {
-        (Value::Array(items), Value::Number(n)) => items
-            .into_iter()
-            .nth(n as usize)
+        (Value::Array(items), Value::Int(n)) => usize::try_from(n)
+            .ok()
+            .and_then(|n| items.into_iter().nth(n))
             .ok_or(format!("{pos}: index {n} out of range")),
         (object @ Value::Object(_), Value::String(key)) => {
             field_of(object, &key, pos)
@@ -185,54 +198,82 @@ fn element(inner: Value, index: Value, pos: Pos) -> Result<Value, String> {
 fn unary(op: &str, value: Value, pos: Pos) -> Result<Value, String> {
     match (op, value) {
         ("!", value) => Ok(Value::Bool(!value.truthy(pos)?)),
+        ("-", Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
         ("-", Value::Number(n)) => Ok(Value::Number(-n)),
         (op, value) => Err(format!("{pos}: `{op}` on a {}", value.kind())),
     }
 }
 
-// One arm per operator: longer than 40 lines, as a table is read whole.
 fn binary(
     op: &str,
     left: Value,
     right: Value,
     pos: Pos,
 ) -> Result<Value, String> {
-    use Value::{Bool, Number, String as Str};
-    Ok(match (op, left, right) {
-        ("+", Str(a), Str(b)) => Str(a + &b),
-        ("+", Number(a), Number(b)) => Number(a + b),
-        ("-", Number(a), Number(b)) => Number(a - b),
-        ("*", Number(a), Number(b)) => Number(a * b),
-        ("/", Number(a), Number(b)) => Number(a / b),
-        ("%", Number(a), Number(b)) => Number(a % b),
-        ("^", Number(a), Number(b)) => Number(a.powf(b)),
-        ("==", a, b) => Bool(equal(&a, &b)),
-        ("!=", a, b) => Bool(!equal(&a, &b)),
-        (op @ ("<" | "<=" | ">" | ">="), a, b) => {
-            let order = match (&a, &b) {
-                (Number(a), Number(b)) => a.partial_cmp(b),
-                (Str(a), Str(b)) => Some(a.cmp(b)),
-                _ => None,
-            };
-            let order = order.ok_or(format!(
-                "{pos}: cannot compare a {} with a {}",
-                a.kind(),
-                b.kind()
-            ))?;
-            Bool(match op {
-                "<" => order.is_lt(),
-                "<=" => order.is_le(),
-                ">" => order.is_gt(),
-                _ => order.is_ge(),
-            })
+    use Value::{Bool, String as Str};
+    match (op, &left, &right) {
+        ("==", a, b) => return Ok(Bool(equal(a, b))),
+        ("!=", a, b) => return Ok(Bool(!equal(a, b))),
+        ("+", Str(a), Str(b)) => return Ok(Str(format!("{a}{b}"))),
+        (op @ ("<" | "<=" | ">" | ">="), Str(a), Str(b)) => {
+            return Ok(Bool(order(op, Some(a.cmp(b)))));
         }
-        (op, a, b) => {
-            return Err(format!(
-                "{pos}: `{op}` on a {} and a {}",
-                a.kind(),
-                b.kind()
-            ));
+        _ => {}
+    }
+    let wrong = || {
+        let (a, b) = (left.kind(), right.kind());
+        format!("{pos}: `{op}` on a {a} and a {b}")
+    };
+    let (Some(a), Some(b)) = (left.number(), right.number()) else {
+        return Err(wrong());
+    };
+    if matches!(op, "/" | "%") && b == 0.0 {
+        return Err(format!("{pos}: divide by zero error"));
+    }
+    let found = match (&left, &right) {
+        // Alloy keeps two ints an int, wrapping as Go's do.
+        (Value::Int(a), Value::Int(b)) => int_op(op, *a, *b),
+        _ => float_op(op, a, b),
+    };
+    found.ok_or_else(wrong)
+}
+
+fn int_op(op: &str, a: i64, b: i64) -> Option<Value> {
+    Some(Value::Int(match op {
+        "+" => a.wrapping_add(b),
+        "-" => a.wrapping_sub(b),
+        "*" => a.wrapping_mul(b),
+        "/" => a.wrapping_div(b),
+        "%" => a.wrapping_rem(b),
+        // Alloy's intPow: 1 for 0, `a` itself for a negative power.
+        "^" if b <= 0 => i64::from(b == 0) + i64::from(b < 0) * a,
+        "^" => a.wrapping_pow(u32::try_from(b).unwrap_or(u32::MAX)),
+        op => return Some(Value::Bool(order(op, Some(a.cmp(&b))))),
+    }))
+}
+
+fn float_op(op: &str, a: f64, b: f64) -> Option<Value> {
+    Some(Value::Number(match op {
+        "+" => a + b,
+        "-" => a - b,
+        "*" => a * b,
+        "/" => a / b,
+        "%" => a % b,
+        "^" => a.powf(b),
+        "<" | "<=" | ">" | ">=" => {
+            return Some(Value::Bool(order(op, a.partial_cmp(&b))));
         }
+        _ => return None,
+    }))
+}
+
+/// A comparison's result; NaN compares false, as in Go.
+fn order(op: &str, found: Option<std::cmp::Ordering>) -> bool {
+    found.is_some_and(|o| match op {
+        "<" => o.is_lt(),
+        "<=" => o.is_le(),
+        ">" => o.is_gt(),
+        _ => o.is_ge(),
     })
 }
 
@@ -240,7 +281,9 @@ pub(super) fn equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => a == b,
+        (a, b) if a.number().is_some() && b.number().is_some() => {
+            a.number() == b.number()
+        }
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equal(a, b))
@@ -281,9 +324,13 @@ mod tests {
 
     #[test]
     fn evaluates_expressions_and_functions() {
-        assert!(matches!(value("1 + 2 * 3"), Ok(Value::Number(7.0))));
-        assert!(matches!(value("2 ^ 3 ^ 2"), Ok(Value::Number(512.0))));
+        assert!(matches!(value("1 + 2 * 3"), Ok(Value::Int(7))));
+        assert!(matches!(value("2 ^ 3 ^ 2"), Ok(Value::Int(512))));
+        assert!(matches!(value("7 / 2"), Ok(Value::Int(3))));
+        assert!(matches!(value("7 / 2.0"), Ok(Value::Number(3.5))));
         assert!(matches!(value("a.b.c - 1"), Ok(Value::Number(6.0))));
+        assert!(value("1 % 0").is_err());
+        assert!(matches!(value("1 == 1.0"), Ok(Value::Bool(true))));
         assert!(matches!(value("!(1 < 2) || 3 >= 3"), Ok(Value::Bool(true))));
         assert_eq!(string(r#""a" + "b""#), "ab");
         assert_eq!(string(r#"string.format("%s:%d", "h", 9100)"#), "h:9100");
