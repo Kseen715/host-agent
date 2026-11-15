@@ -8,7 +8,7 @@ mod format;
 #[cfg(feature = "tls")]
 mod tls;
 
-use crate::alloy::SyslogListener;
+use crate::alloy::{SyslogFormat, SyslogListener};
 use crate::logs::Logs;
 use crate::parts::Part;
 use crate::relabel::Labels;
@@ -115,13 +115,25 @@ impl Syslog {
             match socket.recv_from(&mut self.buf) {
                 Ok((length, from)) => {
                     let length = length.min(self.listener.max_message_length);
-                    let raw = String::from_utf8_lossy(&self.buf[..length]);
-                    let raw = raw.trim_end_matches(['\n', '\r', '\0']);
-                    emit(&self.listener, logs, from.ip(), raw);
+                    let datagram = self.buf[..length].to_vec();
+                    self.datagram(logs, from.ip(), datagram);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error) => return eprintln!("Syslog: {error}"),
             }
+        }
+    }
+
+    /// One datagram: a message, or in raw format the lines it holds.
+    fn datagram(&self, logs: &mut Logs, from: IpAddr, mut datagram: Vec<u8>) {
+        let SyslogFormat::Raw { nul } = self.listener.format else {
+            let raw = String::from_utf8_lossy(&datagram);
+            let raw = raw.trim_end_matches(['\n', '\r', '\0']);
+            return emit(&self.listener, logs, from, raw);
+        };
+        let max = self.listener.max_message_length;
+        while let Some(raw) = frame(&mut datagram, max, true, delimiter(nul)) {
+            emit(&self.listener, logs, from, &String::from_utf8_lossy(&raw));
         }
     }
 
@@ -166,7 +178,12 @@ impl Syslog {
         };
         let open = connection.fill(&mut self.buf);
         let max = self.listener.max_message_length;
-        while let Some(raw) = frame(&mut connection.buf, max, !open) {
+        let delimiter = match self.listener.format {
+            SyslogFormat::Raw { nul } => delimiter(nul),
+            _ => b'\n',
+        };
+        while let Some(raw) = frame(&mut connection.buf, max, !open, delimiter)
+        {
             let raw = String::from_utf8_lossy(&raw);
             emit(&self.listener, logs, connection.from, raw.trim_end());
         }
@@ -203,10 +220,19 @@ impl Part for Syslog {
     }
 }
 
+fn delimiter(nul: bool) -> u8 {
+    if nul { b'\0' } else { b'\n' }
+}
+
 /// The next whole message in `buf`, taken out: `length message` or up
-/// to a newline; at the end of the stream, what is left. A message
+/// to `delimiter`; at the end of the stream, what is left. A message
 /// longer than `max` is cut.
-fn frame(buf: &mut Vec<u8>, max: usize, end: bool) -> Option<Vec<u8>> {
+fn frame(
+    buf: &mut Vec<u8>,
+    max: usize,
+    end: bool,
+    delimiter: u8,
+) -> Option<Vec<u8>> {
     let digits = buf.iter().take_while(|b| b.is_ascii_digit()).count();
     if digits > 0 && buf.get(digits) == Some(&b' ') {
         let length: usize =
@@ -220,7 +246,7 @@ fn frame(buf: &mut Vec<u8>, max: usize, end: bool) -> Option<Vec<u8>> {
         message.truncate(max);
         return Some(message);
     }
-    let line = buf.iter().position(|&b| b == b'\n');
+    let line = buf.iter().position(|&b| b == delimiter);
     let take = match line {
         Some(at) => at + 1,
         None if end && !buf.is_empty() => buf.len(),
@@ -233,10 +259,12 @@ fn frame(buf: &mut Vec<u8>, max: usize, end: bool) -> Option<Vec<u8>> {
 }
 
 fn emit(listener: &SyslogListener, logs: &mut Logs, from: IpAddr, raw: &str) {
-    let parsed = if listener.rfc5424 {
-        format::rfc5424(raw)
-    } else {
-        format::rfc3164(raw)
+    let parsed = match listener.format {
+        SyslogFormat::Rfc5424 => format::rfc5424(raw),
+        SyslogFormat::Rfc3164 => format::rfc3164(raw),
+        SyslogFormat::Raw { .. } => {
+            return raw_line(listener, logs, from, raw);
+        }
     };
     let Some(message) = parsed else {
         return;
@@ -250,6 +278,28 @@ fn emit(listener: &SyslogListener, logs: &mut Logs, from: IpAddr, raw: &str) {
     let labels = labels(&message, from, listener.label_structured_data);
     let ns = ns.unwrap_or_else(time::now_ns);
     listener.source.emit(logs, labels, ns, line);
+}
+
+/// A raw line: its priority, if it has one, gives the severity and
+/// facility; an empty line is dropped; the time is now.
+fn raw_line(
+    listener: &SyslogListener,
+    logs: &mut Logs,
+    from: IpAddr,
+    raw: &str,
+) {
+    let (severity, facility, text) = format::raw(raw.trim());
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let message = Message {
+        severity,
+        facility,
+        ..Message::default()
+    };
+    let labels = labels(&message, from, false);
+    listener.source.emit(logs, labels, time::now_ns(), text);
 }
 
 /// Alloy's `__syslog_*` labels; fields the message lacks are left out.
@@ -287,13 +337,17 @@ mod tests {
     #[test]
     fn frames_tcp_streams() {
         let mut buf = b"17 <14>1 - - - - - -<14>x\n<14>y".to_vec();
-        assert_eq!(frame(&mut buf, 8192, false).unwrap(), b"<14>1 - - - - - -");
-        assert_eq!(frame(&mut buf, 8192, false).unwrap(), b"<14>x\n");
-        assert_eq!(frame(&mut buf, 8192, false), None);
-        assert_eq!(frame(&mut buf, 8192, true).unwrap(), b"<14>y");
+        let nl = b'\n';
+        let first = frame(&mut buf, 8192, false, nl).unwrap();
+        assert_eq!(first, b"<14>1 - - - - - -");
+        assert_eq!(frame(&mut buf, 8192, false, nl).unwrap(), b"<14>x\n");
+        assert_eq!(frame(&mut buf, 8192, false, nl), None);
+        assert_eq!(frame(&mut buf, 8192, true, nl).unwrap(), b"<14>y");
         assert!(buf.is_empty());
         let mut long = vec![b'a'; 20];
-        assert_eq!(frame(&mut long, 8, false).unwrap().len(), 8);
+        assert_eq!(frame(&mut long, 8, false, nl).unwrap().len(), 8);
+        let mut raw = b"a\0b".to_vec();
+        assert_eq!(frame(&mut raw, 8, false, b'\0').unwrap(), b"a\0");
         assert_eq!(long.len(), 12);
     }
 }

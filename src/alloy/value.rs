@@ -1,7 +1,5 @@
 //! Alloy's values and expressions: literals, operators, references to
-//! components' exports, and the standard library functions configs
-//! here use (`sys.env`, `constants.*`, `string.format`, `string.join`,
-//! `coalesce`, `array.concat`).
+//! components' exports, `constants.*`; functions are stdlib.rs's.
 
 use super::syntax::{Expr, Kind, Pos};
 use crate::relabel::Rule;
@@ -94,7 +92,8 @@ pub fn eval(expr: &Expr, resolve: Resolve) -> Result<Value, String> {
                 .iter()
                 .map(|a| eval(a, resolve))
                 .collect::<Result<_, _>>()?;
-            call(&name, args).map_err(|e| format!("{pos}: {name}: {e}"))?
+            super::stdlib::call(&name, args)
+                .map_err(|e| format!("{pos}: {name}: {e}"))?
         }
         Kind::Unary(op, operand) => unary(op, eval(operand, resolve)?, pos)?,
         Kind::Binary(op, left, right) => {
@@ -237,7 +236,7 @@ fn binary(
     })
 }
 
-fn equal(a: &Value, b: &Value) -> bool {
+pub(super) fn equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -254,114 +253,6 @@ fn equal(a: &Value, b: &Value) -> bool {
         }
         _ => false,
     }
-}
-
-fn call(name: &str, args: Vec<Value>) -> Result<Value, String> {
-    match name {
-        "sys.env" | "env" => match &args[..] {
-            [Value::String(key)] => {
-                Ok(Value::String(std::env::var(key).unwrap_or_default()))
-            }
-            _ => Err("takes one string".into()),
-        },
-        "coalesce" => {
-            Ok(args.into_iter().find(|v| !empty(v)).unwrap_or(Value::Null))
-        }
-        "array.concat" | "concat" => concat(args),
-        "string.join" => match &args[..] {
-            [Value::Array(items), Value::String(separator)] => {
-                let words: Result<Vec<String>, String> =
-                    items.iter().map(|v| text(v, false)).collect();
-                Ok(Value::String(words?.join(separator)))
-            }
-            _ => Err("takes an array of strings and a string".into()),
-        },
-        "string.format" => match args.split_first() {
-            Some((Value::String(format), rest)) => {
-                Ok(Value::String(sprintf(format, rest)?))
-            }
-            _ => Err("takes a format string first".into()),
-        },
-        _ => Err("not a function this agent has".into()),
-    }
-}
-
-/// Go's zero values, which coalesce skips.
-fn empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::Bool(b) => !b,
-        Value::Number(n) => *n == 0.0,
-        Value::String(s) => s.is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
-        Value::Capsule(_) => false,
-    }
-}
-
-/// Arrays joined; targets that may change join into such targets.
-fn concat(args: Vec<Value>) -> Result<Value, String> {
-    let dynamic = args
-        .iter()
-        .any(|v| matches!(v, Value::Capsule(Capsule::Targets(_))));
-    if !dynamic {
-        let mut out = Vec::new();
-        for arg in args {
-            match arg {
-                Value::Array(items) => out.extend(items),
-                other => {
-                    return Err(format!(
-                        "takes arrays, not a {}",
-                        other.kind()
-                    ));
-                }
-            }
-        }
-        return Ok(Value::Array(out));
-    }
-    let parts: Result<Vec<Targets>, String> =
-        args.into_iter().map(super::compile::targets_of).collect();
-    Ok(Value::Capsule(Capsule::Targets(Targets::Concat(parts?))))
-}
-
-fn text(value: &Value, quote: bool) -> Result<String, String> {
-    Ok(match value {
-        Value::String(s) if quote => format!("{s:?}"),
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "<nil>".into(),
-        other => return Err(format!("cannot format a {}", other.kind())),
-    })
-}
-
-/// Go's fmt verbs %s %v %d %f %q %%, as string.format takes them.
-fn sprintf(format: &str, args: &[Value]) -> Result<String, String> {
-    let mut out = String::new();
-    let mut args = args.iter();
-    let mut chars = format.chars();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        let verb = chars.next().ok_or("a lone % at the end")?;
-        if verb == '%' {
-            out.push('%');
-            continue;
-        }
-        let arg = args.next().ok_or("fewer arguments than verbs")?;
-        out.push_str(&match (verb, arg) {
-            ('d', Value::Number(n)) => format!("{}", n.trunc() as i64),
-            ('f', Value::Number(n)) => format!("{n:.6}"),
-            ('s' | 'v', value) => text(value, false)?,
-            ('q', value) => text(value, true)?,
-            (verb, value) => {
-                return Err(format!("%{verb} of a {}", value.kind()));
-            }
-        });
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

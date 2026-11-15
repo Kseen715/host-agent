@@ -1,7 +1,9 @@
 //! loki.process's `stage.*` blocks, built into crate::stages.
 
 use super::compile::Body;
-use crate::stages::{Action, Drop, Selector, Stage, Timestamp};
+use crate::stages::{
+    Action, Drop, JsonStage, Selector, Stage, Timestamp, json_path,
+};
 use crate::template::Template;
 use crate::zone::Zone;
 use regex_lite::Regex;
@@ -95,6 +97,9 @@ fn drop(body: &Body) -> Result<Stage, String> {
         "drop_counter_reason",
     ];
     body.check(&attrs, &[])?;
+    // As in stage.match; `separator` joins several sources, refused below.
+    body.string("drop_counter_reason")?;
+    body.string("separator")?;
     let pos = body.block.pos;
     let source = body.string("source")?;
     if source.as_ref().is_some_and(|s| s.contains(',')) {
@@ -146,18 +151,33 @@ fn bytes(text: &str) -> Option<usize> {
 }
 
 fn parse(body: &Body) -> Result<Stage, String> {
-    let (fields, json) = match body.name() {
-        "stage.json" => ("expressions", true),
-        _ => ("mapping", false),
-    };
-    body.check(&[fields, "source", "drop_malformed"], &[])?;
-    let source = body.string("source")?;
-    let fields = body.labels(fields)?;
-    Ok(if json {
-        Stage::Json(source, fields)
-    } else {
-        Stage::Logfmt(source, fields)
-    })
+    if body.name() == "stage.logfmt" {
+        body.check(&["mapping", "source"], &[])?;
+        let mapping = body.labels("mapping")?;
+        return Ok(Stage::Logfmt(body.string("source")?, mapping));
+    }
+    body.check(&["expressions", "regex", "source", "drop_malformed"], &[])?;
+    let pos = body.block.pos;
+    let mut fields = Vec::new();
+    for (name, path) in body.labels("expressions")? {
+        let path = if path.is_empty() { name.clone() } else { path };
+        let steps = json_path(&path).map_err(|e| body.error(pos, &e))?;
+        fields.push((name, steps));
+    }
+    let keys = body.string("regex")?.filter(|r| !r.is_empty());
+    let keys = keys.map(|r| Regex::new(&r));
+    let keys = keys
+        .transpose()
+        .map_err(|e| body.error(pos, &e.to_string()))?;
+    if fields.is_empty() && keys.is_none() {
+        return Err(body.error(pos, "needs `expressions` or `regex`"));
+    }
+    Ok(Stage::Json(JsonStage {
+        source: body.string("source")?,
+        fields,
+        keys,
+        drop_malformed: body.bool_or("drop_malformed", false)?,
+    }))
 }
 
 fn timestamp(body: &Body) -> Result<Stage, String> {
@@ -196,6 +216,10 @@ fn timestamp(body: &Body) -> Result<Stage, String> {
 fn matched(body: &Body) -> Result<Stage, String> {
     let attrs = ["selector", "action", "pipeline_name", "drop_counter_reason"];
     body.check(&attrs, &STAGES)?;
+    // Names in Alloy's own metrics of dropped lines, which this agent
+    // does not keep.
+    body.string("pipeline_name")?;
+    body.string("drop_counter_reason")?;
     let pos = body.block.pos;
     let selector = Selector::parse(&body.required("selector")?)
         .map_err(|e| body.error(pos, &format!("selector: {e}")))?;

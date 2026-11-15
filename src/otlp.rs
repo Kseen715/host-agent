@@ -6,7 +6,7 @@
 //! fails), so its own retries cover an outage, and nothing waits here.
 //! One request per connection, read whole: the clients are local.
 
-use crate::http::{self, Url};
+use crate::http::{self, Client, Url};
 use crate::logs::Logs;
 use crate::parts::Part;
 use crate::state::Positions;
@@ -111,7 +111,12 @@ impl Otlp {
 
     /// The backend's status and body, under the request's content type.
     fn send(url: &Url, request: &Request) -> (u16, String, Vec<u8>) {
-        match http::post(url, &request.headers, &request.body) {
+        match http::post(
+            url,
+            &Client::default(),
+            &request.headers,
+            &request.body,
+        ) {
             Ok(response) => {
                 let kind = request.headers.lines().find(|line| {
                     line.to_ascii_lowercase().starts_with("content-type:")

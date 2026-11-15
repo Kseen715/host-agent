@@ -25,10 +25,13 @@ mod agent;
 mod alloy;
 #[cfg(feature = "docker")]
 mod cgroup;
+mod charset;
 #[cfg(feature = "docker")]
 mod containers;
+mod digest;
 #[cfg(feature = "docker")]
 mod docker;
+mod encoding;
 mod exposition;
 mod files;
 mod glob;

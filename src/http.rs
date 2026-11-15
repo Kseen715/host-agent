@@ -1,7 +1,15 @@
-//! An HTTP/1.1 client for plain-HTTP endpoints on the LAN and on
-//! loopback, and for Docker's socket: one request per connection
-//! (`Connection: close`), so a response ends where the stream does.
+//! An HTTP/1.1 client for scrapes and pushes, as Alloy's HTTP client
+//! settings configure it (auth, headers, proxy, redirects, TLS), and
+//! for Docker's socket: one request per connection (`Connection:
+//! close`), so a response ends where the stream does.
 
+pub mod auth;
+pub mod proxy;
+#[cfg(feature = "tls")]
+pub mod tls;
+
+use auth::Auth;
+use proxy::Proxy;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
@@ -11,27 +19,140 @@ use std::time::Duration;
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// A runaway response stops here instead of taking the host's memory.
 const MAX_RESPONSE: u64 = 64 << 20;
+/// Go's http.Client gives up after as many.
+const MAX_REDIRECTS: usize = 10;
 
+/// How requests to an endpoint are made: Alloy's HTTP client settings.
+#[derive(Clone)]
+pub struct Client {
+    pub timeout: Duration,
+    /// Header lines sent with every request, each ending in CR LF.
+    pub headers: String,
+    pub auth: Auth,
+    pub follow_redirects: bool,
+    pub proxy: Proxy,
+    /// tls_config; None, the system's roots.
+    #[cfg(feature = "tls")]
+    pub tls: Option<tls::Tls>,
+}
+
+impl Default for Client {
+    fn default() -> Client {
+        Client {
+            timeout: TIMEOUT,
+            headers: String::new(),
+            auth: Auth::None,
+            follow_redirects: true,
+            proxy: Proxy::Direct,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Url {
-    /// `host:port`, the port filled in.
+    /// `host:port`, the port filled in: where to connect.
     pub authority: String,
+    /// The host as the URL has it, for the Host header.
+    pub host: String,
+    /// The host without port or brackets, for TLS.
+    pub name: String,
     pub path: String,
+    pub tls: bool,
 }
 
 impl Url {
+    /// An http:// URL, or https:// with feature `tls`.
     pub fn parse(url: &str) -> Option<Url> {
-        let rest = url.strip_prefix("http://")?;
-        let (authority, path) = rest.split_at(rest.find('/')?);
-        if authority.is_empty() {
+        let (tls, rest) = match url.strip_prefix("http://") {
+            Some(rest) => (false, rest),
+            None if cfg!(feature = "tls") => {
+                (true, url.strip_prefix("https://")?)
+            }
+            None => return None,
+        };
+        let (host, path) = match rest.find(['/', '?']) {
+            Some(at) => rest.split_at(at),
+            None => (rest, "/"),
+        };
+        let path = match path.starts_with('?') {
+            true => format!("/{path}"),
+            false => path.to_owned(),
+        };
+        let (name, port) = split_port(host)?;
+        if name.is_empty() || host.contains('@') {
             return None;
         }
-        let authority = if authority.contains(':') {
-            authority.to_owned()
-        } else {
-            format!("{authority}:80")
+        let port = port.unwrap_or(if tls { "443" } else { "80" });
+        let bracketed = name.contains(':');
+        let authority = match bracketed {
+            true => format!("[{name}]:{port}"),
+            false => format!("{name}:{port}"),
         };
-        let path = path.to_owned();
-        Some(Url { authority, path })
+        Some(Url {
+            authority,
+            host: host.to_owned(),
+            name: name.to_owned(),
+            path,
+            tls,
+        })
+    }
+
+    /// `Location`, absolute or relative to this URL.
+    fn join(&self, location: &str) -> Option<Url> {
+        let scheme = if self.tls { "https" } else { "http" };
+        if location.contains("://") {
+            return Url::parse(location);
+        }
+        if let Some(rest) = location.strip_prefix("//") {
+            return Url::parse(&format!("{scheme}://{rest}"));
+        }
+        let path = match location.starts_with('/') {
+            true => location.to_owned(),
+            false => {
+                let path = self.path.split('?').next().unwrap_or("/");
+                let dir = &path[..=path.rfind('/').unwrap_or(0)];
+                format!("{dir}{location}")
+            }
+        };
+        Url::parse(&format!("{scheme}://{}{path}", self.host))
+    }
+}
+
+/// `host`, `host:port`, `[v6]` or `[v6]:port`: the name and the port.
+fn split_port(host: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let (name, rest) = rest.split_once(']')?;
+        let port = match rest {
+            "" => None,
+            _ => Some(rest.strip_prefix(':')?),
+        };
+        return Some((name, port));
+    }
+    match host.split_once(':') {
+        Some((name, port)) => Some((name, Some(port))),
+        None => Some((host, None)),
+    }
+}
+
+/// How a push that fails is retried: its backoff, and whether a 429
+/// waits (retry_on_http_429) or drops what was sent.
+#[derive(Clone, Copy)]
+pub struct Retry {
+    pub min: Duration,
+    pub max: Duration,
+    pub on_429: bool,
+}
+
+impl Retry {
+    pub fn next(&self, backoff: Duration) -> Duration {
+        (backoff * 2).clamp(self.min, self.max)
+    }
+
+    /// Whether a response with `status` is tried again.
+    pub fn again(&self, status: u16) -> bool {
+        status >= 500 || (status == 429 && self.on_429)
     }
 }
 
@@ -46,24 +167,110 @@ impl Response {
     }
 }
 
-pub fn post(url: &Url, headers: &str, body: &[u8]) -> io::Result<Response> {
-    let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n{headers}\r\n",
-        url.path,
-        url.authority,
-        body.len()
-    );
-    exchange(connect(&url.authority)?, head.as_bytes(), body)
+pub fn post(
+    url: &Url,
+    client: &Client,
+    headers: &str,
+    body: &[u8],
+) -> io::Result<Response> {
+    request(url, client, "POST", headers, body)
 }
 
-pub fn get(url: &Url) -> io::Result<Response> {
+pub fn get(url: &Url, client: &Client, accept: &str) -> io::Result<Response> {
+    request(url, client, "GET", &format!("Accept: {accept}\r\n"), &[])
+}
+
+/// One request, and the redirects after it as Go's client follows
+/// them: 307 and 308 keep the method and body, the others turn into a
+/// GET without one.
+fn request(
+    url: &Url,
+    client: &Client,
+    method: &str,
+    headers: &str,
+    body: &[u8],
+) -> io::Result<Response> {
+    let (mut url, mut method, mut body) = (url.clone(), method, body);
+    for _ in 0..=MAX_REDIRECTS {
+        let (response, location) = once(&url, client, method, headers, body)?;
+        let redirect = matches!(response.status, 301 | 302 | 303 | 307 | 308);
+        let Some(location) = location.filter(|_| redirect) else {
+            return Ok(response);
+        };
+        if !client.follow_redirects {
+            return Ok(response);
+        }
+        url = url
+            .join(&location)
+            .ok_or_else(|| broken(&format!("redirect to `{location}`")))?;
+        if !matches!(response.status, 307 | 308) && method != "HEAD" {
+            (method, body) = ("GET", &[]);
+        }
+    }
+    Err(io::Error::other(format!(
+        "stopped after {MAX_REDIRECTS} redirects"
+    )))
+}
+
+fn once(
+    url: &Url,
+    client: &Client,
+    method: &str,
+    headers: &str,
+    body: &[u8],
+) -> io::Result<(Response, Option<String>)> {
+    let route = client.proxy.route(url);
+    let target = match &route {
+        Some(_) if !url.tls => {
+            format!("http://{}{}", url.host, url.path)
+        }
+        _ => url.path.clone(),
+    };
+    let length = match method {
+        "GET" | "HEAD" if body.is_empty() => String::new(),
+        _ => format!("Content-Length: {}\r\n", body.len()),
+    };
+    let proxy_auth = match &route {
+        Some(proxy) if !url.tls => proxy.authorization(),
+        _ => String::new(),
+    };
+    let auth = client.auth.header()?;
     let head = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/plain\r\n\
-         Connection: close\r\n\r\n",
-        url.path, url.authority
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\n{length}\
+         Connection: close\r\n{headers}{auth}{proxy_auth}{}\r\n",
+        url.host, client.headers,
     );
-    exchange(connect(&url.authority)?, head.as_bytes(), &[])
+    let stream = open(url, client, route.as_ref())?;
+    exchange(stream, head.as_bytes(), body)
+}
+
+/// A stream a request is exchanged on: TCP, through TLS or not.
+pub trait Stream: Read + Write {}
+
+impl<S: Read + Write> Stream for S {}
+
+fn open(
+    url: &Url,
+    client: &Client,
+    proxy: Option<&proxy::Route>,
+) -> io::Result<Box<dyn Stream>> {
+    let stream = match proxy {
+        None => connect(&url.authority, client.timeout)?,
+        Some(proxy) => {
+            let stream = connect(&proxy.authority, client.timeout)?;
+            match url.tls {
+                true => proxy.tunnel(stream, url)?,
+                false => stream,
+            }
+        }
+    };
+    if !url.tls {
+        return Ok(Box::new(stream));
+    }
+    #[cfg(feature = "tls")]
+    return tls::wrap(stream, url, client.tls.as_ref());
+    #[cfg(not(feature = "tls"))]
+    Err(io::Error::other("https: built without feature tls"))
 }
 
 pub fn unix_get(socket: &Path, path: &str) -> io::Result<Response> {
@@ -73,16 +280,16 @@ pub fn unix_get(socket: &Path, path: &str) -> io::Result<Response> {
     let head = format!(
         "GET {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
     );
-    exchange(stream, head.as_bytes(), &[])
+    Ok(exchange(stream, head.as_bytes(), &[])?.0)
 }
 
-fn connect(authority: &str) -> io::Result<TcpStream> {
+fn connect(authority: &str, timeout: Duration) -> io::Result<TcpStream> {
     let mut last = io::Error::other(format!("{authority} has no address"));
     for address in authority.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&address, TIMEOUT) {
+        match TcpStream::connect_timeout(&address, timeout) {
             Ok(stream) => {
-                stream.set_read_timeout(Some(TIMEOUT))?;
-                stream.set_write_timeout(Some(TIMEOUT))?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
                 return Ok(stream);
             }
             Err(error) => last = error,
@@ -95,11 +302,18 @@ fn exchange<S: Read + Write>(
     mut stream: S,
     head: &[u8],
     body: &[u8],
-) -> io::Result<Response> {
+) -> io::Result<(Response, Option<String>)> {
     stream.write_all(head)?;
     stream.write_all(body)?;
+    stream.flush()?;
     let mut raw = Vec::new();
-    stream.take(MAX_RESPONSE).read_to_end(&mut raw)?;
+    match stream.take(MAX_RESPONSE).read_to_end(&mut raw) {
+        Ok(_) => {}
+        // A TLS peer that closes without close_notify, as many do
+        // after `Connection: close`: what came is the response.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(e),
+    }
 
     let end = head_end(&raw).ok_or_else(|| broken("no end of headers"))?;
     let head = parse_head(&raw[..end])?;
@@ -111,16 +325,18 @@ fn exchange<S: Read + Write>(
     } else if let Some(length) = head.length {
         body.truncate(length);
     }
-    Ok(Response {
+    let response = Response {
         status: head.status,
         body,
-    })
+    };
+    Ok((response, head.location))
 }
 
 pub struct Head {
     pub status: u16,
     pub chunked: bool,
     pub length: Option<usize>,
+    pub location: Option<String>,
 }
 
 /// Where the body starts: after the empty line ending the headers.
@@ -140,6 +356,7 @@ pub fn parse_head(raw: &[u8]) -> io::Result<Head> {
         status,
         chunked: false,
         length: None,
+        location: None,
     };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -150,12 +367,14 @@ pub fn parse_head(raw: &[u8]) -> io::Result<Head> {
             head.chunked = value.eq_ignore_ascii_case("chunked");
         } else if name.eq_ignore_ascii_case("content-length") {
             head.length = value.parse().ok();
+        } else if name.eq_ignore_ascii_case("location") {
+            head.location = Some(value.to_owned());
         }
     }
     Ok(head)
 }
 
-fn broken(what: &str) -> io::Error {
+pub fn broken(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("HTTP: {what}"))
 }
 
@@ -226,8 +445,25 @@ mod tests {
         let url = Url::parse("http://10.0.0.1:9090/api/v1/write").unwrap();
         assert_eq!(url.authority, "10.0.0.1:9090");
         assert_eq!(url.path, "/api/v1/write");
-        assert_eq!(Url::parse("http://mon/x").unwrap().authority, "mon:80");
-        assert!(Url::parse("https://mon/x").is_none());
+        let url = Url::parse("http://mon/x").unwrap();
+        assert_eq!(
+            (url.authority.as_str(), url.host.as_str()),
+            ("mon:80", "mon")
+        );
+        let url = Url::parse("http://[::1]:9/a?b").unwrap();
+        assert_eq!(
+            (url.authority.as_str(), url.name.as_str()),
+            ("[::1]:9", "::1")
+        );
+        assert_eq!(url.join("c").unwrap().path, "/c");
+        assert_eq!(url.join("/d/e").unwrap().join("f").unwrap().path, "/d/f");
+        assert_eq!(url.join("http://o/").unwrap().authority, "o:80");
+        assert_eq!(Url::parse("http://mon").unwrap().path, "/");
+        assert!(Url::parse("ftp://mon/x").is_none());
+        assert_eq!(
+            Url::parse("https://mon/x").is_some(),
+            cfg!(feature = "tls")
+        );
     }
 
     #[test]

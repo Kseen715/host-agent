@@ -1,7 +1,9 @@
 //! The kernel's counters in /proc: CPU time, memory, load, pressure,
 //! clocks, and the small ones the hosts dashboards show.
 
-use super::{Node, absent, hardware, host_text, number, numbered, read};
+use super::{
+    Node, absent, cpuinfo, hardware, host_text, number, numbered, read,
+};
 use crate::host;
 use crate::remote::Writer;
 use std::ffi::CStr;
@@ -32,8 +34,13 @@ pub fn stat(_: &Node, w: &mut Writer) -> io::Result<()> {
     Ok(())
 }
 
-/// Time in each mode per CPU, and its thermal throttling.
-pub fn cpu(_: &Node, w: &mut Writer) -> io::Result<()> {
+/// Time in each mode per CPU, its time in guests, which CPUs are
+/// isolated, /proc/cpuinfo when asked for, and thermal throttling.
+pub fn cpu(node: &Node, w: &mut Writer) -> io::Result<()> {
+    if node.settings.cpu.info {
+        cpu_info(node, w)?;
+    }
+    let guest = node.settings.cpu.guest;
     for line in host_text("/proc/stat")?.lines() {
         let mut fields = line.split_whitespace();
         let Some(cpu) = fields
@@ -43,13 +50,81 @@ pub fn cpu(_: &Node, w: &mut Writer) -> io::Result<()> {
         else {
             continue;
         };
-        for (mode, value) in CPU_MODES.iter().zip(fields) {
+        let values: Vec<f64> =
+            fields.map(|v| v.parse().unwrap_or(0.0) / USER_HZ).collect();
+        for (mode, value) in CPU_MODES.iter().zip(&values) {
             let labels = [("cpu", cpu), ("mode", *mode)];
-            let value: f64 = value.parse().unwrap_or(0.0);
-            w.add("node_cpu_seconds_total", &labels, value / USER_HZ);
+            w.add("node_cpu_seconds_total", &labels, *value);
+        }
+        // Guest time, also counted in user and nice.
+        let guests = ["user", "nice"].iter().zip(values.iter().skip(8));
+        for (mode, value) in guests.filter(|_| guest) {
+            let labels = [("cpu", cpu), ("mode", *mode)];
+            w.add("node_cpu_guest_seconds_total", &labels, *value);
         }
     }
+    for cpu in cpuinfo::isolated()? {
+        w.add("node_cpu_isolated", &[("cpu", &cpu.to_string())], 1.0);
+    }
     hardware::throttles(w);
+    Ok(())
+}
+
+/// node_cpu_info, the frequencies when cpufreq does not run, and the
+/// first CPU's flags and bugs the filters let through.
+fn cpu_info(node: &Node, w: &mut Writer) -> io::Result<()> {
+    let cpus = cpuinfo::read_all()?;
+    for cpu in &cpus {
+        let processor = cpu.processor.to_string();
+        let labels = [
+            ("package", cpu.package.as_str()),
+            ("core", &cpu.core),
+            ("cpu", &processor),
+            ("vendor", &cpu.vendor),
+            ("family", &cpu.family),
+            ("model", &cpu.model),
+            ("model_name", &cpu.model_name),
+            ("microcode", &cpu.microcode),
+            ("stepping", &cpu.stepping),
+            ("cachesize", &cpu.cache_size),
+        ];
+        w.add("node_cpu_info", &labels, 1.0);
+    }
+    if !node.runs("cpufreq") {
+        for cpu in &cpus {
+            let processor = cpu.processor.to_string();
+            let labels = [
+                ("package", cpu.package.as_str()),
+                ("core", &cpu.core),
+                ("cpu", &processor),
+            ];
+            w.add("node_cpu_frequency_hertz", &labels, cpu.mhz * 1e6);
+        }
+    }
+    let Some(first) = cpus.first() else {
+        return Ok(());
+    };
+    let settings = &node.settings.cpu;
+    let lists = [
+        (
+            &first.flags,
+            &settings.flags_include,
+            "node_cpu_flag_info",
+            "flag",
+        ),
+        (
+            &first.bugs,
+            &settings.bugs_include,
+            "node_cpu_bug_info",
+            "bug",
+        ),
+    ];
+    for (values, include, metric, label) in lists {
+        let Some(include) = include else { continue };
+        for value in values.iter().filter(|v| include.is_match(v)) {
+            w.add(metric, &[(label, value)], 1.0);
+        }
+    }
     Ok(())
 }
 
@@ -93,7 +168,7 @@ pub fn vmstat(node: &Node, w: &mut Writer) -> io::Result<()> {
         let Some((key, value)) = line.split_once(' ') else {
             continue;
         };
-        if node.vmstat_fields.is_match(key) {
+        if node.settings.vmstat_fields.is_match(key) {
             let value = value.trim().parse().unwrap_or(0.0);
             w.add(&format!("node_vmstat_{key}"), &[], value);
         }

@@ -1,14 +1,15 @@
 //! Loki's push API: lines are grouped by label set into one JSON batch,
-//! sent after `WAIT` or at `MAX_BATCH` bytes. A batch Loki cannot take
+//! sent after `wait` or at `max_batch` bytes. A batch Loki cannot take
 //! now (429, 5xx, no answer) is kept and retried with backoff; while it
 //! waits the sources are not read, and the journal, Docker and the files
 //! hold the lines instead of this process.
 
-use crate::http::{self, Url};
+use crate::http::{self, Client, Retry, Url};
 use crate::json::escape;
 use crate::relabel::Labels;
 use std::time::{Duration, Instant};
 
+/// Unless batch_size, batch_wait and the backoff periods say otherwise.
 const MAX_BATCH: usize = 256 << 10;
 const WAIT: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -31,6 +32,7 @@ pub enum Flushed {
 
 pub struct Loki {
     url: Url,
+    client: Client,
     pub address: String,
     /// Its component's label: `central` of loki.write "central".
     pub name: String,
@@ -41,17 +43,26 @@ pub struct Loki {
     first: Option<Instant>,
     retry_at: Option<Instant>,
     backoff: Duration,
+    pub retry: Retry,
+    pub wait: Duration,
+    pub max_batch: usize,
     pub sent: u64,
     pub dropped: u64,
     pub tap: crate::tap::Tap,
 }
 
 impl Loki {
-    pub fn new(url_text: &str, name: &str, external: Labels) -> Option<Loki> {
+    pub fn new(
+        url_text: &str,
+        name: &str,
+        external: Labels,
+        client: Client,
+    ) -> Option<Loki> {
         let url = Url::parse(url_text)?;
         Some(Loki {
             address: url.authority.clone(),
             url,
+            client,
             name: name.to_owned(),
             external,
             streams: Vec::new(),
@@ -59,6 +70,13 @@ impl Loki {
             first: None,
             retry_at: None,
             backoff: Duration::ZERO,
+            retry: Retry {
+                min: WAIT,
+                max: MAX_BACKOFF,
+                on_429: true,
+            },
+            wait: WAIT,
+            max_batch: MAX_BATCH,
             sent: 0,
             dropped: 0,
             tap: crate::tap::Tap::default(),
@@ -120,16 +138,16 @@ impl Loki {
 
     /// No more lines now: the batch is full or waits for a retry.
     pub fn blocked(&self, now: Instant) -> bool {
-        self.bytes >= MAX_BATCH || self.retry_at.is_some_and(|at| now < at)
+        self.bytes >= self.max_batch || self.retry_at.is_some_and(|at| now < at)
     }
 
     /// When the batch should go, if it has lines.
     pub fn due_at(&self) -> Option<Instant> {
         let first = self.first?;
-        if self.bytes >= MAX_BATCH {
+        if self.bytes >= self.max_batch {
             return Some(self.retry_at.unwrap_or(first));
         }
-        Some(self.retry_at.unwrap_or(first + WAIT))
+        Some(self.retry_at.unwrap_or(first + self.wait))
     }
 
     pub fn flush(&mut self) -> Flushed {
@@ -137,10 +155,11 @@ impl Loki {
             return Flushed::Done;
         }
         let count: u64 = self.streams.iter().map(|s| s.count).sum();
-        let result = http::post(&self.url, JSON, self.body().as_bytes());
+        let result =
+            http::post(&self.url, &self.client, JSON, self.body().as_bytes());
         match result {
             Ok(response) if response.ok() => self.sent += count,
-            Ok(response) if response.status != 429 && response.status < 500 => {
+            Ok(response) if !self.retry.again(response.status) => {
                 let text = String::from_utf8_lossy(&response.body);
                 eprintln!(
                     "Logs: {} {}, lines dropped",
@@ -167,7 +186,7 @@ impl Loki {
         if self.backoff.is_zero() {
             eprintln!("Logs: {error}, retrying");
         }
-        self.backoff = (self.backoff * 2).clamp(WAIT, MAX_BACKOFF);
+        self.backoff = self.retry.next(self.backoff);
         self.retry_at = Some(Instant::now() + self.backoff);
         Flushed::Kept
     }
@@ -210,8 +229,13 @@ mod tests {
     #[test]
     fn groups_lines_by_labels() {
         let host = vec![("host".into(), "h".into())];
-        let mut loki =
-            Loki::new("http://127.0.0.1:1/push", "central", host).unwrap();
+        let mut loki = Loki::new(
+            "http://127.0.0.1:1/push",
+            "central",
+            host,
+            Default::default(),
+        )
+        .unwrap();
         let labels = |pairs: &[(&str, &str)]| -> Labels {
             pairs
                 .iter()

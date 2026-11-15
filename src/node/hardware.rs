@@ -119,11 +119,14 @@ pub fn thermal_zone(_: &Node, w: &mut Writer) -> io::Result<()> {
     Ok(())
 }
 
-pub fn hwmon(_: &Node, w: &mut Writer) -> io::Result<()> {
+pub fn hwmon(node: &Node, w: &mut Writer) -> io::Result<()> {
     for (dir, _) in numbered("/sys/class/hwmon", "hwmon") {
         let Some(chip) = chip_name(&dir) else {
             continue;
         };
+        if node.settings.hwmon.skips(&chip) {
+            continue;
+        }
         let mut sensors = BTreeMap::new();
         sensor_files(&dir, &mut sensors);
         sensor_files(&dir.join("device"), &mut sensors);

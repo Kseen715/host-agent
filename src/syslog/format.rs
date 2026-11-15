@@ -66,6 +66,27 @@ fn priority(raw: &str) -> Option<(&'static str, &'static str, &str)> {
     Some((SEVERITIES[usize::from(priority & 7)], facility, rest))
 }
 
+/// A raw line's `<PRI>`, up to 255, as Alloy's raw parser reads it:
+/// the severity, the facility if there is one, and the rest. A line
+/// without a priority is all text.
+pub fn raw(line: &str) -> (&'static str, &'static str, &str) {
+    let digits = line.strip_prefix('<').and_then(|r| r.split_once('>'));
+    let found = digits.and_then(|(digits, rest)| {
+        let all =
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        let priority: u8 = digits.parse().ok().filter(|_| all)?;
+        Some((priority, rest))
+    });
+    match found {
+        Some((priority, rest)) if line.len() >= 3 => {
+            let facility = FACILITIES.get(usize::from(priority >> 3));
+            let severity = SEVERITIES[usize::from(priority & 7)];
+            (severity, facility.copied().unwrap_or(""), rest)
+        }
+        _ => ("", "", line),
+    }
+}
+
 /// `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD [MSG]`, `-` for
 /// a field left out.
 pub fn rfc5424(raw: &str) -> Option<Message<'_>> {
@@ -225,6 +246,14 @@ mod tests {
         );
         assert!(m.ns.is_some());
         assert!(rfc3164("no priority").is_none());
+    }
+
+    #[test]
+    fn reads_raw_lines() {
+        assert_eq!(raw("<27>ndm: x"), ("error", "daemon", "ndm: x"));
+        assert_eq!(raw("<255>x"), ("debug", "", "x"));
+        assert_eq!(raw("<256>x"), ("", "", "<256>x"));
+        assert_eq!(raw("plain"), ("", "", "plain"));
     }
 
     #[test]

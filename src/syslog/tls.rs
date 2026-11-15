@@ -2,10 +2,11 @@
 //! read when poll(2) finds it readable, as plain TCP is.
 
 use crate::alloy::ListenerTls;
+use crate::http::tls::{certificates, versions};
 use rustls::RootCertStore;
 use rustls::crypto::ring;
+use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ServerConfig, ServerConnection, WebPkiClientVerifier};
 use std::io::{self, Read};
 use std::net::TcpStream;
@@ -14,13 +15,8 @@ use std::sync::Arc;
 /// The listener's server settings, from its PEM certificates and key.
 pub fn config(tls: &ListenerTls) -> Result<Arc<ServerConfig>, String> {
     let provider = Arc::new(ring::default_provider());
-    let versions: &[_] = if tls.tls13_only {
-        &[&rustls::version::TLS13]
-    } else {
-        &[&rustls::version::TLS13, &rustls::version::TLS12]
-    };
     let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
-        .with_protocol_versions(versions)
+        .with_protocol_versions(versions(tls.tls13_only))
         .map_err(|e| e.to_string())?;
     let builder = match &tls.ca {
         None => builder.with_no_client_auth(),
@@ -43,16 +39,6 @@ pub fn config(tls: &ListenerTls) -> Result<Arc<ServerConfig>, String> {
         .with_single_cert(certificates(&tls.cert)?, key)
         .map_err(|e| format!("cert: {e}"))?;
     Ok(Arc::new(config))
-}
-
-fn certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
-    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("certificate: {e}"))?;
-    match certs.is_empty() {
-        true => Err("no certificate in PEM".into()),
-        false => Ok(certs),
-    }
 }
 
 /// Reads what arrived on `stream` into `out`, decrypted, and sends the

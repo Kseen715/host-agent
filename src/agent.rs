@@ -6,6 +6,7 @@
 
 use crate::alloy::syntax::Stmt;
 use crate::alloy::{self, Exporter, Plan, ScrapeJob};
+use crate::encoding::query_escape;
 use crate::files::{self, Files};
 use crate::http::Url;
 use crate::logs::Logs;
@@ -134,6 +135,7 @@ impl Agent {
         let job = &self.scrapes[index].0;
         let (to, honor) = (Rc::clone(&job.to), job.honor_labels);
         let interval = job.interval;
+        let (client, stamps) = (job.client.clone(), job.honor_timestamps);
         for target in prepare(job, docker) {
             let visible: Labels = target
                 .iter()
@@ -145,7 +147,12 @@ impl Agent {
                 self.in_process(&target, (visible, to, honor), interval);
             } else {
                 self.writer.target(visible, to, honor);
-                crate::scrape::scrape(&mut self.writer, &url(&target));
+                let Some(url) = url(&target) else {
+                    eprintln!("Scrape: no URL for {target:?}");
+                    self.writer.up(false);
+                    continue;
+                };
+                crate::scrape::scrape(&mut self.writer, &url, &client, stamps);
             }
         }
     }
@@ -493,35 +500,24 @@ fn prepare(job: &ScrapeJob, docker: &[Labels]) -> Vec<Labels> {
     prepared
 }
 
-/// A target's URL: its address, path and `__param_*` as the query.
-fn url(target: &Labels) -> Url {
+/// A target's URL: its scheme, address, path and `__param_*` as the
+/// query.
+fn url(target: &Labels) -> Option<Url> {
     let mut path = targets::get(target, "__metrics_path__").to_owned();
     let params = target
         .iter()
         .filter_map(|(k, v)| Some((k.strip_prefix("__param_")?, v)));
     for (i, (name, value)) in params.enumerate() {
         path.push(if i == 0 { '?' } else { '&' });
-        path.push_str(&format!("{}={}", encode(name), encode(value)));
+        path.push_str(&format!(
+            "{}={}",
+            query_escape(name),
+            query_escape(value)
+        ));
     }
-    let authority = targets::get(target, "__address__").to_owned();
-    Url { authority, path }
-}
-
-fn encode(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    let scheme = targets::get(target, "__scheme__");
+    let address = targets::get(target, "__address__");
+    Url::parse(&format!("{scheme}://{address}{path}"))
 }
 
 /// A spool on disk for each remote write, as Alloy keeps a WAL in

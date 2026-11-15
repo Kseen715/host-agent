@@ -20,7 +20,12 @@ default = [
     "snmp",
     "syslog",
 ]
+# loki.source.file's `decompression`: gzip, zlib, bzip2 (pure Rust).
+decompression = ["dep:flate2", "dep:bzip2-rs"]
 docker = []
+# loki.source.file's `encoding` beyond UTF-8, UTF-16 and Latin-1: the
+# WHATWG encodings (encoding_rs, +~0.5 MB of tables).
+encodings = ["dep:encoding_rs"]
 filesystems = []
 journal = []
 # The journal read from its files instead of through journalctl, which
@@ -36,10 +41,16 @@ snmp = []
 syslog = []
 # SNMP devices polled by tasks on one thread instead of a thread each.
 tokio = ["snmp", "dep:tokio"]
-# Syslog over TLS (its listeners' tls_config): rustls on ring, +~0.9 MB.
-tls = ["syslog", "dep:rustls"]
+# HTTPS for scrapes and pushes, and syslog over TLS (its listeners'
+# tls_config): rustls on ring, +~0.9 MB.
+tls = ["dep:rustls"]
 
 [dependencies]
+bzip2-rs = { version = "0.1", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+flate2 = { version = "1", optional = true, default-features = false, features = [
+    "rust_backend",
+] }
 libc = "0.2"
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = [
     "safe-decode",

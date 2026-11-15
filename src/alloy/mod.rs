@@ -2,17 +2,21 @@
 //! components this agent has, in Alloy's syntax, so one file serves
 //! both.
 
+mod client;
 mod compile;
 mod components;
 mod process;
 mod snmp;
+mod stdlib;
 pub mod syntax;
+mod unix;
 mod value;
 
 #[cfg(feature = "tls")]
 pub use compile::ListenerTls;
 pub use compile::{
-    Exporter, JournalSource, Plan, ScrapeJob, SyslogListener, compile,
+    Exporter, JournalSource, Plan, ScrapeJob, SyslogFormat, SyslogListener,
+    compile,
 };
 pub use components::INTERNAL;
 

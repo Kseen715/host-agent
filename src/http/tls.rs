@@ -1,0 +1,185 @@
+//! HTTPS: rustls as Go's crypto/tls client is configured by a
+//! tls_config, verifying against the system's roots by default.
+
+use super::{Stream, Url};
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use rustls::crypto::{CryptoProvider, ring};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore,
+    SignatureScheme, StreamOwned,
+};
+use std::io;
+use std::net::TcpStream;
+use std::sync::{Arc, OnceLock};
+
+/// Where Go looks for the system's roots, in its order.
+const ROOT_FILES: [&str; 6] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+/// A tls_config, as PEM text.
+#[derive(Default)]
+pub struct Settings {
+    pub ca: Option<String>,
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub server_name: Option<String>,
+    pub insecure_skip_verify: bool,
+    pub tls13_only: bool,
+}
+
+#[derive(Clone)]
+pub struct Tls {
+    config: Arc<ClientConfig>,
+    server_name: Option<String>,
+}
+
+pub fn certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certs = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("certificate: {e}"))?;
+    match certs.is_empty() {
+        true => Err("no certificate in PEM".into()),
+        false => Ok(certs),
+    }
+}
+
+type Version = &'static rustls::SupportedProtocolVersion;
+
+/// TLS 1.2 and 1.3, or 1.3 only (min_version).
+pub fn versions(tls13_only: bool) -> &'static [Version] {
+    static BOTH: [Version; 2] =
+        [&rustls::version::TLS13, &rustls::version::TLS12];
+    match tls13_only {
+        true => &BOTH[..1],
+        false => &BOTH,
+    }
+}
+
+impl Tls {
+    pub fn new(settings: &Settings) -> Result<Tls, String> {
+        let provider = Arc::new(ring::default_provider());
+        let builder =
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_protocol_versions(versions(settings.tls13_only))
+                .map_err(|e| e.to_string())?;
+        let builder =
+            match settings.insecure_skip_verify {
+                true => builder.dangerous().with_custom_certificate_verifier(
+                    Arc::new(Unverified(provider)),
+                ),
+                false => builder
+                    .with_root_certificates(roots(settings.ca.as_deref())?),
+            };
+        let config = match (&settings.cert, &settings.key) {
+            (Some(cert), Some(key)) => {
+                let key = PrivateKeyDer::from_pem_slice(key.as_bytes())
+                    .map_err(|e| format!("key: {e}"))?;
+                builder
+                    .with_client_auth_cert(certificates(cert)?, key)
+                    .map_err(|e| format!("cert: {e}"))?
+            }
+            _ => builder.with_no_client_auth(),
+        };
+        Ok(Tls {
+            config: Arc::new(config),
+            server_name: settings.server_name.clone(),
+        })
+    }
+}
+
+/// The CA given, or the system's: SSL_CERT_FILE, else the first of
+/// Go's files found.
+fn roots(ca: Option<&str>) -> Result<RootCertStore, String> {
+    let mut store = RootCertStore::empty();
+    let pem = match ca {
+        Some(ca) => ca.to_owned(),
+        None => {
+            let env = std::env::var("SSL_CERT_FILE").ok();
+            let mut files = env.iter().map(String::as_str).chain(ROOT_FILES);
+            files
+                .find_map(|file| std::fs::read_to_string(file).ok())
+                .ok_or("no system roots: set ca_pem or ca_file")?
+        }
+    };
+    for cert in certificates(&pem)? {
+        // A bundle may hold certificates rustls cannot use: as Go,
+        // the rest still count.
+        if store.add(cert).is_err() && ca.is_some() {
+            return Err("ca: a certificate rustls cannot use".into());
+        }
+    }
+    Ok(store)
+}
+
+/// TLS over `stream` to `url`; no tls_config, the system's roots.
+pub fn wrap(
+    stream: TcpStream,
+    url: &Url,
+    tls: Option<&Tls>,
+) -> io::Result<Box<dyn Stream>> {
+    static DEFAULT: OnceLock<Result<Tls, String>> = OnceLock::new();
+    let tls = match tls {
+        Some(tls) => tls,
+        None => DEFAULT
+            .get_or_init(|| Tls::new(&Settings::default()))
+            .as_ref()
+            .map_err(|e| io::Error::other(e.clone()))?,
+    };
+    let name = tls.server_name.as_deref().unwrap_or(&url.name);
+    let name = ServerName::try_from(name.to_owned())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let connection = ClientConnection::new(Arc::clone(&tls.config), name)
+        .map_err(io::Error::other)?;
+    Ok(Box::new(StreamOwned::new(connection, stream)))
+}
+
+/// insecure_skip_verify: any certificate, signatures still checked.
+#[derive(Debug)]
+struct Unverified(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for Unverified {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.0.signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.0.signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}

@@ -222,6 +222,80 @@ impl Parser<'_> {
 }
 
 /// Appends `text` as the inside of a JSON string.
+impl Json {
+    /// As Go's encoding/json writes it: compact, keys sorted, `<>&`
+    /// escaped.
+    pub fn go_text(&self) -> String {
+        let mut out = String::new();
+        self.go_write(&mut out);
+        out
+    }
+
+    fn go_write(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => out.push_str(&go_float(*n)),
+            Json::Str(s) => go_string(out, s),
+            Json::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.go_write(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(fields) => {
+                let mut sorted: Vec<_> = fields.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                out.push('{');
+                for (i, (key, value)) in sorted.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    go_string(out, key);
+                    out.push(':');
+                    value.go_write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+fn go_string(out: &mut String, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c => escape(out, c.encode_utf8(&mut [0; 4])),
+        }
+    }
+    out.push('"');
+}
+
+/// A float as Go's encoding/json writes it: decimal between 1e-6 and
+/// 1e21, else `1e+21`, `1e-7`.
+fn go_float(n: f64) -> String {
+    let abs = n.abs();
+    if abs == 0.0 || (1e-6..1e21).contains(&abs) {
+        return format!("{n}");
+    }
+    let text = format!("{n:e}");
+    match text.split_once('e') {
+        Some((mantissa, exp)) if !exp.starts_with('-') => {
+            format!("{mantissa}e+{exp:0>2}")
+        }
+        _ => text,
+    }
+}
+
 pub fn escape(out: &mut String, text: &str) {
     for ch in text.chars() {
         match ch {

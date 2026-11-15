@@ -17,8 +17,8 @@ pub fn filesystem(node: &Node, w: &mut Writer) -> io::Result<()> {
             continue;
         };
         let point = host::unescape(point);
-        if node.fs_mount_points.is_match(&point)
-            || node.fs_types.is_match(fstype)
+        if node.settings.fs_mount_points.is_match(&point)
+            || node.settings.fs_types.is_match(fstype)
         {
             continue;
         }
@@ -99,7 +99,7 @@ pub fn diskstats(node: &Node, w: &mut Writer) -> io::Result<()> {
         else {
             continue;
         };
-        if node.disk_devices.is_match(device) {
+        if node.settings.disk.skips(device) {
             continue;
         }
         let labels = [("device", device)];
@@ -107,7 +107,7 @@ pub fn diskstats(node: &Node, w: &mut Writer) -> io::Result<()> {
             let value: f64 = value.parse().unwrap_or(0.0);
             w.add(name, &labels, value * scale);
         }
-        let path = format!("/run/udev/data/b{major}:{minor}");
+        let path = format!("{}/b{major}:{minor}", node.settings.udev_data);
         let text = host_text(&path).unwrap_or_default();
         disk_info(w, device, major, minor, &udev(&text));
     }

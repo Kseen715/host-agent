@@ -28,8 +28,8 @@ pub enum Stage {
     LabelDrop(Vec<String>),
     LabelKeep(Vec<String>),
     Drop(Drop),
-    /// Values to extract and the paths or keys they are read from.
-    Json(Option<String>, Vec<(String, String)>),
+    Json(JsonStage),
+    /// Values to extract and the keys they are read from.
     Logfmt(Option<String>, Vec<(String, String)>),
     Timestamp(Timestamp),
     Output(String),
@@ -79,6 +79,117 @@ impl Timestamp {
     }
 }
 
+/// stage.json: values read from the line (or `source`) as JSON.
+#[derive(Default)]
+pub struct JsonStage {
+    pub source: Option<String>,
+    /// Each value to extract and the path it is read from.
+    pub fields: Vec<(String, Vec<Step>)>,
+    /// Top-level keys extracted under their own names.
+    pub keys: Option<Regex>,
+    /// A line that is not a JSON object is dropped.
+    pub drop_malformed: bool,
+}
+
+/// A step of a JMESPath made of fields and indexes: `a."b-c"[0][-1]`.
+pub enum Step {
+    Field(String),
+    Index(i64),
+}
+
+/// The paths stage.json can follow; anything else JMESPath has is
+/// refused, not read another way.
+pub fn json_path(text: &str) -> Result<Vec<Step>, String> {
+    let refuse = || format!("`{text}`: only fields and indexes");
+    let mut steps = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(inside) = rest.strip_prefix('[') {
+            let (index, after) = inside.split_once(']').ok_or_else(refuse)?;
+            steps.push(Step::Index(index.parse().map_err(|_| refuse())?));
+            rest = after;
+        } else {
+            if !steps.is_empty() {
+                rest = rest.strip_prefix('.').ok_or_else(refuse)?;
+            }
+            let (field, after) = json_field(rest).ok_or_else(refuse)?;
+            steps.push(Step::Field(field));
+            rest = after;
+        }
+    }
+    if steps.is_empty() {
+        return Err(refuse());
+    }
+    Ok(steps)
+}
+
+/// An identifier, or a quoted one, and what follows it.
+fn json_field(text: &str) -> Option<(String, &str)> {
+    if let Some(quoted) = text.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        let name = &quoted[..end];
+        return (!name.contains('\\'))
+            .then(|| (name.to_owned(), &quoted[end + 1..]));
+    }
+    let end = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(text.len());
+    let name = &text[..end];
+    let starts =
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+    starts.then(|| (name.to_owned(), &text[end..]))
+}
+
+impl JsonStage {
+    /// Whether the entry goes on.
+    fn apply(&self, entry: &Entry, x: &mut Labels) -> bool {
+        let Some(input) = input(&self.source, entry, x) else {
+            return true;
+        };
+        let json = Json::parse(&input).filter(|j| matches!(j, Json::Obj(_)));
+        let Some(json) = json else {
+            return !self.drop_malformed;
+        };
+        for (name, path) in &self.fields {
+            if let Some(value) = follow(&json, path).and_then(json_value) {
+                set(x, name, value);
+            }
+        }
+        if let Some(keys) = &self.keys {
+            for (key, value) in json.obj() {
+                if let Some(value) =
+                    keys.is_match(key).then(|| json_value(value)).flatten()
+                {
+                    set(x, key, value);
+                }
+            }
+        }
+        true
+    }
+}
+
+fn follow<'a>(json: &'a Json, path: &[Step]) -> Option<&'a Json> {
+    path.iter().try_fold(json, |at, step| match step {
+        Step::Field(name) => at.get(name),
+        Step::Index(i) => {
+            let items = at.arr();
+            let i = if *i < 0 { items.len() as i64 + i } else { *i };
+            items.get(usize::try_from(i).ok()?)
+        }
+    })
+}
+
+/// A value as Alloy extracts it: objects and arrays as JSON text.
+fn json_value(json: &Json) -> Option<String> {
+    match json {
+        Json::Null => None,
+        Json::Str(s) => Some(s.clone()),
+        Json::Num(n) => Some(n.to_string()),
+        Json::Bool(b) => Some(b.to_string()),
+        other => Some(other.go_text()),
+    }
+}
+
 /// Drops a line that meets every condition given.
 #[derive(Default)]
 pub struct Drop {
@@ -111,6 +222,7 @@ impl Stage {
                 }
             }
             Stage::Match(..) => true,
+            Stage::Json(json) => json.apply(entry, x),
             _ => {
                 self.extract(entry, x);
                 self.shape(entry, x);
@@ -139,11 +251,6 @@ impl Stage {
             }
             Stage::Replace(regex, source, with) => {
                 replace(regex, source, with, entry, x)
-            }
-            Stage::Json(source, fields) => {
-                if let Some(input) = input(source, entry, x) {
-                    json(&input, fields, x);
-                }
             }
             Stage::Logfmt(source, fields) => {
                 if let Some(input) = input(source, entry, x) {
@@ -265,39 +372,6 @@ impl Drop {
         };
         self.regex.as_ref().is_none_or(|r| r.is_match(value))
             && self.value.as_ref().is_none_or(|v| v == value)
-    }
-}
-
-/// Values at JMESPath's simplest paths: `a.b`, `a[0]`; objects and
-/// arrays are not extracted.
-fn json(input: &str, fields: &[(String, String)], x: &mut Labels) {
-    let Some(json) = Json::parse(input) else {
-        return;
-    };
-    for (name, path) in fields {
-        let path = if path.is_empty() { name } else { path };
-        let mut at = Some(&json);
-        for step in path.split('.') {
-            let (key, index) = match step.split_once('[') {
-                Some((key, i)) => {
-                    (key, i.trim_end_matches(']').parse::<usize>().ok())
-                }
-                None => (step, None),
-            };
-            at = at.and_then(
-                |j| if key.is_empty() { Some(j) } else { j.get(key) },
-            );
-            if let Some(index) = index {
-                at = at.and_then(|j| j.arr().get(index));
-            }
-        }
-        let value = match at {
-            Some(Json::Str(s)) => s.clone(),
-            Some(Json::Num(n)) => n.to_string(),
-            Some(Json::Bool(b)) => b.to_string(),
-            _ => continue,
-        };
-        set(x, name, value);
     }
 }
 
@@ -514,6 +588,29 @@ mod tests {
     }
 
     #[test]
+    fn reads_json_as_alloy() {
+        assert!(json_path(r#"a."b-c"[0][-1]"#).is_ok());
+        for refused in ["a | b", "a[*]", "keys(@)", "a..b", "", "1a"] {
+            assert!(json_path(refused).is_err(), "{refused}");
+        }
+        let stage = |drop_malformed| {
+            Stage::Json(JsonStage {
+                fields: vec![("o".into(), json_path("o").unwrap())],
+                keys: Some(Regex::new("^n").unwrap()),
+                drop_malformed,
+                ..JsonStage::default()
+            })
+        };
+        let mut parsed = entry(r#"{"o":{"z":"<",  "a":[1e21,2]},"n":1}"#);
+        let x = &mut parsed.labels.clone();
+        assert!(stage(false).apply(&mut parsed, x));
+        assert_eq!(get(x, "o"), Some(r#"{"a":[1e+21,2],"z":"\u003c"}"#));
+        assert_eq!(get(x, "n"), Some("1"));
+        assert!(run(&[stage(false)], &mut entry("[1]")));
+        assert!(!run(&[stage(true)], &mut entry("not json")));
+    }
+
+    #[test]
     fn drops_matches_and_parses() {
         let drop = Stage::Drop(Drop {
             regex: Some(Regex::new("^info: guest-ping").unwrap()),
@@ -525,16 +622,26 @@ mod tests {
         let stage = Stage::Match(selector.unwrap(), Action::Drop);
         assert!(!run(std::slice::from_ref(&stage), &mut entry("a boom")));
         assert!(run(&[stage], &mut entry("quiet")));
+    }
 
+    #[test]
+    fn parses_json_and_logfmt() {
         let mut parsed = entry(r#"{"a":{"b":[1,"x"]}}"#);
-        let fields = vec![("v".into(), "a.b[1]".into())];
+        let json = JsonStage {
+            fields: vec![("v".into(), json_path("a.b[-1]").unwrap())],
+            ..JsonStage::default()
+        };
         let stages = [
-            Stage::Json(None, fields),
+            Stage::Json(json),
             Stage::Output("v".into()),
             Stage::Logfmt(None, vec![("t".into(), String::new())]),
         ];
         assert!(run(&stages, &mut parsed));
         assert_eq!(parsed.line, "x");
+    }
+
+    #[test]
+    fn reads_timestamps() {
         let stages = [
             Stage::Logfmt(None, vec![("t".into(), String::new())]),
             Stage::Timestamp(Timestamp {

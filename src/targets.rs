@@ -21,6 +21,9 @@ pub enum Targets {
     /// discovery.relabel's output.
     Relabel(Box<Targets>, Rc<Vec<Rule>>),
     Concat(Vec<Targets>),
+    /// array.combine_maps's: the left joined with the right on these
+    /// labels; the bool keeps the left ones that do not join.
+    Combine(Box<[Targets; 2]>, Vec<String>, bool),
     /// local.file_match's: a target per file its `__path__` matches,
     /// less those modified longer ago than the duration.
     FileMatch(Box<Targets>, Option<Duration>),
@@ -41,6 +44,12 @@ impl Targets {
             Targets::Concat(parts) => {
                 parts.iter().flat_map(|p| p.resolve(docker)).collect()
             }
+            Targets::Combine(sides, on, keep) => {
+                let [left, right] = sides.as_ref();
+                let (left, right) =
+                    (left.resolve(docker), right.resolve(docker));
+                combine(&left, &right, on, *keep, String::eq)
+            }
             Targets::FileMatch(inner, older) => inner
                 .resolve(docker)
                 .iter()
@@ -48,6 +57,45 @@ impl Targets {
                 .collect(),
         }
     }
+}
+
+/// array.combine_maps: each left map with each right one that has the
+/// same values under every key in `on`, merged (the right's win). With
+/// `keep`, a left map is also kept as is once for each right one it
+/// does not join, as Alloy's loop does.
+pub fn combine<T: Clone>(
+    left: &[Vec<(String, T)>],
+    right: &[Vec<(String, T)>],
+    on: &[String],
+    keep: bool,
+    same: impl Fn(&T, &T) -> bool,
+) -> Vec<Vec<(String, T)>> {
+    fn get<'a, T>(map: &'a [(String, T)], key: &str) -> Option<&'a T> {
+        map.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    let joins = |l: &[(String, T)], r: &[(String, T)]| {
+        on.iter().all(|key| match (get(l, key), get(r, key)) {
+            (Some(a), Some(b)) => same(a, b),
+            _ => false,
+        })
+    };
+    let mut out = Vec::new();
+    for l in left {
+        for r in right {
+            if joins(l, r) {
+                let mut merged: Vec<_> = l
+                    .iter()
+                    .filter(|(k, _)| get(r, k).is_none())
+                    .cloned()
+                    .collect();
+                merged.extend(r.iter().cloned());
+                out.push(merged);
+            } else if keep {
+                out.push(l.clone());
+            }
+        }
+    }
+    out
 }
 
 fn file_match(target: &Labels, older: Option<Duration>) -> Vec<Labels> {

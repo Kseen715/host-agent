@@ -3,7 +3,9 @@
 
 use super::{Node, absent, host_text, numbered, read};
 use crate::remote::Writer;
+use std::ffi::CStr;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 const RECEIVE: [&str; 8] = [
@@ -27,11 +29,14 @@ const TRANSMIT: [&str; 8] = [
     "compressed",
 ];
 
-pub fn netdev(_: &Node, w: &mut Writer) -> io::Result<()> {
+pub fn netdev(node: &Node, w: &mut Writer) -> io::Result<()> {
     for line in host_text("/proc/net/dev")?.lines().skip(2) {
         let Some((device, counters)) = line.split_once(':') else {
             continue;
         };
+        if node.settings.netdev.skips(device.trim()) {
+            continue;
+        }
         let labels = [("device", device.trim())];
         let values: Vec<f64> = counters
             .split_whitespace()
@@ -43,7 +48,106 @@ pub fn netdev(_: &Node, w: &mut Writer) -> io::Result<()> {
             w.add(&format!("node_network_{way}_{name}_total"), &labels, value);
         }
     }
+    if node.settings.netdev_address_info {
+        addresses(w)?;
+    }
     Ok(())
+}
+
+/// node_network_address_info: each address of this network namespace,
+/// as Go's net.Interfaces lists them.
+fn addresses(w: &mut Writer) -> io::Result<()> {
+    for (device, address, prefix) in interface_addresses()? {
+        let netmask = prefix.to_string();
+        let labels = [
+            ("device", device.as_str()),
+            ("address", &address.to_string()),
+            ("netmask", &netmask),
+            ("scope", scope(address)),
+        ];
+        w.add("node_network_address_info", &labels, 1.0);
+    }
+    Ok(())
+}
+
+/// Go's scope(): link-local, interface-local, global, or none.
+fn scope(ip: IpAddr) -> &'static str {
+    let link_local = match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.octets()[..3] == [224, 0, 0],
+        IpAddr::V6(v6) => {
+            v6.is_unicast_link_local() || v6.segments()[0] & 0xff0f == 0xff02
+        }
+    };
+    let global = match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast()),
+    };
+    let interface_local =
+        matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xff0f == 0xff01);
+    if ip.is_loopback() || link_local {
+        "link-local"
+    } else if interface_local {
+        "interface-local"
+    } else if global {
+        "global"
+    } else {
+        ""
+    }
+}
+
+/// getifaddrs(3)'s IPv4 and IPv6 addresses and their prefix lengths.
+fn interface_addresses() -> io::Result<Vec<(String, IpAddr, u32)>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, freed below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut found = Vec::new();
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: a node of the list getifaddrs returned.
+        let ifa = unsafe { &*entry };
+        entry = ifa.ifa_next;
+        // SAFETY: the pointers are null or point to sockaddrs.
+        let addresses = unsafe { (ip(ifa.ifa_addr), ip(ifa.ifa_netmask)) };
+        let (Some(address), Some(mask)) = addresses else {
+            continue;
+        };
+        // SAFETY: a NUL-terminated interface name.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) };
+        let prefix = match mask {
+            IpAddr::V4(m) => u32::from(m).count_ones(),
+            IpAddr::V6(m) => u128::from(m).count_ones(),
+        };
+        found.push((name.to_string_lossy().into_owned(), address, prefix));
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(found)
+}
+
+/// A sockaddr's IP address, if it is IPv4 or IPv6.
+unsafe fn ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    // SAFETY: the family says which sockaddr this is.
+    unsafe {
+        match i32::from((*addr).sa_family) {
+            libc::AF_INET => {
+                let v4 = &*addr.cast::<libc::sockaddr_in>();
+                let bytes = v4.sin_addr.s_addr.to_ne_bytes();
+                Some(IpAddr::V4(Ipv4Addr::from(bytes)))
+            }
+            libc::AF_INET6 => {
+                let v6 = &*addr.cast::<libc::sockaddr_in6>();
+                Some(IpAddr::V6(Ipv6Addr::from(v6.sin6_addr.s6_addr)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Numeric attributes of /sys/class/net/<device>: decimal or `0x` hex.
@@ -68,9 +172,10 @@ const NETCLASS: [(&str, &str); 15] = [
     ("type", "node_network_protocol_type"),
 ];
 
-pub fn netclass(_: &Node, w: &mut Writer) -> io::Result<()> {
+pub fn netclass(node: &Node, w: &mut Writer) -> io::Result<()> {
+    let s = &node.settings;
     for (dir, device) in numbered("/sys/class/net", "") {
-        if !dir.is_dir() {
+        if !dir.is_dir() || s.netclass_ignored.is_match(&device) {
             continue;
         }
         let labels = [("device", device.as_str())];
@@ -85,30 +190,37 @@ pub fn netclass(_: &Node, w: &mut Writer) -> io::Result<()> {
         if let Some(length) = attribute(&dir, "tx_queue_len") {
             w.add("node_network_transmit_queue_length", &labels, length);
         }
-        // Megabits per second; -1 (unknown) is kept, as Alloy does.
-        if let Some(speed) = attribute(&dir, "speed") {
+        // Megabits per second; -1 (unknown) is kept unless asked not to.
+        let speed = attribute(&dir, "speed");
+        if let Some(speed) =
+            speed.filter(|v| *v >= 0.0 || !s.netclass_invalid_speed)
+        {
             w.add("node_network_speed_bytes", &labels, speed * 125_000.0);
         }
-        let flags = attribute(&dir, "flags").unwrap_or(0.0) as u64;
-        let admin = if flags & libc::IFF_UP as u64 != 0 {
-            "up"
-        } else {
-            "down"
-        };
-        let (address, broadcast) = (file("address"), file("broadcast"));
-        let (duplex, alias) = (file("duplex"), file("ifalias"));
-        let info = [
-            ("address", address.as_str()),
-            ("adminstate", admin),
-            ("broadcast", broadcast.as_str()),
-            ("device", device.as_str()),
-            ("duplex", duplex.as_str()),
-            ("ifalias", alias.as_str()),
-            ("operstate", state.as_str()),
-        ];
-        w.add("node_network_info", &info, 1.0);
+        info(&dir, &device, &state, w);
     }
     Ok(())
+}
+
+fn info(dir: &Path, device: &str, state: &str, w: &mut Writer) {
+    let file = |name: &str| read(dir.join(name)).unwrap_or_default();
+    let flags = attribute(dir, "flags").unwrap_or(0.0) as u64;
+    let admin = match flags & libc::IFF_UP as u64 {
+        0 => "down",
+        _ => "up",
+    };
+    let (address, broadcast) = (file("address"), file("broadcast"));
+    let (duplex, alias) = (file("duplex"), file("ifalias"));
+    let info = [
+        ("address", address.as_str()),
+        ("adminstate", admin),
+        ("broadcast", broadcast.as_str()),
+        ("device", device),
+        ("duplex", duplex.as_str()),
+        ("ifalias", alias.as_str()),
+        ("operstate", state),
+    ];
+    w.add("node_network_info", &info, 1.0);
 }
 
 fn attribute(dir: &Path, name: &str) -> Option<f64> {
@@ -180,7 +292,7 @@ fn add_netstat(
     value: &str,
 ) {
     let key = format!("{proto}_{name}");
-    if node.netstat_fields.is_match(&key) {
+    if node.settings.netstat_fields.is_match(&key) {
         let value = value.parse().unwrap_or(0.0);
         w.add(&format!("node_netstat_{key}"), &[], value);
     }

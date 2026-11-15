@@ -5,13 +5,18 @@
 //! reports `node_scrape_collector_success` and its duration; one whose
 //! source this host lacks (no NFS, no bonding) fails, as Alloy's does.
 
+mod blockdev;
+mod cpuinfo;
+mod fabric;
 #[cfg(feature = "filesystems")]
 mod filesystems;
 mod hardware;
+mod ipvs;
 mod kernel;
 mod network;
 mod nfs;
 mod platform;
+mod power;
 mod storage;
 mod system;
 mod systemd;
@@ -21,6 +26,7 @@ mod zfs;
 
 use crate::host;
 use crate::remote::Writer;
+pub use cpuinfo::known as cpuinfo_known;
 use regex_lite::Regex;
 use std::cell::RefCell;
 use std::fs;
@@ -30,10 +36,10 @@ use std::time::Instant;
 
 type Collect = fn(&Node, &mut Writer) -> io::Result<()>;
 
-/// Alloy's unix exporter's default collectors that report something
-/// on some host here, under its names.
+/// Alloy's unix exporter's Linux collectors, under its names.
 const COLLECTORS: &[(&str, Collect)] = &[
     ("arp", kernel::arp),
+    ("bcache", blockdev::bcache),
     ("bonding", network::bonding),
     #[cfg(feature = "filesystems")]
     ("btrfs", filesystems::btrfs),
@@ -44,10 +50,14 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("dmi", platform::dmi),
     ("edac", platform::edac),
     ("entropy", system::entropy),
+    ("fibrechannel", fabric::fibrechannel),
     ("filefd", system::filefd),
     ("filesystem", storage::filesystem),
     ("hwmon", hardware::hwmon),
+    ("infiniband", fabric::infiniband),
+    ("ipvs", ipvs::collect),
     ("loadavg", system::loadavg),
+    ("mdadm", blockdev::mdadm),
     ("meminfo", system::meminfo),
     ("netclass", network::netclass),
     ("netdev", network::netdev),
@@ -56,14 +66,17 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("nfsd", nfs::server),
     ("nvme", platform::nvme),
     ("os", kernel::os),
+    ("powersupplyclass", power::supplies),
     ("pressure", system::pressure),
     ("processes", kernel::processes),
+    ("rapl", power::rapl),
     ("schedstat", kernel::schedstat),
     ("selinux", kernel::selinux),
     ("sockstat", kernel::sockstat),
     ("softnet", kernel::softnet),
     ("stat", system::stat),
     ("systemd", systemd::collect),
+    ("tapestats", blockdev::tapestats),
     ("textfile", textfile::collect),
     ("thermal_zone", hardware::thermal_zone),
     ("time", system::time),
@@ -77,18 +90,141 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("zfs", zfs::collect),
 ];
 
-/// prometheus.exporter.unix's collector settings.
-#[derive(Default)]
+/// prometheus.exporter.unix's collector settings; its filters are
+/// regular expressions anchored as node_exporter anchors each.
 pub struct Settings {
     pub enable: Vec<String>,
     pub disable: Vec<String>,
     /// In place of the default collectors.
     pub set: Option<Vec<String>>,
     pub textfile_dir: Option<PathBuf>,
+    /// sysfs_path as configured: labels that name sysfs paths use it.
+    pub sysfs: String,
+    pub udev_data: String,
+    pub arp: Filter,
+    pub bcache_priority_stats: bool,
+    pub cpu: CpuSettings,
+    pub disk: Filter,
+    pub fs_mount_points: Regex,
+    pub fs_types: Regex,
+    pub hwmon: Filter,
+    /// The labels of node_ipvs_backend_*, in node_exporter's order.
+    pub ipvs_labels: Vec<String>,
+    pub netclass_ignored: Regex,
+    pub netclass_invalid_speed: bool,
+    pub netdev: Filter,
+    pub netdev_address_info: bool,
+    pub netstat_fields: Regex,
+    pub power_supplies_ignored: Regex,
+    pub systemd: SystemdSettings,
+    pub tapes_ignored: Regex,
+    pub vmstat_fields: Regex,
 }
 
-/// Collectors node_exporter runs only when asked.
-const OFF_BY_DEFAULT: [&str; 1] = ["systemd"];
+/// Alloy's defaults, which its configuration may change.
+pub const NETSTAT_FIELDS: &str = "^(.*_(InErrors|InErrs)|Ip_Forwarding\
+    |Ip(6|Ext)_(InOctets|OutOctets)|Icmp6?_(InMsgs|OutMsgs)\
+    |TcpExt_(Listen.*|Syncookies.*|TCPSynRetrans|TCPTimeouts)\
+    |Tcp_(ActiveOpens|InSegs|OutSegs|OutRsts|PassiveOpens|RetransSegs\
+    |CurrEstab)|Udp6?_(InDatagrams|OutDatagrams|NoPorts|RcvbufErrors\
+    |SndbufErrors))$";
+pub const VMSTAT_FIELDS: &str = "^(oom_kill|pgpg|pswp|pg.*fault).*";
+pub const FS_MOUNT_POINTS: &str =
+    "^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+)($|/)";
+pub const FS_TYPES: &str = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs\
+    |debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay\
+    |proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs\
+    |tracefs)$";
+pub const DISK_EXCLUDE: &str =
+    "^(ram|loop|fd|(h|s|v|xv)d[a-z]|nvme\\d+n\\d+p)\\d+$";
+pub const SYSTEMD_UNIT_EXCLUDE: &str =
+    ".+\\.(automount|device|mount|scope|slice)";
+pub const IPVS_LABELS: [&str; 6] = [
+    "local_address",
+    "local_port",
+    "remote_address",
+    "remote_port",
+    "proto",
+    "local_mark",
+];
+
+/// node_exporter's device filter: a name is skipped if `exclude`
+/// matches it, or `include` is given and does not.
+#[derive(Default)]
+pub struct Filter {
+    pub exclude: Option<Regex>,
+    pub include: Option<Regex>,
+}
+
+impl Filter {
+    pub fn skips(&self, name: &str) -> bool {
+        self.exclude.as_ref().is_some_and(|r| r.is_match(name))
+            || self.include.as_ref().is_some_and(|r| !r.is_match(name))
+    }
+}
+
+#[derive(Default)]
+pub struct CpuSettings {
+    pub guest: bool,
+    pub info: bool,
+    pub flags_include: Option<Regex>,
+    pub bugs_include: Option<Regex>,
+}
+
+pub struct SystemdSettings {
+    pub include: Regex,
+    pub exclude: Regex,
+    pub start_time: bool,
+    pub restarts: bool,
+    pub tasks: bool,
+}
+
+/// A regular expression from a default above.
+pub fn regex(text: &str) -> Regex {
+    Regex::new(text).expect("a valid default")
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            enable: Vec::new(),
+            disable: Vec::new(),
+            set: None,
+            textfile_dir: None,
+            sysfs: "/sys".into(),
+            udev_data: "/run/udev/data".into(),
+            arp: Filter::default(),
+            bcache_priority_stats: false,
+            cpu: CpuSettings::default(),
+            disk: Filter {
+                exclude: Some(regex(DISK_EXCLUDE)),
+                include: None,
+            },
+            fs_mount_points: regex(FS_MOUNT_POINTS),
+            fs_types: regex(FS_TYPES),
+            hwmon: Filter::default(),
+            ipvs_labels: IPVS_LABELS.map(String::from).to_vec(),
+            netclass_ignored: regex("^$"),
+            netclass_invalid_speed: false,
+            netdev: Filter::default(),
+            netdev_address_info: false,
+            netstat_fields: regex(NETSTAT_FIELDS),
+            power_supplies_ignored: regex("^$"),
+            systemd: SystemdSettings {
+                include: regex("^(?:.+)$"),
+                exclude: regex(&format!("^(?:{SYSTEMD_UNIT_EXCLUDE})$")),
+                start_time: false,
+                restarts: false,
+                tasks: false,
+            },
+            tapes_ignored: regex("^$"),
+            vmstat_fields: regex(VMSTAT_FIELDS),
+        }
+    }
+}
+
+/// Collectors Alloy runs only when asked.
+const OFF_BY_DEFAULT: [&str; 2] = ["processes", "systemd"];
 
 /// Whether this agent has the collector.
 pub fn has_collector(name: &str) -> bool {
@@ -98,41 +234,13 @@ pub fn has_collector(name: &str) -> bool {
 pub struct Node {
     settings: Settings,
     service_types: RefCell<systemd::ServiceTypes>,
-    netstat_fields: Regex,
-    vmstat_fields: Regex,
-    fs_mount_points: Regex,
-    fs_types: Regex,
-    disk_devices: Regex,
 }
 
 impl Node {
     pub fn new(settings: Settings) -> Node {
-        let regex = |text: &str| Regex::new(text).expect("a valid default");
         Node {
             settings,
             service_types: RefCell::default(),
-            netstat_fields: regex(
-                "^(.*_(InErrors|InErrs)|Ip_Forwarding|Ip(6|Ext)_(InOctets\
-                 |OutOctets)|Icmp6?_(InMsgs|OutMsgs)|TcpExt_(Listen.*\
-                 |Syncookies.*|TCPSynRetrans|TCPTimeouts)|Tcp_(ActiveOpens\
-                 |InSegs|OutSegs|OutRsts|PassiveOpens|RetransSegs|CurrEstab)\
-                 |Udp6?_(InDatagrams|OutDatagrams|NoPorts|RcvbufErrors\
-                 |SndbufErrors))$",
-            ),
-            vmstat_fields: regex("^(oom_kill|pgpg|pswp|pg.*fault).*"),
-            fs_mount_points: regex(
-                "^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+\
-                 |var/lib/containers/storage/.+)($|/)",
-            ),
-            fs_types: regex(
-                "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts\
-                 |devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs\
-                 |overlay|proc|procfs|pstore|rpc_pipefs|securityfs\
-                 |selinuxfs|squashfs|erofs|sysfs|tracefs)$",
-            ),
-            disk_devices: regex(
-                "^(ram|loop|fd|(h|s|v|xv)d[a-z]|nvme\\d+n\\d+p)\\d+$",
-            ),
         }
     }
 
@@ -186,6 +294,55 @@ fn host_text(path: &str) -> io::Result<String> {
     fs::read_to_string(host::path(path))
 }
 
+/// A sysfs attribute, trimmed, as procfs's SysReadFile reads it.
+fn sys_read(path: &Path) -> io::Result<String> {
+    Ok(fs::read_to_string(path)?.trim().to_owned())
+}
+
+/// Errors procfs passes over when it reads a sysfs class's attributes:
+/// the attribute is absent, or the device does not support it now.
+fn unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::InvalidInput
+    ) || error.raw_os_error() == Some(libc::ENODEV)
+}
+
+fn invalid(what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
+}
+
+/// An integer as Go's ParseInt reads it with base 0: `0x1f`, `0o17`,
+/// `017`, `0b1`, `1_000`.
+fn go_int(text: &str) -> io::Result<i64> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let value = go_uint(digits)?;
+    let value = i64::try_from(value).map_err(|_| invalid(text))?;
+    Ok(if negative { -value } else { value })
+}
+
+fn go_uint(text: &str) -> io::Result<u64> {
+    let lower = text.to_ascii_lowercase();
+    let (radix, digits) = if let Some(hex) = lower.strip_prefix("0x") {
+        (16, hex)
+    } else if let Some(octal) = lower.strip_prefix("0o") {
+        (8, octal)
+    } else if let Some(binary) = lower.strip_prefix("0b") {
+        (2, binary)
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        (8, &lower[1..])
+    } else {
+        (10, lower.as_str())
+    };
+    let digits = digits.replace('_', "");
+    u64::from_str_radix(&digits, radix).map_err(|_| invalid(text))
+}
+
 /// A file's text, trimmed.
 fn read(path: impl AsRef<Path>) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
@@ -226,16 +383,20 @@ mod tests {
     fn default_filters_compile_and_match_alloys() {
         let node = Node::new(Settings::default());
         assert!(node.runs("cpu") && !node.runs("systemd"));
-        assert!(node.netstat_fields.is_match("Tcp_CurrEstab"));
-        assert!(node.netstat_fields.is_match("Udp6_InErrors"));
-        assert!(!node.netstat_fields.is_match("TcpExt_TCPOFOQueue"));
-        assert!(node.vmstat_fields.is_match("pgmajfault"));
-        assert!(node.fs_mount_points.is_match("/var/lib/docker/overlay2/x"));
-        assert!(!node.fs_mount_points.is_match("/var/lib/docker"));
-        assert!(node.fs_types.is_match("overlay"));
-        assert!(!node.fs_types.is_match("tmpfs"));
-        assert!(node.disk_devices.is_match("nvme0n1p2"));
-        assert!(!node.disk_devices.is_match("zram0"));
-        assert!(!node.disk_devices.is_match("dm-0"));
+        assert!(!node.runs("processes"));
+        let s = &node.settings;
+        assert!(s.netstat_fields.is_match("Tcp_CurrEstab"));
+        assert!(s.netstat_fields.is_match("Udp6_InErrors"));
+        assert!(!s.netstat_fields.is_match("TcpExt_TCPOFOQueue"));
+        assert!(s.vmstat_fields.is_match("pgmajfault"));
+        assert!(s.fs_mount_points.is_match("/var/lib/docker/overlay2/x"));
+        assert!(!s.fs_mount_points.is_match("/var/lib/docker"));
+        assert!(s.fs_types.is_match("overlay"));
+        assert!(!s.fs_types.is_match("tmpfs"));
+        assert!(s.disk.skips("nvme0n1p2"));
+        assert!(!s.disk.skips("zram0"));
+        assert!(!s.disk.skips("dm-0"));
+        assert!(s.systemd.exclude.is_match("user.slice"));
+        assert!(!s.systemd.exclude.is_match("ssh.service"));
     }
 }

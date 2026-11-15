@@ -6,7 +6,7 @@
 //! prometheus.relabel components their scrape forwards to. `--print`
 //! writes the text exposition format to stdout instead.
 
-use crate::http::{self, Url};
+use crate::http::{self, Client, Retry, Url};
 use crate::relabel::{self, Labels, Rule};
 use crate::spool::{Sent, Spool};
 use crate::tap::Tap;
@@ -17,8 +17,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const CHUNK: usize = 256 << 10;
-/// Waits between tries while Prometheus does not answer: chunks go
-/// straight to the spool meanwhile.
+/// Waits between tries while Prometheus does not answer, unless
+/// queue_config says otherwise: chunks go straight to the spool
+/// meanwhile.
 const BACKOFF: (Duration, Duration) =
     (Duration::from_secs(15), Duration::from_secs(120));
 
@@ -230,6 +231,17 @@ impl Writer {
     /// One sample, with the target's labels, as Prometheus's scrape
     /// gives them.
     pub fn add(&mut self, name: &str, labels: &[(&str, &str)], value: f64) {
+        self.add_at(name, labels, value, None);
+    }
+
+    /// As `add`, at the sample's own time if it has one.
+    pub fn add_at(
+        &mut self,
+        name: &str,
+        labels: &[(&str, &str)],
+        value: f64,
+        at_ms: Option<i64>,
+    ) {
         let target = &self.target;
         let theirs = |key: &str| target.iter().any(|(k, _)| k == key);
         let exported: Vec<(String, &str)> = labels
@@ -261,7 +273,7 @@ impl Writer {
             return;
         }
         let to = Rc::clone(&self.to);
-        let at_ms = self.stamp_ms.unwrap_or(self.now_ms);
+        let at_ms = at_ms.or(self.stamp_ms).unwrap_or(self.now_ms);
         self.metrics.send(&to, &all, value, at_ms);
     }
 
@@ -277,6 +289,7 @@ impl Writer {
 pub struct RemoteWrite {
     /// None: print instead of sending.
     url: Option<Url>,
+    client: Client,
     pub url_text: String,
     /// Its component's label.
     pub name: String,
@@ -290,6 +303,7 @@ pub struct RemoteWrite {
     spool: Option<Spool>,
     backoff: Duration,
     retry_at: Option<Instant>,
+    pub retry: Retry,
     pub stats: Stats,
 }
 
@@ -298,6 +312,7 @@ impl RemoteWrite {
         url_text: &str,
         name: &str,
         external: Labels,
+        client: Client,
         print: bool,
     ) -> Option<RemoteWrite> {
         let url = if print {
@@ -307,6 +322,7 @@ impl RemoteWrite {
         };
         Some(RemoteWrite {
             url,
+            client,
             url_text: url_text.to_owned(),
             name: name.to_owned(),
             external,
@@ -317,6 +333,11 @@ impl RemoteWrite {
             spool: None,
             backoff: Duration::ZERO,
             retry_at: None,
+            retry: Retry {
+                min: BACKOFF.0,
+                max: BACKOFF.1,
+                on_429: true,
+            },
             stats: Stats::default(),
         })
     }
@@ -424,13 +445,13 @@ impl RemoteWrite {
         let Some(url) = &self.url else {
             return Sent::Refused;
         };
-        let (sent, error) = post(url, chunk);
+        let (sent, error) = post(url, &self.client, &self.retry, chunk);
         match sent {
             Sent::Later => {
                 if self.backoff.is_zero() {
                     eprintln!("Metrics: {error}; kept to send later");
                 }
-                self.backoff = (self.backoff * 2).clamp(BACKOFF.0, BACKOFF.1);
+                self.backoff = self.retry.next(self.backoff);
                 self.retry_at = Some(Instant::now() + self.backoff);
             }
             Sent::Done | Sent::Refused => {
@@ -448,11 +469,16 @@ impl RemoteWrite {
 }
 
 /// Posts a compressed chunk: what became of it, and why if not taken.
-fn post(url: &Url, chunk: &[u8]) -> (Sent, String) {
+fn post(
+    url: &Url,
+    client: &Client,
+    retry: &Retry,
+    chunk: &[u8],
+) -> (Sent, String) {
     let headers = "Content-Type: application/x-protobuf\r\n\
         Content-Encoding: snappy\r\n\
         X-Prometheus-Remote-Write-Version: 0.1.0\r\n";
-    let response = match http::post(url, headers, chunk) {
+    let response = match http::post(url, client, headers, chunk) {
         Ok(response) => response,
         Err(error) => return (Sent::Later, error.to_string()),
     };
@@ -462,8 +488,8 @@ fn post(url: &Url, chunk: &[u8]) -> (Sent, String) {
     let text = String::from_utf8_lossy(&response.body);
     let error = format!("{} {}", response.status, text.trim());
     let error = error.trim_end().to_owned();
-    let retry = response.status == 429 || response.status >= 500;
-    (if retry { Sent::Later } else { Sent::Refused }, error)
+    let again = retry.again(response.status);
+    (if again { Sent::Later } else { Sent::Refused }, error)
 }
 
 /// A `TimeSeries` message: its labels, sorted, then one `Sample`.

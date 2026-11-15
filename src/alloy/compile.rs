@@ -26,6 +26,9 @@ pub struct ScrapeJob {
     pub interval: Duration,
     pub job: String,
     pub honor_labels: bool,
+    pub honor_timestamps: bool,
+    /// Its HTTP client, with scrape_timeout.
+    pub client: crate::http::Client,
     pub metrics_path: String,
     pub scheme: String,
     pub params: Labels,
@@ -75,11 +78,22 @@ pub struct ListenerTls {
     pub tls13_only: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SyslogFormat {
+    Rfc5424,
+    Rfc3164,
+    /// The line as it came, its priority taken off; `nul`: messages end
+    /// at NUL instead of a newline.
+    Raw {
+        nul: bool,
+    },
+}
+
 /// A loki.source.syslog `listener`, with its component's source.
 pub struct SyslogListener {
     pub address: String,
     pub tcp: bool,
-    pub rfc5424: bool,
+    pub format: SyslogFormat,
     pub idle_timeout: Duration,
     pub label_structured_data: bool,
     pub use_incoming_timestamp: bool,
@@ -292,6 +306,11 @@ impl<'a> Body<'a> {
         })
     }
 
+    /// Where attribute `name` is, or the block if it is not set.
+    pub fn attr_pos(&self, name: &str) -> Pos {
+        self.attr(name).map_or(self.block.pos, |a| a.1)
+    }
+
     pub fn value(&self, name: &str) -> Result<Option<(Value, Pos)>, String> {
         let Some((expr, pos)) = self.attr(name) else {
             return Ok(None);
@@ -323,6 +342,47 @@ impl<'a> Body<'a> {
         let missing =
             || self.error(self.block.pos, &format!("`{name}` is required"));
         self.string(name)?.ok_or_else(missing)
+    }
+
+    pub fn number(&self, name: &str) -> Result<Option<f64>, String> {
+        match self.value(name)? {
+            None => Ok(None),
+            Some((Value::Number(n), _)) => Ok(Some(n)),
+            Some((other, pos)) => {
+                Err(self.wrong(pos, name, "a number", &other))
+            }
+        }
+    }
+
+    /// Refuses a bool `name` other than `only`, all this agent does; its
+    /// default is Alloy's.
+    pub fn only(
+        &self,
+        name: &str,
+        only: bool,
+        default: bool,
+    ) -> Result<(), String> {
+        if self.bool_or(name, default)? == only {
+            return Ok(());
+        }
+        let pos = self.attr(name).map_or(self.block.pos, |a| a.1);
+        Err(self.error(pos, &format!("only `{name} = {only}`")))
+    }
+
+    /// Checks attributes that tune how Alloy works, not what it sends:
+    /// they have no counterpart here (README).
+    pub fn tuning(
+        &self,
+        durations: &[&str],
+        numbers: &[&str],
+    ) -> Result<(), String> {
+        for name in durations {
+            self.duration_or(name, "0s")?;
+        }
+        for name in numbers {
+            self.number(name)?;
+        }
+        Ok(())
     }
 
     pub fn bool_or(&self, name: &str, default: bool) -> Result<bool, String> {
@@ -357,6 +417,38 @@ impl<'a> Body<'a> {
             other => Err(self.wrong(pos, name, "a list of strings", &other)),
         });
         strings.collect()
+    }
+
+    /// An object of lists of strings, such as `http_headers`.
+    pub fn object_lists(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        let Some((Value::Object(fields), pos)) = self.value(name)? else {
+            return match self.value(name)? {
+                None => Ok(Vec::new()),
+                Some((other, pos)) => {
+                    Err(self.wrong(pos, name, "an object of lists", &other))
+                }
+            };
+        };
+        let mut found = Vec::new();
+        for (key, value) in fields {
+            let Value::Array(items) = value else {
+                return Err(self.wrong(
+                    pos,
+                    name,
+                    "an object of lists",
+                    &value,
+                ));
+            };
+            let strings = items.into_iter().map(|item| match item {
+                Value::String(s) => Ok(s),
+                other => Err(self.wrong(pos, name, "lists of strings", &other)),
+            });
+            found.push((key, strings.collect::<Result<_, _>>()?));
+        }
+        Ok(found)
     }
 
     /// An object of strings, such as `labels`.
@@ -437,10 +529,28 @@ impl<'a> Body<'a> {
         self.blocks(name).next()
     }
 
+    /// A block inside, or `empty` in its place: Alloy's defaults apply.
+    pub fn block_or<'b>(&'b self, name: &str, empty: &'b Block) -> Body<'b> {
+        let found = self.block.body.iter().find_map(|stmt| match stmt {
+            Stmt::Block(block) if block.name == name => Some(block),
+            _ => None,
+        });
+        Body {
+            block: found.unwrap_or(empty),
+            id: self.id,
+            resolve: self.resolve,
+        }
+    }
+
     /// The `rule` blocks, as relabel rules.
     pub fn rules(&self) -> Result<Vec<Rule>, String> {
+        self.rules_in("rule")
+    }
+
+    /// Blocks `name` as relabel rules: `write_relabel_config` too.
+    pub fn rules_in(&self, name: &'a str) -> Result<Vec<Rule>, String> {
         let mut rules = Vec::new();
-        for rule in self.blocks("rule") {
+        for rule in self.blocks(name) {
             rule.check(
                 &[
                     "action",
@@ -532,7 +642,7 @@ mod tests {
         assert!(components(&twice).unwrap_err().contains("twice"));
     }
 
-    #[cfg(feature = "tls")]
+    #[cfg(all(feature = "tls", feature = "syslog"))]
     #[test]
     fn reads_syslog_tls_config() {
         let config = |protocol: &str, tls: &str| {

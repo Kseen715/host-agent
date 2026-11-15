@@ -1,34 +1,41 @@
 //! Prometheus's text exposition format, read: exporters' scrapes and
-//! the textfile directory's `*.prom` files. Samples' own timestamps are
-//! left out, as the scrape's time is used.
+//! the textfile directory's `*.prom` files, each sample with its own
+//! timestamp if it has one, for a scrape that honors them.
 
 use std::borrow::Cow;
 
 pub type Labels<'a> = Vec<(&'a str, Cow<'a, str>)>;
 
-/// Calls `sample` with each sample's name, labels and value; lines that
-/// cannot be read are skipped.
-pub fn parse(text: &str, mut sample: impl FnMut(&str, &Labels, f64)) {
+/// Calls `sample` with each sample's name, labels, value and timestamp
+/// in milliseconds; lines that cannot be read are skipped.
+pub fn parse(
+    text: &str,
+    mut sample: impl FnMut(&str, &Labels, f64, Option<i64>),
+) {
     for line in text.lines() {
         let line = line.trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((name, labels, value)) = parse_line(line) {
-            sample(name, &labels, value);
+        if let Some((name, labels, value, at)) = parse_line(line) {
+            sample(name, &labels, value, at);
         }
     }
 }
 
-fn parse_line(line: &str) -> Option<(&str, Labels<'_>, f64)> {
+type Sample<'a> = (&'a str, Labels<'a>, f64, Option<i64>);
+
+fn parse_line(line: &str) -> Option<Sample<'_>> {
     let end = line.find(['{', ' ', '\t']).unwrap_or(line.len());
     let (name, mut rest) = line.split_at(end);
     let mut labels = Vec::new();
     if let Some(inside) = rest.strip_prefix('{') {
         rest = parse_labels(inside, &mut labels)?;
     }
-    let value = rest.split_whitespace().next()?;
-    Some((name, labels, parse_value(value)?))
+    let mut words = rest.split_whitespace();
+    let value = parse_value(words.next()?)?;
+    let at = words.next().and_then(|ms| ms.parse().ok());
+    Some((name, labels, value, at))
 }
 
 /// Reads `key="value",...}` into `labels`; returns what follows `}`.
@@ -93,10 +100,11 @@ mod tests {
 
     fn collect(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        parse(text, |name, labels, value| {
+        parse(text, |name, labels, value, at| {
             let pairs: Vec<String> =
                 labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            out.push(format!("{name}|{}|{value}", pairs.join(",")));
+            let at = at.map(|ms| format!("@{ms}")).unwrap_or_default();
+            out.push(format!("{name}|{}|{value}{at}", pairs.join(",")));
         });
         out
     }
@@ -110,7 +118,7 @@ mod tests {
             collect(text),
             [
                 "up||1",
-                "a_total|x=1,y=q\"uo\\te\n|2.5",
+                "a_total|x=1,y=q\"uo\\te\n|2.5@1700000000000",
                 "b||inf",
                 "c|z=a,b}|-300",
             ]

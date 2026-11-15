@@ -16,8 +16,9 @@ used, in about 1 MiB of memory instead of about 100.
 - Logs: the systemd journal (read from its files, or through
   `journalctl --output=export` without feature `journal-files`),
   every running Docker container's output, files from static targets
-  and from file_sd JSON files (`__path__` may be a glob, `**` included),
-  syslog over UDP or TCP (RFC 5424 or 3164).
+  and from file_sd JSON files (`__path__` may be a glob, `**` included;
+  any text encoding, gzip, zlib or bzip2 by the features below),
+  syslog over UDP or TCP (RFC 5424, 3164 or raw).
   Labels from the journal's fields and syslog's header, for
   `loki.relabel` and `loki.process` to shape.
 - Alloy's configuration: it reads `config.alloy` and does what its
@@ -49,8 +50,12 @@ journalctl), `journal-files` (from the files, without journalctl),
 `filesystems` (btrfs, XFS, ZFS), `snmp`, `syslog`, `otlp`, `server`.
 Off by default: `journal-xz` (fields journald compressed with xz,
 before systemd 246), `tokio` (SNMP devices polled by tasks on one
-thread instead of a thread each), `tls` (syslog over TLS, rustls on
-ring: +0.9 MB, and a C compiler for the target). A smaller build:
+thread instead of a thread each), `tls` (HTTPS for scrapes, remote
+write, Loki and OAuth2 tokens, and syslog over TLS: rustls on ring,
++0.9 MB, and a C compiler for the target), `decompression`
+(`loki.source.file`'s gzip, zlib, bzip2: pure Rust), `encodings`
+(its encodings other than UTF-8, UTF-16 and Latin-1, by WHATWG's
+labels: encoding_rs). A smaller build:
 `--no-default-features --features journal,filesystems`. A
 configuration that needs a part the build lacks is refused.
 
@@ -78,8 +83,12 @@ Docker's socket and the containers' `/proc` need it.
 ## Configuration
 
 Alloy's syntax: blocks, attributes, references between components
-(`prometheus.remote_write.default.receiver`), `sys.env`, `constants.*`,
-`string.format`, `string.join`, `coalesce`, `array.concat`. Components:
+(`prometheus.remote_write.default.receiver`), `constants.*` and
+Alloy's standard library: `sys.env`, `convert.nonsensitive`,
+`string.*`, `encoding.*` but `from_yaml`, `array.concat`,
+`.combine_maps` (on targets that change too), `.group_by`,
+`file.path_join`, `coalesce`, `json_path` (`$`, `.name`, `..`, `*`,
+`[n]`, `['name']`), and the deprecated names. Components:
 
 - `prometheus.exporter.unix`, `.self`, `.cadvisor`, `.snmp`;
   `prometheus.scrape`, `prometheus.relabel`, `prometheus.remote_write`;
@@ -96,10 +105,26 @@ Alloy's syntax: blocks, attributes, references between components
   unchanged, to every exporter a signal reaches;
   `otelcol.processor.batch` in between is let through).
 
-What it cannot do as Alloy would (another component, attribute or
-block, such as `loki.source.kafka` or syslog's `raw` format) is refused
-with its position in the file, never ignored. `logging`,
-`livedebugging` and `tracing` are accepted and ignored.
+HTTP clients (scrapes, `remote_write` and `loki.write` endpoints)
+take Prometheus's client settings: `basic_auth`, `authorization`,
+`bearer_token[_file]`, `oauth2` (client credentials), `tls_config`,
+`proxy_url`, `no_proxy`, `proxy_from_environment`,
+`proxy_connect_header`, `http_headers`, `follow_redirects`, with
+Prometheus's checks; HTTP/1.1 only. The unix exporter takes each
+collector's block, `cpu`'s info, flags and bugs included; `processes`
+and `systemd` are off unless enabled, as in Alloy. Templates are Go's
+text/template with Promtail's functions and the string and number
+functions of sprig; an unknown function is refused when read.
+
+Settings that change how, not what, is sent (queue shards and
+capacities, the WAL's, cache sizes, refresh intervals,
+`max_backoff_retries`: the agent waits instead of dropping) are
+checked for their type and have no effect. What it cannot do as Alloy
+would (another component, attribute or block, such as
+`loki.source.kafka`, `sigv4`, `encoding.from_yaml`, cAdvisor's
+`docker_only = false`) is refused with its position in the file, never
+ignored. `logging`, `livedebugging` and `tracing` are accepted and
+ignored.
 
 ## Docker
 

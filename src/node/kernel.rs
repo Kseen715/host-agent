@@ -8,14 +8,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 
-pub fn arp(_: &Node, w: &mut Writer) -> io::Result<()> {
+pub fn arp(node: &Node, w: &mut Writer) -> io::Result<()> {
     let mut devices: BTreeMap<String, f64> = BTreeMap::new();
     for line in host_text("/proc/net/arp")?.lines().skip(1) {
         if let Some(device) = line.split_whitespace().nth(5) {
             *devices.entry(device.to_owned()).or_default() += 1.0;
         }
     }
-    for (device, count) in devices {
+    let devices = devices.into_iter();
+    for (device, count) in devices.filter(|(d, _)| !node.settings.arp.skips(d))
+    {
         w.add("node_arp_entries", &[("device", &device)], count);
     }
     Ok(())
