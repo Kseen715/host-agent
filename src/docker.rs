@@ -2,10 +2,13 @@
 //! every round (for their metrics, their logs and the Minecraft
 //! servers' addresses) and one log stream per running container.
 
-use crate::http::{self, Dechunk};
+use crate::config::Minecraft;
+use crate::http::{self, Dechunk, Url};
 use crate::json::Json;
 use crate::levels;
 use crate::loki::Loki;
+use crate::parts::Part;
+use crate::remote::Writer;
 use crate::state::Positions;
 use crate::time;
 use std::collections::HashMap;
@@ -50,11 +53,12 @@ pub struct Docker {
     streams: Vec<LogStream>,
     /// Containers started after this are read from their start.
     since_ns: i64,
+    minecraft: Vec<Minecraft>,
 }
 
 impl Docker {
     /// None where Docker does not run.
-    pub fn new() -> Option<Docker> {
+    pub fn new(minecraft: Vec<Minecraft>) -> Option<Docker> {
         let socket = PathBuf::from(SOCKET);
         socket.exists().then(|| Docker {
             socket,
@@ -62,6 +66,7 @@ impl Docker {
             containers: Vec::new(),
             streams: Vec::new(),
             since_ns: time::now_ns(),
+            minecraft,
         })
     }
 
@@ -154,10 +159,6 @@ impl Docker {
                 }
             }
         }
-    }
-
-    pub fn fds(&self) -> impl Iterator<Item = RawFd> + '_ {
-        self.streams.iter().map(|s| s.socket.as_raw_fd())
     }
 
     /// Reads the stream polled at `index`; a stream that ended is closed
@@ -391,6 +392,50 @@ fn read_head(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
                 )));
             }
             return Ok(raw.split_off(end));
+        }
+    }
+}
+
+/// Containers' metrics under cAdvisor's job, the Minecraft plugins in
+/// them, and their logs.
+impl Part for Docker {
+    fn round(&mut self, w: &mut Writer, now_ms: i64) {
+        let up = self.refresh();
+        w.target("cadvisor", &[]);
+        w.up(up);
+        crate::agent::build_info(w, "cadvisor_build_info");
+        crate::containers::collect(w, &self.containers, now_ms as f64 / 1e3);
+        #[cfg(feature = "minecraft")]
+        self.minecraft(w);
+    }
+
+    fn follow(&mut self, loki: &mut Loki, positions: &mut Positions) {
+        self.follow_logs(loki, positions);
+    }
+
+    fn fds(&self) -> Vec<RawFd> {
+        self.streams.iter().map(|s| s.socket.as_raw_fd()).collect()
+    }
+
+    fn read(&mut self, index: usize, loki: &mut Loki, p: &mut Positions) {
+        Docker::read(self, index, loki, p);
+    }
+}
+
+impl Docker {
+    /// Each server's plugin at the addresses of the service's containers
+    /// that expose the server's port.
+    #[cfg(feature = "minecraft")]
+    fn minecraft(&self, w: &mut Writer) {
+        for server in &self.minecraft {
+            let hosts = self.containers.iter().filter(|c| {
+                c.service == server.service && c.ports.contains(&server.port)
+            });
+            for ip in hosts.flat_map(|c| &c.ips) {
+                w.target("minecraft", &[("server", &server.server)]);
+                let address = format!("{ip}:{}", server.metrics_port);
+                crate::scrape::scrape(w, &Url::metrics(&address), &[]);
+            }
         }
     }
 }

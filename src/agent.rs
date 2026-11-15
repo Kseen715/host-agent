@@ -3,13 +3,11 @@
 //! Nothing is buffered beyond one log batch and one metrics chunk.
 
 use crate::config::Config;
-use crate::containers;
-use crate::docker::Docker;
 use crate::files::Files;
 use crate::http::Url;
-use crate::journal::Journal;
 use crate::loki::{Flushed, Loki};
 use crate::node::Node;
+use crate::parts::{self, Part};
 use crate::remote::Writer;
 use crate::scrape;
 use crate::spool::Spool;
@@ -23,6 +21,14 @@ use std::time::{Duration, Instant};
 const FILES_EVERY: Duration = Duration::from_secs(1);
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static RELOAD: AtomicBool = AtomicBool::new(false);
+
+/// Why `run` returned.
+pub enum Ended {
+    Stop,
+    /// SIGHUP: logs sent and positions saved, for a new agent to go on.
+    Reload,
+}
 
 pub struct Agent {
     config: Config,
@@ -30,15 +36,10 @@ pub struct Agent {
     node: Node,
     scrapes: Vec<(String, Url)>,
     loki: Loki,
-    journal: Option<Journal>,
-    docker: Option<Docker>,
+    parts: Vec<Box<dyn Part>>,
     files: Files,
     positions: Positions,
-}
-
-enum Source {
-    Journal,
-    Docker(usize),
+    config_loaded: bool,
 }
 
 impl Agent {
@@ -48,7 +49,7 @@ impl Agent {
         }
         let mut writer = Writer::new(&config.metrics_url, &config.host, print)
             .ok_or("metrics_url is not an http:// URL")?;
-        let loki = Loki::new(&config.logs_url, &config.host)
+        let mut loki = Loki::new(&config.logs_url, &config.host)
             .ok_or("logs_url is not an http:// URL")?;
         let node = Node::new(
             std::mem::take(&mut config.disabled),
@@ -57,13 +58,20 @@ impl Agent {
         let scrapes = config
             .scrapes
             .iter()
-            .map(|s| (s.job.clone(), Url::metrics(&s.address)));
-        let drops = std::mem::take(&mut config.journal_drops);
-        let journal = if print {
-            None
-        } else {
-            Journal::new(&config.journal_max_age, drops)
-        };
+            .map(|s| (s.job.clone(), Url::metrics(&s.address)))
+            .collect();
+        let parts = parts::build(&mut config, print)?;
+        #[cfg(feature = "relabel")]
+        {
+            let parse = |rules: &[String]| -> Result<Vec<_>, String> {
+                rules
+                    .iter()
+                    .map(|r| crate::relabel::Rule::parse(r))
+                    .collect()
+            };
+            writer.rules = parse(&config.metric_relabel)?;
+            loki.rules = parse(&config.log_relabel)?;
+        }
         if !print {
             fs::create_dir_all(&config.state_dir)
                 .map_err(|e| format!("{}: {e}", config.state_dir.display()))?;
@@ -80,13 +88,13 @@ impl Agent {
                 config.log_targets_dir.clone(),
                 std::mem::take(&mut config.logs),
             ),
-            scrapes: scrapes.collect(),
-            docker: Docker::new(),
-            journal,
+            scrapes,
+            parts,
             config,
             writer,
             node,
             loki,
+            config_loaded: true,
         })
     }
 
@@ -95,39 +103,16 @@ impl Agent {
         let now_ms = time::now_ms();
         self.writer.begin(now_ms);
         self.node.collect(&mut self.writer);
-        if let Some(docker) = &mut self.docker {
-            let up = docker.refresh();
-            self.writer.target("cadvisor", &[]);
-            self.writer.up(up);
-            containers::collect(
-                &mut self.writer,
-                &docker.containers,
-                now_ms as f64 / 1e3,
-            );
+        for part in &mut self.parts {
+            part.round(&mut self.writer, now_ms);
         }
         for (job, url) in &self.scrapes {
             self.writer.target(job, &[]);
             scrape::scrape(&mut self.writer, url, &self.config.server_ports);
         }
-        self.minecraft();
         self.own_metrics();
+        self.writer.end_target();
         self.writer.flush();
-    }
-
-    fn minecraft(&mut self) {
-        let Some(docker) = &self.docker else { return };
-        for server in &self.config.minecraft {
-            let hosts = docker.containers.iter().filter(|c| {
-                c.service == server.service && c.ports.contains(&server.port)
-            });
-            for ip in hosts.flat_map(|c| &c.ips) {
-                self.writer
-                    .target("minecraft", &[("server", &server.server)]);
-                let url =
-                    Url::metrics(&format!("{ip}:{}", server.metrics_port));
-                scrape::scrape(&mut self.writer, &url, &[]);
-            }
-        }
     }
 
     /// This agent's own numbers as Alloy's, job `alloy`, under its
@@ -137,9 +122,9 @@ impl Agent {
         let w = &mut self.writer;
         w.target("alloy", &[]);
         w.up(true);
-        let version = concat!("host-agent-v", env!("CARGO_PKG_VERSION"));
-        w.add("alloy_build_info", &[("version", version)], 1.0);
-        w.add("alloy_config_last_load_successful", &[], 1.0);
+        build_info(w, "alloy_build_info");
+        let loaded = f64::from(self.config_loaded);
+        w.add("alloy_config_last_load_successful", &[], loaded);
         crate::process::collect(w);
 
         let stats = std::mem::take(&mut w.stats);
@@ -181,19 +166,28 @@ impl Agent {
         w.add("loki_write_dropped_entries_total", &dropped, count);
     }
 
-    pub fn run(&mut self) {
+    /// A reload failed: this agent goes on with its configuration.
+    pub fn config_failed(&mut self) {
+        self.config_loaded = false;
+    }
+
+    pub fn run(&mut self) -> Ended {
         handle_signals();
         let interval = self.config.interval;
         let mut next_round = Instant::now();
         let mut next_files = Instant::now();
         while !STOP.load(Ordering::Relaxed) {
+            if RELOAD.swap(false, Ordering::Relaxed) {
+                self.flush_logs(true);
+                return Ended::Reload;
+            }
             if Instant::now() >= next_round {
                 self.round();
                 self.follow_logs();
                 next_round = (next_round + interval).max(Instant::now());
             }
-            if let Some(journal) = &mut self.journal {
-                journal.ensure_running(self.positions.journal.as_deref());
+            for part in &mut self.parts {
+                part.prepare(&self.positions);
             }
             let wake = [Some(next_round), Some(next_files), self.loki.due_at()];
             let wake = wake.into_iter().flatten().min().unwrap_or(next_round);
@@ -208,11 +202,12 @@ impl Agent {
             }
         }
         self.flush_logs(true);
+        Ended::Stop
     }
 
     fn follow_logs(&mut self) {
-        if let Some(docker) = &mut self.docker {
-            docker.follow_logs(&mut self.loki, &mut self.positions);
+        for part in &mut self.parts {
+            part.follow(&mut self.loki, &mut self.positions);
         }
         self.files.refresh(&mut self.positions);
     }
@@ -222,39 +217,24 @@ impl Agent {
     fn poll_sources(&mut self, wake: Instant) {
         let mut sources = Vec::new();
         let mut fds = Vec::new();
-        if !self.loki.blocked(Instant::now()) {
-            if let Some(fd) = self.journal.as_ref().and_then(Journal::fd) {
-                sources.push(Source::Journal);
-                fds.push(fd);
+        let blocked = self.loki.blocked(Instant::now());
+        for (part, owner) in self.parts.iter().enumerate() {
+            if blocked && owner.feeds_loki() {
+                continue;
             }
-            for (index, fd) in
-                self.docker.iter().flat_map(Docker::fds).enumerate()
-            {
-                sources.push(Source::Docker(index));
+            for (index, fd) in owner.fds().into_iter().enumerate() {
+                sources.push((part, index));
                 fds.push(fd);
             }
         }
         let timeout = wake.saturating_duration_since(Instant::now());
         let ready = crate::process::poll(&fds, timeout);
-        // From the last: reading may close a Docker stream and shift the
-        // ones after it.
-        for (source, _) in sources.iter().zip(ready).rev().filter(|(_, r)| *r) {
-            match source {
-                Source::Journal => {
-                    if let Some(journal) = &mut self.journal {
-                        journal.read(&mut self.loki, &mut self.positions);
-                    }
-                }
-                Source::Docker(index) => {
-                    if let Some(docker) = &mut self.docker {
-                        docker.read(
-                            *index,
-                            &mut self.loki,
-                            &mut self.positions,
-                        );
-                    }
-                }
-            }
+        // From the last: reading may close a stream and shift the ones
+        // after it.
+        let ready = sources.iter().zip(ready).rev().filter(|(_, r)| *r);
+        for ((part, index), _) in ready {
+            let (loki, positions) = (&mut self.loki, &mut self.positions);
+            self.parts[*part].read(*index, loki, positions);
         }
     }
 
@@ -267,18 +247,46 @@ impl Agent {
     }
 }
 
+/// `name`'s build labels, as Go programs give them, for this build:
+/// dashboards read the version.
+pub fn build_info(w: &mut Writer, name: &str) {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let labels = [
+        ("goarch", arch),
+        ("goos", "linux"),
+        (
+            "version",
+            concat!("host-agent-v", env!("CARGO_PKG_VERSION")),
+        ),
+    ];
+    w.add(name, &labels, 1.0);
+}
+
 extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// SIGTERM and SIGINT end the loop after a last send. No SA_RESTART:
-/// poll returns at once.
+extern "C" fn reload(_: libc::c_int) {
+    RELOAD.store(true, Ordering::Relaxed);
+}
+
+/// SIGTERM and SIGINT end the loop after a last send, SIGHUP reloads.
+/// No SA_RESTART: poll returns at once.
 fn handle_signals() {
-    // SAFETY: the handler only stores to an atomic.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = stop as *const () as usize;
-        for signal in [libc::SIGTERM, libc::SIGINT] {
+    let handlers: [(libc::c_int, extern "C" fn(libc::c_int)); 3] = [
+        (libc::SIGTERM, stop),
+        (libc::SIGINT, stop),
+        (libc::SIGHUP, reload),
+    ];
+    for (signal, handler) in handlers {
+        // SAFETY: the handlers only store to an atomic.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as *const () as usize;
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
     }

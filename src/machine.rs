@@ -129,12 +129,6 @@ pub fn memory() -> (f64, f64) {
     (kib("MemTotal:"), kib("SwapTotal:"))
 }
 
-pub fn boot_time() -> f64 {
-    let stat = fs::read_to_string(host::path("/proc/stat")).unwrap_or_default();
-    let line = stat.lines().find_map(|l| l.strip_prefix("btime "));
-    line.and_then(|t| t.trim().parse().ok()).unwrap_or(0.0)
-}
-
 /// File system types cAdvisor's plugins take, besides ext* and nfs*.
 const FS_TYPES: [&str; 18] = [
     "btrfs", "exfat", "f2fs", "fat", "hfs", "hfsplus", "iso9660", "jfs",

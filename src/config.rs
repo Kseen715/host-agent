@@ -19,11 +19,19 @@
 //! server_port 25565 classic
 //! journal_max_age 12h
 //! journal_drop ^info: guest-ping called
+//! snmp keenetic 10.18.18.1 public system,if_mib
+//! syslog 514
+//! metric_relabel drop source_labels=__name__ regex=go_.*
+//! log_relabel labeldrop regex=filename
+//! otlp 127.0.0.1:4318
+//! otlp_forward logs http://10.18.18.81:3100/otlp/v1/logs
+//! syslog_device keenetic 10.18.18.1
 //! ```
 
 use crate::files::Target;
 use crate::scrape::ServerPort;
 use regex_lite::Regex;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -40,6 +48,14 @@ pub struct Minecraft {
     pub service: String,
     pub port: u16,
     pub metrics_port: u16,
+}
+
+/// A network device polled over SNMP v2c.
+pub struct Device {
+    pub name: String,
+    pub address: String,
+    pub community: String,
+    pub modules: Vec<String>,
 }
 
 pub struct Config {
@@ -62,6 +78,19 @@ pub struct Config {
     pub server_ports: Vec<ServerPort>,
     pub journal_max_age: String,
     pub journal_drops: Vec<Regex>,
+    /// `snmp <name> <address> <community> <module,...>`: a device polled.
+    pub snmp: Vec<Device>,
+    /// `metric_relabel <rule>`, `log_relabel <rule>` (crate::relabel).
+    pub metric_relabel: Vec<String>,
+    pub log_relabel: Vec<String>,
+    /// `otlp <address>`: OTLP/HTTP received there (crate::otlp)...
+    pub otlp: Option<String>,
+    /// ...and `otlp_forward <signal> <url>`: where each signal goes.
+    pub otlp_forwards: Vec<(String, String)>,
+    /// `syslog <port>`: network devices' syslog received there.
+    pub syslog_port: Option<u16>,
+    /// `syslog_device <name> <address>`: a device whose lines are kept.
+    pub syslog_devices: Vec<(String, IpAddr)>,
 }
 
 impl Config {
@@ -83,6 +112,13 @@ impl Config {
             server_ports: Vec::new(),
             journal_max_age: String::from("12h"),
             journal_drops: Vec::new(),
+            snmp: Vec::new(),
+            metric_relabel: Vec::new(),
+            log_relabel: Vec::new(),
+            otlp: None,
+            otlp_forwards: Vec::new(),
+            syslog_port: None,
+            syslog_devices: Vec::new(),
         };
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -158,6 +194,29 @@ impl Config {
             ("journal_drop", _) if !value.is_empty() => {
                 let regex = Regex::new(value).map_err(|e| e.to_string())?;
                 self.journal_drops.push(regex);
+            }
+            ("snmp", [name, address, community, modules]) => {
+                self.snmp.push(Device {
+                    name: (*name).into(),
+                    address: (*address).into(),
+                    community: (*community).into(),
+                    modules: modules.split(',').map(str::to_owned).collect(),
+                })
+            }
+            ("metric_relabel", _) => self.metric_relabel.push(value.into()),
+            ("log_relabel", _) => self.log_relabel.push(value.into()),
+            ("otlp", [address]) => self.otlp = Some((*address).into()),
+            ("otlp_forward", [signal, url]) => {
+                self.otlp_forwards.push(((*signal).into(), (*url).into()))
+            }
+            ("syslog", [port]) => {
+                let port = port.parse().map_err(|_| "syslog is a port")?;
+                self.syslog_port = Some(port);
+            }
+            ("syslog_device", [name, address]) => {
+                let address =
+                    address.parse().map_err(|_| "not an IP address")?;
+                self.syslog_devices.push(((*name).into(), address));
             }
             _ => return Err(format!("cannot read `{key} {value}`")),
         }

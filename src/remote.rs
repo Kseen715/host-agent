@@ -6,7 +6,9 @@
 
 use crate::http::{self, Url};
 use crate::spool::{Sent, Spool};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,18 @@ pub struct Stats {
     pub newest_sent: f64,
 }
 
+/// A target's round in progress, for the series Prometheus adds to
+/// every scrape: how long it took, how many samples, how many series new
+/// since the last.
+struct Scrape {
+    key: String,
+    start: Instant,
+    samples: u64,
+    /// Of them, dropped by `metric_relabel`.
+    dropped: u64,
+    series: Vec<u64>,
+}
+
 pub struct Writer {
     /// None: print instead of sending.
     url: Option<Url>,
@@ -32,6 +46,9 @@ pub struct Writer {
     host: String,
     /// The target's labels, set on every series it gives: `job` first.
     target: Vec<(String, String)>,
+    scrape: Option<Scrape>,
+    /// Each target's series in its last round, by hash, sorted.
+    seen: HashMap<String, Vec<u64>>,
     now_ms: i64,
     body: Vec<u8>,
     series: Vec<u8>,
@@ -40,6 +57,8 @@ pub struct Writer {
     backoff: Duration,
     retry_at: Option<Instant>,
     pub stats: Stats,
+    #[cfg(feature = "relabel")]
+    pub rules: Vec<crate::relabel::Rule>,
 }
 
 impl Writer {
@@ -54,6 +73,8 @@ impl Writer {
             url_text: url_text.to_owned(),
             host: host.to_owned(),
             target: Vec::new(),
+            scrape: None,
+            seen: HashMap::new(),
             now_ms: 0,
             body: Vec::with_capacity(CHUNK + (16 << 10)),
             series: Vec::new(),
@@ -62,6 +83,8 @@ impl Writer {
             backoff: Duration::ZERO,
             retry_at: None,
             stats: Stats::default(),
+            #[cfg(feature = "relabel")]
+            rules: Vec::new(),
         })
     }
 
@@ -77,15 +100,48 @@ impl Writer {
         self.stats.newest = now_ms as f64 / 1000.0;
     }
 
-    /// Series from here on are the target's: `job`, `instance` = this
-    /// host, and `extra` labels.
+    /// Series from here on are the target's: `job`, `instance` (this
+    /// host unless `extra` has one), and `extra` labels.
     pub fn target(&mut self, job: &str, extra: &[(&str, &str)]) {
+        self.end_target();
         self.target.clear();
         self.target.push(("job".into(), job.into()));
-        self.target.push(("instance".into(), self.host.clone()));
+        if !extra.iter().any(|(key, _)| *key == "instance") {
+            self.target.push(("instance".into(), self.host.clone()));
+        }
         for (key, value) in extra {
             self.target.push(((*key).into(), (*value).into()));
         }
+        let key = self.target.iter().map(|(k, v)| format!("{k}={v},"));
+        self.scrape = Some(Scrape {
+            key: key.collect(),
+            start: Instant::now(),
+            samples: 0,
+            dropped: 0,
+            series: Vec::new(),
+        });
+    }
+
+    /// Ends the current target's round with the series a Prometheus
+    /// scrape adds; nothing is relabeled, so the samples after metric
+    /// relabeling are the samples.
+    pub fn end_target(&mut self) {
+        let Some(mut scrape) = self.scrape.take() else {
+            return;
+        };
+        scrape.series.sort_unstable();
+        scrape.series.dedup();
+        let last = self.seen.remove(&scrape.key).unwrap_or_default();
+        let added = scrape.series.iter();
+        let added = added.filter(|h| last.binary_search(h).is_err()).count();
+        let samples = scrape.samples as f64;
+        let seconds = scrape.start.elapsed().as_secs_f64();
+        self.add("scrape_duration_seconds", &[], seconds);
+        self.add("scrape_samples_scraped", &[], samples);
+        let kept = (scrape.samples - scrape.dropped) as f64;
+        self.add("scrape_samples_post_metric_relabeling", &[], kept);
+        self.add("scrape_series_added", &[], added as f64);
+        self.seen.insert(scrape.key, scrape.series);
     }
 
     pub fn up(&mut self, up: bool) {
@@ -93,8 +149,8 @@ impl Writer {
     }
 
     /// One sample. The target's labels win over the series' own, as
-    /// Prometheus's scrape does; `host` is added where the series has
-    /// none, as an external label is.
+    /// Prometheus's scrape does; then `metric_relabel` applies; `host`
+    /// is added where the series has none, as an external label is.
     pub fn add(&mut self, name: &str, labels: &[(&str, &str)], value: f64) {
         let mut all: Vec<(&str, &str)> = Vec::with_capacity(labels.len() + 5);
         all.push(("__name__", name));
@@ -102,11 +158,39 @@ impl Writer {
         let own = |key: &str| target.iter().any(|(k, _)| k == key);
         all.extend(labels.iter().filter(|(k, v)| !own(k) && !v.is_empty()));
         all.extend(target.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        #[cfg(feature = "relabel")]
+        let relabeled;
+        // The series a scrape adds itself are not relabeled.
+        #[cfg(feature = "relabel")]
+        if !self.rules.is_empty()
+            && name != "up"
+            && !name.starts_with("scrape_")
+        {
+            let mut labels = owned(&all);
+            if !crate::relabel::apply(&self.rules, &mut labels) {
+                if let Some(scrape) = self.scrape.as_mut() {
+                    scrape.samples += 1;
+                    scrape.dropped += 1;
+                }
+                return;
+            }
+            relabeled = labels;
+            all = relabeled
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+        }
         if !all.iter().any(|(k, _)| *k == "host") {
             all.push(("host", &self.host));
         }
         all.sort_unstable_by(|a, b| a.0.cmp(b.0));
         all.dedup_by(|a, b| a.0 == b.0);
+        if let Some(scrape) = self.scrape.as_mut().filter(|_| name != "up") {
+            let mut hasher = DefaultHasher::new();
+            all.hash(&mut hasher);
+            scrape.series.push(hasher.finish());
+            scrape.samples += 1;
+        }
 
         if self.url.is_none() {
             print_series(&all, value);
@@ -294,6 +378,14 @@ fn print_series(labels: &[(&str, &str)], value: f64) {
     }
     let close = if separator == ',' { "}" } else { "" };
     let _ = writeln!(std::io::stdout(), "{line}{close} {value}");
+}
+
+#[cfg(feature = "relabel")]
+pub fn owned(labels: &[(&str, &str)]) -> crate::relabel::Labels {
+    labels
+        .iter()
+        .map(|(k, v)| ((*k).into(), (*v).into()))
+        .collect()
 }
 
 #[cfg(test)]

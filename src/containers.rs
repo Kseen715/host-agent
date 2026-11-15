@@ -26,7 +26,7 @@ const TASK_STATES: [&str; 5] = [
 
 pub fn collect(w: &mut Writer, containers: &[Container], now_s: f64) {
     machine::collect(w);
-    let boot = machine::boot_time();
+    let boot = host::boot_time();
     let root = [("id", "/")];
     let cgroup = Cgroup::root();
     resources(w, &root, &cgroup, Some(1));

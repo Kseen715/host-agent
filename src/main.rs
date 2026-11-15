@@ -5,27 +5,56 @@
 //! Usage: `host-agent [--print] [CONFIG]`. `--print` writes one round
 //! of metrics to stdout in the text format and sends nothing.
 
+// A build without some parts leaves their shared helpers unused; the
+// full build is the one linted for dead code.
+#![cfg_attr(
+    not(all(
+        feature = "docker",
+        feature = "journal-files",
+        feature = "minecraft",
+        feature = "otlp",
+        feature = "relabel",
+        feature = "snmp",
+        feature = "syslog"
+    )),
+    allow(dead_code, unused_imports, unused_mut)
+)]
+
 mod agent;
+#[cfg(feature = "docker")]
 mod cgroup;
 mod config;
+#[cfg(feature = "docker")]
 mod containers;
+#[cfg(feature = "docker")]
 mod docker;
 mod exposition;
 mod files;
 mod glob;
 mod host;
 mod http;
+#[cfg(feature = "journal")]
 mod journal;
 mod json;
 mod levels;
 mod loki;
+#[cfg(feature = "docker")]
 mod machine;
 mod node;
+#[cfg(feature = "otlp")]
+mod otlp;
+mod parts;
 mod process;
+#[cfg(feature = "relabel")]
+mod relabel;
 mod remote;
 mod scrape;
+#[cfg(feature = "snmp")]
+mod snmp;
 mod spool;
 mod state;
+#[cfg(feature = "syslog")]
+mod syslog;
 mod time;
 
 use std::process::ExitCode;
@@ -44,14 +73,7 @@ fn main() -> ExitCode {
             _ => path = arg,
         }
     }
-    let text = match std::env::var(CONFIG_VARIABLE) {
-        Ok(text) => Ok(text),
-        Err(_) => std::fs::read_to_string(&path)
-            .map_err(|error| format!("{path}: {error}")),
-    };
-    let agent = text
-        .and_then(|text| config::Config::parse(&text))
-        .and_then(|config| agent::Agent::new(config, print));
+    let agent = load(&path).and_then(|c| agent::Agent::new(c, print));
     let mut agent = match agent {
         Ok(agent) => agent,
         Err(error) => {
@@ -61,8 +83,31 @@ fn main() -> ExitCode {
     };
     if print {
         agent.round();
-    } else {
-        agent.run();
+        return ExitCode::SUCCESS;
+    }
+    // SIGHUP: the configuration again. A bad one keeps the running agent,
+    // which reports alloy_config_last_load_successful 0, as Alloy does.
+    while let agent::Ended::Reload = agent.run() {
+        match load(&path).and_then(|c| agent::Agent::new(c, false)) {
+            Ok(new) => {
+                eprintln!("Configuration reloaded");
+                agent = new;
+            }
+            Err(error) => {
+                eprintln!("Reload: {error}");
+                agent.config_failed();
+            }
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// The configuration from HOST_AGENT_CONFIG, else from the file.
+fn load(path: &str) -> Result<config::Config, String> {
+    let text = match std::env::var(CONFIG_VARIABLE) {
+        Ok(text) => text,
+        Err(_) => std::fs::read_to_string(path)
+            .map_err(|error| format!("{path}: {error}"))?,
+    };
+    config::Config::parse(&text)
 }

@@ -24,6 +24,13 @@ pub fn path(path: &str) -> PathBuf {
     }
 }
 
+/// When the host booted, in seconds since the epoch.
+pub fn boot_time() -> f64 {
+    let stat = std::fs::read_to_string(path("/proc/stat")).unwrap_or_default();
+    let line = stat.lines().find_map(|l| l.strip_prefix("btime "));
+    line.and_then(|t| t.trim().parse().ok()).unwrap_or(0.0)
+}
+
 /// statvfs of a host's mount point.
 pub fn statvfs(path: &str) -> Option<libc::statvfs> {
     let path = CString::new(self::path(path).as_os_str().as_bytes()).ok()?;

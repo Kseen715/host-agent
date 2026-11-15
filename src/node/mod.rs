@@ -4,16 +4,19 @@
 //! reports `node_scrape_collector_success` and its duration; one whose
 //! source this host lacks (no NFS, no bonding) fails, as Alloy's does.
 
+#[cfg(feature = "filesystems")]
 mod filesystems;
 mod hardware;
 mod kernel;
 mod network;
+#[cfg(feature = "filesystems")]
 mod nfs;
 mod platform;
 mod storage;
 mod system;
 mod systemd;
 mod textfile;
+#[cfg(feature = "filesystems")]
 mod zfs;
 
 use crate::host;
@@ -32,6 +35,7 @@ type Collect = fn(&Node, &mut Writer) -> io::Result<()>;
 const COLLECTORS: &[(&str, Collect)] = &[
     ("arp", kernel::arp),
     ("bonding", network::bonding),
+    #[cfg(feature = "filesystems")]
     ("btrfs", filesystems::btrfs),
     ("conntrack", system::conntrack),
     ("cpu", system::cpu),
@@ -48,7 +52,9 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("netclass", network::netclass),
     ("netdev", network::netdev),
     ("netstat", network::netstat),
+    #[cfg(feature = "filesystems")]
     ("nfs", nfs::client),
+    #[cfg(feature = "filesystems")]
     ("nfsd", nfs::server),
     ("nvme", platform::nvme),
     ("os", kernel::os),
@@ -67,7 +73,9 @@ const COLLECTORS: &[(&str, Collect)] = &[
     ("udp_queues", kernel::udp_queues),
     ("uname", system::uname),
     ("vmstat", system::vmstat),
+    #[cfg(feature = "filesystems")]
     ("xfs", filesystems::xfs),
+    #[cfg(feature = "filesystems")]
     ("zfs", zfs::collect),
 ];
 
@@ -117,6 +125,7 @@ impl Node {
     pub fn collect(&self, w: &mut Writer) {
         w.target("node", &[]);
         w.up(true);
+        crate::agent::build_info(w, "node_exporter_build_info");
         for (name, collect) in COLLECTORS {
             if self.disabled.iter().any(|d| d == name) {
                 continue;

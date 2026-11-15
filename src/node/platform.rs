@@ -8,22 +8,27 @@ use std::io;
 use std::path::Path;
 
 /// node_exporter's labels and the /sys/class/dmi/id files they come
-/// from; serial numbers and UUIDs are left out, as there.
-const DMI: [(&str, &str); 16] = [
+/// from. Serials and the UUID are readable by root only, as this agent
+/// runs.
+const DMI: [(&str, &str); 20] = [
     ("bios_date", "bios_date"),
     ("bios_release", "bios_release"),
     ("bios_vendor", "bios_vendor"),
     ("bios_version", "bios_version"),
     ("board_asset_tag", "board_asset_tag"),
     ("board_name", "board_name"),
+    ("board_serial", "board_serial"),
     ("board_vendor", "board_vendor"),
     ("board_version", "board_version"),
     ("chassis_asset_tag", "chassis_asset_tag"),
+    ("chassis_serial", "chassis_serial"),
     ("chassis_vendor", "chassis_vendor"),
     ("chassis_version", "chassis_version"),
     ("product_family", "product_family"),
     ("product_name", "product_name"),
+    ("product_serial", "product_serial"),
     ("product_sku", "product_sku"),
+    ("product_uuid", "product_uuid"),
     ("product_version", "product_version"),
     ("system_vendor", "sys_vendor"),
 ];

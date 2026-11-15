@@ -1,0 +1,310 @@
+//! SNMP v2c over UDP, as much as walking a device takes: BER for a
+//! GetBulkRequest and its Response (RFC 3416), one request at a time.
+
+use std::io;
+use std::net::UdpSocket;
+use std::time::Duration;
+
+/// snmp_exporter's.
+const MAX_REPETITIONS: i64 = 25;
+/// A device on the LAN answers in milliseconds, and the round waits for
+/// a dead one: it is given up on soon.
+const TIMEOUT: Duration = Duration::from_secs(1);
+const RETRIES: u64 = 2;
+
+pub enum Value {
+    Number(f64),
+    Bytes(Vec<u8>),
+    Oid(String),
+}
+
+pub struct Client {
+    socket: UdpSocket,
+    community: Vec<u8>,
+    request_id: i64,
+    buf: Vec<u8>,
+    pub sent: u64,
+    pub retried: u64,
+}
+
+impl Client {
+    /// `address` with its port, or 161.
+    pub fn connect(address: &str, community: &str) -> io::Result<Client> {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        if address.contains(':') {
+            socket.connect(address)?;
+        } else {
+            socket.connect((address, 161))?;
+        }
+        socket.set_read_timeout(Some(TIMEOUT))?;
+        Ok(Client {
+            socket,
+            community: community.as_bytes().to_vec(),
+            request_id: 0,
+            buf: vec![0; 65536],
+            sent: 0,
+            retried: 0,
+        })
+    }
+
+    /// Every variable under `root`, in the device's order.
+    pub fn walk(
+        &mut self,
+        root: &str,
+        out: &mut Vec<(String, Value)>,
+    ) -> io::Result<()> {
+        let prefix = format!("{root}.");
+        let mut from = root.to_owned();
+        loop {
+            let binds = self.get_bulk(&from)?;
+            let last = from.clone();
+            for (oid, value) in binds {
+                let Some(value) = value.filter(|_| oid.starts_with(&prefix))
+                else {
+                    return Ok(());
+                };
+                from.clone_from(&oid);
+                out.push((oid, value));
+            }
+            // An empty answer, or one going nowhere, ends it.
+            if from == last {
+                return Ok(());
+            }
+        }
+    }
+
+    fn get_bulk(&mut self, oid: &str) -> io::Result<Vec<Bind>> {
+        self.request_id = (self.request_id + 1) & 0x7fff_ffff;
+        let request = request(&self.community, self.request_id, oid)
+            .ok_or_else(|| io::Error::other(format!("bad OID {oid}")))?;
+        for attempt in 0..=RETRIES {
+            self.retried += u64::from(attempt > 0);
+            self.socket.send(&request)?;
+            self.sent += 1;
+            loop {
+                let length = match self.socket.recv(&mut self.buf) {
+                    Ok(length) => length,
+                    Err(e) if timed_out(&e) => break,
+                    Err(e) => return Err(e),
+                };
+                // Another request's answer, late: wait on.
+                let answer = response(&self.buf[..length], self.request_id);
+                if let Some(answer) = answer {
+                    return answer;
+                }
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::TimedOut, "no answer"))
+    }
+}
+
+fn timed_out(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// A variable and its value; None past the end of the device's MIB.
+type Bind = (String, Option<Value>);
+
+fn request(community: &[u8], id: i64, oid: &str) -> Option<Vec<u8>> {
+    let bind = tlv(0x30, &[encode_oid(oid)?, vec![0x05, 0x00]].concat());
+    let fields = [
+        integer(id),
+        integer(0),
+        integer(MAX_REPETITIONS),
+        tlv(0x30, &bind),
+    ];
+    let pdu = tlv(0xA5, &fields.concat());
+    Some(tlv(0x30, &[integer(1), tlv(0x04, community), pdu].concat()))
+}
+
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let length = content.len().to_be_bytes();
+    let skip = length.iter().take_while(|&&b| b == 0).count();
+    if content.len() < 0x80 {
+        out.push(content.len() as u8);
+    } else {
+        out.push(0x80 | (length.len() - skip) as u8);
+        out.extend_from_slice(&length[skip..]);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// The fewest two's complement bytes that keep the sign.
+fn integer(value: i64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let redundant = |i: usize| {
+        (bytes[i] == 0 && bytes[i + 1] < 0x80)
+            || (bytes[i] == 0xff && bytes[i + 1] >= 0x80)
+    };
+    let start = (0..7).take_while(|&i| redundant(i)).count();
+    tlv(0x02, &bytes[start..])
+}
+
+fn encode_oid(text: &str) -> Option<Vec<u8>> {
+    let arcs: Vec<u32> = text
+        .split('.')
+        .map(|a| a.parse().ok())
+        .collect::<Option<_>>()?;
+    let [first, second, rest @ ..] = &arcs[..] else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for arc in std::iter::once(first * 40 + second).chain(rest.iter().copied())
+    {
+        let mut groups = vec![(arc & 0x7f) as u8];
+        let mut arc = arc >> 7;
+        while arc > 0 {
+            groups.push(0x80 | (arc & 0x7f) as u8);
+            arc >>= 7;
+        }
+        out.extend(groups.iter().rev());
+    }
+    Some(tlv(0x06, &out))
+}
+
+/// The first TLV in `buf`: its tag, its content, and what follows it.
+fn read(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = buf.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (length, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count > 4 || rest.len() < count {
+            return None;
+        }
+        let length = rest[..count]
+            .iter()
+            .fold(0, |length, &b| length << 8 | usize::from(b));
+        (length, &rest[count..])
+    };
+    (rest.len() >= length).then(|| (tag, &rest[..length], &rest[length..]))
+}
+
+/// The variables of the Response to request `id`; None for anything
+/// else.
+fn response(buf: &[u8], id: i64) -> Option<io::Result<Vec<Bind>>> {
+    let (0x30, message, _) = read(buf)? else {
+        return None;
+    };
+    let (_, _version, rest) = read(message)?;
+    let (_, _community, rest) = read(rest)?;
+    let (0xA2, pdu, _) = read(rest)? else {
+        return None;
+    };
+    let (_, request_id, rest) = read(pdu)?;
+    if signed(request_id) != id {
+        return None;
+    }
+    let (_, status, rest) = read(rest)?;
+    if signed(status) != 0 {
+        let error = format!("error status {}", signed(status));
+        return Some(Err(io::Error::other(error)));
+    }
+    let (_, _index, rest) = read(rest)?;
+    let (_, mut binds, _) = read(rest)?;
+    let mut out = Vec::new();
+    while !binds.is_empty() {
+        let (_, bind, rest) = read(binds)?;
+        binds = rest;
+        let (_, name, value) = read(bind)?;
+        let (tag, content, _) = read(value)?;
+        out.push((decode_oid(name), value_of(tag, content)));
+    }
+    Some(Ok(out))
+}
+
+fn value_of(tag: u8, content: &[u8]) -> Option<Value> {
+    let unsigned = || content.iter().fold(0u64, |n, &b| n << 8 | u64::from(b));
+    match tag {
+        0x02 => Some(Value::Number(signed(content) as f64)),
+        // Counter32, Gauge32, TimeTicks, Counter64.
+        0x41..=0x43 | 0x46 => Some(Value::Number(unsigned() as f64)),
+        // Net-SNMP's floats (laLoadFloat): an Opaque wrapping one.
+        0x44 if content.len() == 7 && content[..3] == [0x9f, 0x78, 4] => {
+            let bytes = [content[3], content[4], content[5], content[6]];
+            Some(Value::Number(f64::from(f32::from_be_bytes(bytes))))
+        }
+        0x04 | 0x40 | 0x44 => Some(Value::Bytes(content.to_vec())),
+        0x06 => Some(Value::Oid(decode_oid(content))),
+        // NULL, noSuchObject, noSuchInstance, endOfMibView.
+        _ => None,
+    }
+}
+
+fn signed(content: &[u8]) -> i64 {
+    let negative = content.first().is_some_and(|&b| b >= 0x80);
+    let start = if negative { -1 } else { 0 };
+    content.iter().fold(start, |n, &b| n << 8 | i64::from(b))
+}
+
+fn decode_oid(content: &[u8]) -> String {
+    let mut arcs = Vec::new();
+    let mut arc: u64 = 0;
+    for &byte in content {
+        arc = arc << 7 | u64::from(byte & 0x7f);
+        if byte < 0x80 {
+            arcs.push(arc);
+            arc = 0;
+        }
+    }
+    let Some(&first) = arcs.first() else {
+        return String::new();
+    };
+    let (a, b) = if first < 80 {
+        (first / 40, first % 40)
+    } else {
+        (2, first - 80)
+    };
+    let rest = arcs[1..].iter().map(|arc| format!(".{arc}"));
+    format!("{a}.{b}{}", rest.collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips() {
+        let oid = "1.3.6.1.2.1.31.1.1.1.18.200";
+        let encoded = encode_oid(oid).unwrap();
+        let (_, content, _) = read(&encoded).unwrap();
+        assert_eq!(decode_oid(content), oid);
+        for n in [0, 127, 128, -1, -129, 0x7fff_ffff] {
+            let encoded = integer(n);
+            let (_, content, _) = read(&encoded).unwrap();
+            assert_eq!(signed(content), n);
+        }
+        let long = tlv(0x04, &[7; 300]);
+        assert_eq!(&long[..4], [0x04, 0x82, 0x01, 0x2c]);
+        assert_eq!(read(&long).unwrap().1.len(), 300);
+    }
+
+    #[test]
+    fn reads_a_response() {
+        let bind = |oid: &str, value: Vec<u8>| {
+            tlv(0x30, &[encode_oid(oid).unwrap(), value].concat())
+        };
+        let binds = [
+            bind("1.3.6.1.2.1.1.3.0", tlv(0x43, &[0x01, 0x00])),
+            bind("1.3.6.1.2.1.1.5.0", tlv(0x04, b"keenetic")),
+            bind("1.3.6.1.2.1.2.1.0", vec![0x82, 0x00]),
+        ]
+        .concat();
+        let pdu = [integer(7), integer(0), integer(0), tlv(0x30, &binds)];
+        let message = [integer(1), tlv(0x04, b"c"), tlv(0xA2, &pdu.concat())];
+        let message = tlv(0x30, &message.concat());
+        assert!(response(&message, 8).is_none());
+        let binds = response(&message, 7).unwrap().unwrap();
+        assert!(matches!(binds[0].1, Some(Value::Number(256.0))));
+        assert!(
+            matches!(&binds[1].1, Some(Value::Bytes(b)) if b == b"keenetic")
+        );
+        assert!(binds[2].1.is_none());
+    }
+}

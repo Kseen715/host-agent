@@ -26,7 +26,7 @@ pub fn collect(w: &mut Writer) {
     // SAFETY: sysconf only reads a constant.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f64;
 
-    let start = crate::machine::boot_time() + field(START) / CLOCK_TICKS;
+    let start = crate::host::boot_time() + field(START) / CLOCK_TICKS;
     let values = [
         (
             "cpu_seconds_total",

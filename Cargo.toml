@@ -7,9 +7,39 @@ description = "Pushes a host's metrics to Prometheus and its logs to Loki"
 license = "MIT"
 publish = false
 
+# Parts a host may go without, for a smaller binary. `minecraft` needs
+# `docker`: the plugins are found through the containers.
+[features]
+default = [
+    "docker",
+    "filesystems",
+    "journal",
+    "journal-files",
+    "minecraft",
+    "otlp",
+    "relabel",
+    "snmp",
+    "syslog",
+]
+docker = []
+filesystems = []
+journal = []
+# The journal read from its files instead of through journalctl, which
+# a container from scratch lacks.
+journal-files = ["journal", "dep:lz4_flex", "dep:ruzstd"]
+minecraft = ["docker"]
+otlp = []
+relabel = []
+snmp = []
+syslog = []
+
 [dependencies]
 libc = "0.2"
+lz4_flex = { version = "0.14", optional = true, default-features = false, features = [
+    "safe-decode",
+] }
 regex-lite = "0.1"
+ruzstd = { version = "0.9", optional = true }
 snap = "1"
 
 # Small and lean: an agent on every host, idle between rounds, so size

@@ -39,6 +39,8 @@ pub struct Loki {
     backoff: Duration,
     pub sent: u64,
     pub dropped: u64,
+    #[cfg(feature = "relabel")]
+    pub rules: Vec<crate::relabel::Rule>,
 }
 
 impl Loki {
@@ -55,11 +57,29 @@ impl Loki {
             backoff: Duration::ZERO,
             sent: 0,
             dropped: 0,
+            #[cfg(feature = "relabel")]
+            rules: Vec::new(),
         })
     }
 
-    /// One line. Labels with empty values are left out; `host` is added.
+    /// One line, after `log_relabel`. Labels with empty values are left
+    /// out; `host` is added unless the line has its own (a network
+    /// device's).
     pub fn add(&mut self, labels: &[(&str, &str)], ns: i64, line: &str) {
+        #[cfg(feature = "relabel")]
+        let relabeled;
+        #[cfg(feature = "relabel")]
+        let labels = if self.rules.is_empty() {
+            labels
+        } else {
+            let mut owned = crate::remote::owned(labels);
+            if !crate::relabel::apply(&self.rules, &mut owned) {
+                return;
+            }
+            relabeled = owned;
+            let pairs = relabeled.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            &pairs.collect::<Vec<_>>()
+        };
         let key = self.key(labels);
         let index = match self.streams.iter().position(|s| s.labels == key) {
             Some(index) => index,
@@ -93,7 +113,8 @@ impl Loki {
             .copied()
             .collect();
         all.push(("host", &self.host));
-        all.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        // Stable: of two `host`s, the line's own comes first and stays.
+        all.sort_by(|a, b| a.0.cmp(b.0));
         all.dedup_by(|a, b| a.0 == b.0);
         let mut key = String::from("{");
         for (i, (name, value)) in all.iter().enumerate() {
