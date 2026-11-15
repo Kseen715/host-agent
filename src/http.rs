@@ -4,9 +4,14 @@
 //! close`), so a response ends where the stream does.
 
 pub mod auth;
+mod aws_profile;
 pub mod azure;
 #[cfg(feature = "tls")]
+mod azure_cert;
+#[cfg(feature = "tls")]
 pub mod google;
+#[cfg(feature = "http2")]
+mod h2;
 pub mod proxy;
 pub mod sigv4;
 #[cfg(feature = "tls")]
@@ -38,6 +43,9 @@ pub struct Client {
     /// tls_config; None, the system's roots.
     #[cfg(feature = "tls")]
     pub tls: Option<tls::Tls>,
+    /// enable_http2: offered over TLS.
+    #[cfg(feature = "http2")]
+    pub http2: bool,
 }
 
 impl Default for Client {
@@ -50,6 +58,8 @@ impl Default for Client {
             proxy: Proxy::Direct,
             #[cfg(feature = "tls")]
             tls: None,
+            #[cfg(feature = "http2")]
+            http2: false,
         }
     }
 }
@@ -224,19 +234,9 @@ fn once(
     body: &[u8],
 ) -> io::Result<(Response, Option<String>)> {
     let route = client.proxy.route(url);
-    let target = match &route {
-        Some(_) if !url.tls => {
-            format!("http://{}{}", url.host, url.path)
-        }
-        _ => url.path.clone(),
-    };
     let length = match method {
         "GET" | "HEAD" if body.is_empty() => String::new(),
         _ => format!("Content-Length: {}\r\n", body.len()),
-    };
-    let proxy_auth = match &route {
-        Some(proxy) if !url.tls => proxy.authorization(),
-        _ => String::new(),
     };
     let headers = format!("{headers}{}", client.headers);
     let request = auth::Request {
@@ -245,14 +245,44 @@ fn once(
         headers: &headers,
         body,
     };
-    let auth = client.auth.header(&request)?;
-    let head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {}\r\n{length}\
-         Connection: close\r\n{headers}{auth}{proxy_auth}\r\n",
-        url.host,
-    );
+    let lines = format!("{length}{headers}{}", client.auth.header(&request)?);
+    let head = head(method, url, route.as_ref(), &lines);
+    #[cfg(feature = "http2")]
+    if url.tls && client.http2 {
+        let stream = tcp(url, client, route.as_ref())?;
+        let request = h2::Request {
+            method,
+            url,
+            lines: &lines,
+            head: head.as_bytes(),
+            body,
+        };
+        return h2::exchange(stream, client, &request);
+    }
     let stream = open(url, client, route.as_ref())?;
     exchange(stream, head.as_bytes(), body)
+}
+
+/// An HTTP/1.1 request's head; to a proxy without TLS, with the whole
+/// URL as its target and the proxy's credentials.
+fn head(
+    method: &str,
+    url: &Url,
+    route: Option<&proxy::Route>,
+    lines: &str,
+) -> String {
+    let (target, proxy_auth) = match route {
+        Some(proxy) if !url.tls => (
+            format!("http://{}{}", url.host, url.path),
+            proxy.authorization(),
+        ),
+        _ => (url.path.clone(), String::new()),
+    };
+    format!(
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+         {lines}{proxy_auth}\r\n",
+        url.host,
+    )
 }
 
 /// A stream a request is exchanged on: TCP, through TLS or not.
@@ -265,16 +295,7 @@ fn open(
     client: &Client,
     proxy: Option<&proxy::Route>,
 ) -> io::Result<Box<dyn Stream>> {
-    let stream = match proxy {
-        None => connect(&url.authority, client.timeout)?,
-        Some(proxy) => {
-            let stream = connect(&proxy.authority, client.timeout)?;
-            match url.tls {
-                true => proxy.tunnel(stream, url)?,
-                false => stream,
-            }
-        }
-    };
+    let stream = tcp(url, client, proxy)?;
     if !url.tls {
         return Ok(Box::new(stream));
     }
@@ -282,6 +303,22 @@ fn open(
     return tls::wrap(stream, url, client.tls.as_ref());
     #[cfg(not(feature = "tls"))]
     Err(io::Error::other("https: built without feature tls"))
+}
+
+/// A connection to `url`, through the proxy's tunnel for TLS.
+fn tcp(
+    url: &Url,
+    client: &Client,
+    proxy: Option<&proxy::Route>,
+) -> io::Result<TcpStream> {
+    let Some(proxy) = proxy else {
+        return connect(&url.authority, client.timeout);
+    };
+    let stream = connect(&proxy.authority, client.timeout)?;
+    match url.tls {
+        true => proxy.tunnel(stream, url),
+        false => Ok(stream),
+    }
 }
 
 pub fn unix_get(socket: &Path, path: &str) -> io::Result<Response> {
@@ -318,14 +355,21 @@ fn exchange<S: Read + Write>(
     stream.write_all(body)?;
     stream.flush()?;
     let mut raw = Vec::new();
-    match stream.take(MAX_RESPONSE).read_to_end(&mut raw) {
-        Ok(_) => {}
-        // A TLS peer that closes without close_notify, as many do
-        // after `Connection: close`: what came is the response.
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-        Err(e) => return Err(e),
-    }
+    ended(stream.take(MAX_RESPONSE).read_to_end(&mut raw))?;
+    parse_response(raw)
+}
 
+/// A response read to its end: a TLS peer that closes without
+/// close_notify, as many do after `Connection: close`, ends it too.
+fn ended(read: io::Result<usize>) -> io::Result<()> {
+    match read {
+        Err(e) if e.kind() != io::ErrorKind::UnexpectedEof => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// An HTTP/1.1 response, and its Location.
+fn parse_response(mut raw: Vec<u8>) -> io::Result<(Response, Option<String>)> {
     let end = head_end(&raw).ok_or_else(|| broken("no end of headers"))?;
     let head = parse_head(&raw[..end])?;
     let mut body = raw.split_off(end);

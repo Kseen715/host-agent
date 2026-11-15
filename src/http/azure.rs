@@ -1,7 +1,8 @@
 //! Azure AD tokens for remote_write, as Prometheus's azuread asks for
 //! them: a managed identity, a workload identity's federated token, an
-//! app's client secret, or the SDK's default chain (environment,
-//! workload identity, managed identity, Azure CLI).
+//! app's client secret, or the SDK's default chain (environment's
+//! secret, certificate or password, workload identity, managed
+//! identity, the Azure CLI, Azure Developer CLI and PowerShell).
 
 use super::auth::{Expiring, Secret, Tokens, form_token, json_token};
 use super::{Client, Url};
@@ -16,6 +17,18 @@ use std::time::{Duration, Instant};
 /// Workload identity's projected token, unless configured.
 pub const TOKEN_FILE: &str =
     "/var/run/secrets/azure/tokens/azure-identity-token";
+/// DefaultAzureCredential's sources in order; the first three are
+/// AZURE_TOKEN_CREDENTIALS's "prod", the rest its "dev".
+const SOURCES: [&str; 6] = [
+    "EnvironmentCredential",
+    "WorkloadIdentityCredential",
+    "ManagedIdentityCredential",
+    "AzureCLICredential",
+    "AzureDeveloperCLICredential",
+    "AzurePowerShellCredential",
+];
+const ASSERTION_TYPE: &str =
+    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 /// Metadata servers answer at once or are not there.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -172,10 +185,7 @@ impl Azure {
         let form = self.form(
             id,
             &[
-                (
-                    "client_assertion_type",
-                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                ),
+                ("client_assertion_type", ASSERTION_TYPE),
                 ("client_assertion", assertion.trim()),
             ],
         );
@@ -215,56 +225,144 @@ impl Azure {
         json_token(&super::request(&url, &client, "GET", &header, &[])?)
     }
 
-    /// DefaultAzureCredential: the first source that gives a token.
+    /// DefaultAzureCredential: the first of the sources
+    /// AZURE_TOKEN_CREDENTIALS selects (all unset) that gives a token.
     fn chain(&self, tenant: &str) -> io::Result<Expiring<String>> {
-        let var = |name: &str| env::var(name).unwrap_or_default();
+        let chosen = selected(&var("AZURE_TOKEN_CREDENTIALS"))
+            .map_err(io::Error::other)?;
         let tenant = match tenant {
             "" => var("AZURE_TENANT_ID"),
             tenant => tenant.to_owned(),
         };
-        let (id, secret) = (var("AZURE_CLIENT_ID"), var("AZURE_CLIENT_SECRET"));
-        let file = var("AZURE_FEDERATED_TOKEN_FILE");
         let mut errors = Vec::new();
-        let mut attempt = |found: io::Result<Expiring<String>>| match found {
-            Ok(token) => Some(token),
-            Err(error) => {
-                errors.push(error.to_string());
-                None
+        for source in chosen {
+            let found = match source {
+                "EnvironmentCredential" => self.environment(),
+                "WorkloadIdentityCredential" => self.workload(&tenant),
+                "ManagedIdentityCredential" => {
+                    self.managed(&var("AZURE_CLIENT_ID"))
+                }
+                "AzureCLICredential" => self.cli(&tenant),
+                "AzureDeveloperCLICredential" => self.azd(&tenant),
+                _ => self.powershell(&tenant),
+            };
+            match found {
+                Ok(token) => return Ok(token),
+                Err(error) => errors.push(format!("{source}: {error}")),
             }
-        };
-        let complete = !tenant.is_empty() && !id.is_empty();
-        if complete && !secret.is_empty() {
-            if let Some(token) = attempt(self.secret(&id, &secret, &tenant)) {
-                return Ok(token);
-            }
-        }
-        if complete && !file.is_empty() {
-            if let Some(token) = attempt(self.federated(&id, &tenant, &file)) {
-                return Ok(token);
-            }
-        }
-        if let Some(token) = attempt(self.managed(&id)) {
-            return Ok(token);
-        }
-        if let Some(token) = attempt(self.cli(&tenant)) {
-            return Ok(token);
         }
         Err(io::Error::other(format!("azure: {}", errors.join("; "))))
     }
 
+    /// EnvironmentCredential: a client secret, a certificate, or a
+    /// user's password, by AZURE_* variables.
+    fn environment(&self) -> io::Result<Expiring<String>> {
+        let (tenant, id) = (var("AZURE_TENANT_ID"), var("AZURE_CLIENT_ID"));
+        for (name, value) in
+            [("AZURE_TENANT_ID", &tenant), ("AZURE_CLIENT_ID", &id)]
+        {
+            if value.is_empty() {
+                let message = format!("missing environment variable {name}");
+                return Err(io::Error::other(message));
+            }
+        }
+        let secret = var("AZURE_CLIENT_SECRET");
+        if !secret.is_empty() {
+            return self.secret(&id, &secret, &tenant);
+        }
+        let path = var("AZURE_CLIENT_CERTIFICATE_PATH");
+        if !path.is_empty() {
+            return self.certificate(&id, &tenant, &path);
+        }
+        let user = var("AZURE_USERNAME");
+        if !user.is_empty() {
+            return self.password(&id, &tenant, &user);
+        }
+        Err(io::Error::other(
+            "incomplete environment variable configuration. Only \
+             AZURE_TENANT_ID and AZURE_CLIENT_ID are set",
+        ))
+    }
+
+    #[cfg(feature = "tls")]
+    fn certificate(
+        &self,
+        id: &str,
+        tenant: &str,
+        path: &str,
+    ) -> io::Result<Expiring<String>> {
+        let password = var("AZURE_CLIENT_CERTIFICATE_PASSWORD");
+        let cert = super::azure_cert::load(path, &password)?;
+        let send = var("AZURE_CLIENT_SEND_CERTIFICATE_CHAIN");
+        let send = send == "1" || send.eq_ignore_ascii_case("true");
+        let url = self.token_url(tenant)?;
+        let audience = format!("https://{}{}", url.host, url.path);
+        let assertion = cert.assertion(&audience, id, send)?;
+        let form = self.form(
+            id,
+            &[
+                ("client_assertion_type", ASSERTION_TYPE),
+                ("client_assertion", &assertion),
+            ],
+        );
+        form_token(&url, &self.client, &form, "")
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn certificate(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> io::Result<Expiring<String>> {
+        Err(io::Error::other("certificate credentials need feature tls"))
+    }
+
+    /// The resource owner password grant, as a public client.
+    fn password(
+        &self,
+        id: &str,
+        tenant: &str,
+        user: &str,
+    ) -> io::Result<Expiring<String>> {
+        let password = var("AZURE_PASSWORD");
+        if password.is_empty() {
+            return Err(io::Error::other("no value for AZURE_PASSWORD"));
+        }
+        let scope = format!("{} openid offline_access profile", self.scope);
+        let form = [
+            ("grant_type", "password"),
+            ("client_id", id),
+            ("username", user),
+            ("password", &password),
+            ("scope", &scope),
+            ("client_info", "1"),
+        ];
+        let form: Vec<(String, String)> = form
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect();
+        form_token(&self.token_url(tenant)?, &self.client, &form, "")
+    }
+
+    fn workload(&self, tenant: &str) -> io::Result<Expiring<String>> {
+        let (id, file) =
+            (var("AZURE_CLIENT_ID"), var("AZURE_FEDERATED_TOKEN_FILE"));
+        if tenant.is_empty() || id.is_empty() || file.is_empty() {
+            let message = "no client ID, tenant ID or token file specified";
+            return Err(io::Error::other(message));
+        }
+        self.federated(&id, tenant, &file)
+    }
+
     /// `az account get-access-token`, as the SDK's AzureCLICredential.
     fn cli(&self, tenant: &str) -> io::Result<Expiring<String>> {
-        let mut az = Command::new("az");
-        az.args(["account", "get-access-token", "--output", "json"]);
-        az.args(["--resource", self.resource()]);
+        let mut args = vec!["account", "get-access-token", "-o", "json"];
+        args.extend(["--resource", self.resource()]);
         if !tenant.is_empty() {
-            az.args(["--tenant", tenant]);
+            args.extend(["--tenant", tenant]);
         }
-        let output = az.output()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let json = Json::parse(&text)
-            .filter(|_| output.status.success())
-            .ok_or_else(|| io::Error::other("az: no token"))?;
+        let json = run("az", &args)?;
         let token = json.get("accessToken").and_then(Json::str).unwrap_or("");
         let at = json.get("expires_on").and_then(Json::num);
         let now_s = crate::time::now_ms() as f64 / 1e3;
@@ -272,6 +370,92 @@ impl Azure {
         let expiry = Instant::now() + Duration::from_secs_f64(left);
         Ok((format!("Bearer {token}"), Some(expiry)))
     }
+
+    /// `azd auth token`, as AzureDeveloperCLICredential.
+    fn azd(&self, tenant: &str) -> io::Result<Expiring<String>> {
+        let mut args = vec!["auth", "token", "-o", "json", "--no-prompt"];
+        args.extend(["--scope", &self.scope]);
+        if !tenant.is_empty() {
+            args.extend(["--tenant-id", tenant]);
+        }
+        let json = run("azd", &args)?;
+        let token = json.get("token").and_then(Json::str).unwrap_or("");
+        let at = json.get("expiresOn").and_then(Json::str).unwrap_or("");
+        Ok((format!("Bearer {token}"), Some(expires_at(at)?)))
+    }
+
+    /// Az.Accounts' Get-AzAccessToken through pwsh, as
+    /// AzurePowerShellCredential runs it.
+    fn powershell(&self, tenant: &str) -> io::Result<Expiring<String>> {
+        let script = include_str!("azure_token.ps1")
+            .replace("{resource}", self.resource())
+            .replace("{tenant}", tenant);
+        let utf16: Vec<u8> =
+            script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = crate::encoding::base64(&utf16);
+        let args = [
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-EncodedCommand",
+            &encoded,
+        ];
+        let json = run("pwsh", &args)?;
+        let token = json.get("Token").and_then(Json::str).unwrap_or("");
+        let at = json.get("ExpiresOn").and_then(Json::num).unwrap_or(0.0);
+        let left = (at - crate::time::now_ms() as f64 / 1e3).max(0.0);
+        let expiry = Instant::now() + Duration::from_secs_f64(left);
+        Ok((format!("Bearer {token}"), Some(expiry)))
+    }
+}
+
+/// The sources AZURE_TOKEN_CREDENTIALS names, in the chain's order;
+/// refused when it names none, as NewDefaultAzureCredential refuses it.
+pub fn selected(value: &str) -> Result<Vec<&'static str>, String> {
+    let (prod, dev) = SOURCES.split_at(3);
+    match value {
+        "" => Ok(SOURCES.to_vec()),
+        "dev" => Ok(dev.to_vec()),
+        "prod" => Ok(prod.to_vec()),
+        name => SOURCES
+            .iter()
+            .find(|s| s.eq_ignore_ascii_case(name))
+            .map(|s| vec![*s])
+            .ok_or_else(|| {
+                format!(
+                    "invalid AZURE_TOKEN_CREDENTIALS value {name:?}. Valid \
+                     values are \"dev\", \"prod\", or the name of any \
+                     credential type in the default chain"
+                )
+            }),
+    }
+}
+
+fn var(name: &str) -> String {
+    env::var(name).unwrap_or_default()
+}
+
+/// A developer tool's JSON answer.
+fn run(program: &str, args: &[&str]) -> io::Result<Json> {
+    let output = Command::new(program).args(args).output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Json::parse(&text)
+        .filter(|_| output.status.success())
+        .ok_or_else(|| {
+            let error = String::from_utf8_lossy(&output.stderr);
+            io::Error::other(format!("{program}: {}", error.trim()))
+        })
+}
+
+/// azd's `2006-01-02T15:04:05Z` expiry.
+fn expires_at(text: &str) -> io::Result<Instant> {
+    let at_ns = crate::time::parse_rfc3339(text).ok_or_else(|| {
+        let message = format!("error parsing token expiration time {text:?}");
+        io::Error::other(message)
+    })?;
+    let left = (at_ns - crate::time::now_ns()).max(0) as u64;
+    Ok(Instant::now() + Duration::from_nanos(left))
 }
 
 /// Go's uuid.Parse: 36 characters with dashes, or 32 hex digits,

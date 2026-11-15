@@ -12,6 +12,8 @@ pub enum Value {
     Bool(bool),
     /// Alloy's int: from literals without a fraction, and int arithmetic.
     Int(i64),
+    /// Alloy's uint: literals past int64, and uint arithmetic.
+    Uint(u64),
     /// Alloy's float.
     Number(f64),
     String(String),
@@ -39,7 +41,7 @@ impl Value {
         match self {
             Value::Null => "null",
             Value::Bool(_) => "bool",
-            Value::Int(_) | Value::Number(_) => "number",
+            Value::Int(_) | Value::Uint(_) | Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
@@ -49,11 +51,16 @@ impl Value {
         }
     }
 
-    /// Either kind of number, as a float.
+    /// Any kind of number, as a float.
     pub fn number(&self) -> Option<f64> {
+        self.num().map(Num::float)
+    }
+
+    fn num(&self) -> Option<Num> {
         match self {
-            Value::Int(n) => Some(*n as f64),
-            Value::Number(n) => Some(*n),
+            Value::Uint(n) => Some(Num::Uint(*n)),
+            Value::Int(n) => Some(Num::Int(*n)),
+            Value::Number(n) => Some(Num::Float(*n)),
             _ => None,
         }
     }
@@ -77,6 +84,7 @@ pub fn eval(expr: &Expr, resolve: Resolve) -> Result<Value, String> {
         Kind::Null => Value::Null,
         Kind::Bool(b) => Value::Bool(*b),
         Kind::Int(n) => Value::Int(*n),
+        Kind::Uint(n) => Value::Uint(*n),
         Kind::Number(n) => Value::Number(*n),
         Kind::Str(s) => Value::String(s.clone()),
         Kind::Array(items) => Value::Array(
@@ -180,10 +188,12 @@ fn field_of(value: Value, field: &str, pos: Pos) -> Result<Value, String> {
 
 fn element(inner: Value, index: Value, pos: Pos) -> Result<Value, String> {
     match (inner, index) {
-        (Value::Array(items), Value::Int(n)) => usize::try_from(n)
-            .ok()
-            .and_then(|n| items.into_iter().nth(n))
-            .ok_or(format!("{pos}: index {n} out of range")),
+        (Value::Array(items), Value::Int(n)) => {
+            nth(items, usize::try_from(n).ok(), n, pos)
+        }
+        (Value::Array(items), Value::Uint(n)) => {
+            nth(items, usize::try_from(n).ok(), n, pos)
+        }
         (object @ Value::Object(_), Value::String(key)) => {
             field_of(object, &key, pos)
         }
@@ -195,10 +205,22 @@ fn element(inner: Value, index: Value, pos: Pos) -> Result<Value, String> {
     }
 }
 
+fn nth(
+    items: Vec<Value>,
+    at: Option<usize>,
+    index: impl std::fmt::Display,
+    pos: Pos,
+) -> Result<Value, String> {
+    at.and_then(|n| items.into_iter().nth(n))
+        .ok_or(format!("{pos}: index {index} out of range"))
+}
+
 fn unary(op: &str, value: Value, pos: Pos) -> Result<Value, String> {
     match (op, value) {
         ("!", value) => Ok(Value::Bool(!value.truthy(pos)?)),
         ("-", Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
+        // As Alloy: a negated uint is an int.
+        ("-", Value::Uint(n)) => Ok(Value::Int((n as i64).wrapping_neg())),
         ("-", Value::Number(n)) => Ok(Value::Number(-n)),
         (op, value) => Err(format!("{pos}: `{op}` on a {}", value.kind())),
     }
@@ -224,18 +246,92 @@ fn binary(
         let (a, b) = (left.kind(), right.kind());
         format!("{pos}: `{op}` on a {a} and a {b}")
     };
-    let (Some(a), Some(b)) = (left.number(), right.number()) else {
+    let (Some(a), Some(b)) = (left.num(), right.num()) else {
         return Err(wrong());
     };
-    if matches!(op, "/" | "%") && b == 0.0 {
+    if matches!(op, "/" | "%") && b.is_zero() {
         return Err(format!("{pos}: divide by zero error"));
     }
-    let found = match (&left, &right) {
-        // Alloy keeps two ints an int, wrapping as Go's do.
-        (Value::Int(a), Value::Int(b)) => int_op(op, *a, *b),
-        _ => float_op(op, a, b),
+    // Wrapping as Go's ints do.
+    let found = match fit(a, b) {
+        (Num::Uint(a), Num::Uint(b)) => uint_op(op, a, b),
+        (Num::Int(a), Num::Int(b)) => int_op(op, a, b),
+        (a, b) => float_op(op, a.float(), b.float()),
     };
     found.ok_or_else(wrong)
+}
+
+/// A number of one of Alloy's kinds, in the order a pair widens to.
+#[derive(Clone, Copy)]
+enum Num {
+    Uint(u64),
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    fn rank(self) -> u8 {
+        match self {
+            Num::Uint(_) => 0,
+            Num::Int(_) => 1,
+            Num::Float(_) => 2,
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        match self {
+            Num::Uint(n) => n == 0,
+            Num::Int(n) => n == 0,
+            Num::Float(n) => n == 0.0,
+        }
+    }
+
+    // Converted as Go converts: ints by their bits, floats truncated.
+    fn uint(self) -> u64 {
+        match self {
+            Num::Uint(n) => n,
+            Num::Int(n) => n as u64,
+            Num::Float(n) => n as u64,
+        }
+    }
+
+    fn int(self) -> i64 {
+        match self {
+            Num::Uint(n) => n as i64,
+            Num::Int(n) => n,
+            Num::Float(n) => n as i64,
+        }
+    }
+
+    fn float(self) -> f64 {
+        match self {
+            Num::Uint(n) => n as f64,
+            Num::Int(n) => n as f64,
+            Num::Float(n) => n,
+        }
+    }
+}
+
+/// Both as the wider kind of the two, as Alloy's fitNumberKinds.
+fn fit(a: Num, b: Num) -> (Num, Num) {
+    match a.rank().max(b.rank()) {
+        0 => (Num::Uint(a.uint()), Num::Uint(b.uint())),
+        1 => (Num::Int(a.int()), Num::Int(b.int())),
+        _ => (Num::Float(a.float()), Num::Float(b.float())),
+    }
+}
+
+fn uint_op(op: &str, a: u64, b: u64) -> Option<Value> {
+    Some(Value::Uint(match op {
+        "+" => a.wrapping_add(b),
+        "-" => a.wrapping_sub(b),
+        "*" => a.wrapping_mul(b),
+        "/" => a / b,
+        "%" => a % b,
+        "^" if b == 0 => 1,
+        "^" => a.wrapping_pow(u32::try_from(b).unwrap_or(u32::MAX)),
+        op => return Some(Value::Bool(order(op, Some(a.cmp(&b))))),
+    }))
 }
 
 fn int_op(op: &str, a: i64, b: i64) -> Option<Value> {
@@ -281,8 +377,12 @@ pub(super) fn equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
-        (a, b) if a.number().is_some() && b.number().is_some() => {
-            a.number() == b.number()
+        (a, b) if a.num().is_some() && b.num().is_some() => {
+            match fit(a.num().unwrap(), b.num().unwrap()) {
+                (Num::Uint(a), Num::Uint(b)) => a == b,
+                (Num::Int(a), Num::Int(b)) => a == b,
+                (a, b) => a.float() == b.float(),
+            }
         }
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Array(a), Value::Array(b)) => {
@@ -331,6 +431,14 @@ mod tests {
         assert!(matches!(value("a.b.c - 1"), Ok(Value::Number(6.0))));
         assert!(value("1 % 0").is_err());
         assert!(matches!(value("1 == 1.0"), Ok(Value::Bool(true))));
+        let max = "18446744073709551615";
+        assert!(matches!(value(max), Ok(Value::Uint(u64::MAX))));
+        let half = value(&format!("{max} / {max}"));
+        assert!(matches!(half, Ok(Value::Uint(1))));
+        let min = value("-9223372036854775808");
+        assert!(matches!(min, Ok(Value::Int(i64::MIN))));
+        let format = format!(r#"string.format("%d %x", {max}, {max})"#);
+        assert_eq!(string(&format), format!("{max} ffffffffffffffff"));
         assert!(matches!(value("!(1 < 2) || 3 >= 3"), Ok(Value::Bool(true))));
         assert_eq!(string(r#""a" + "b""#), "ab");
         assert_eq!(string(r#"string.format("%s:%d", "h", 9100)"#), "h:9100");

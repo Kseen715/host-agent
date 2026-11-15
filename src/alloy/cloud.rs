@@ -79,6 +79,7 @@ fn sigv4(body: &Body, client: Client) -> Result<Auth, String> {
             external_id,
             session_name: text("session_name")?,
             tags: body.labels("tags")?,
+            duration_s: sigv4::ROLE_SECONDS,
         })
     });
     let settings = sigv4::Settings {
@@ -185,6 +186,8 @@ fn azure_method(body: &Body) -> Result<azure::Method, String> {
     }
     let sdk = body.block("sdk").expect("one block was given");
     sdk.check(&["tenant_id"], &[])?;
+    let chosen = std::env::var("AZURE_TOKEN_CREDENTIALS").unwrap_or_default();
+    azure::selected(&chosen).map_err(|e| sdk.error(sdk.block.pos, &e))?;
     let tenant_id = sdk.string_or("tenant_id", "")?;
     Ok(azure::Method::Sdk { tenant_id })
 }

@@ -17,6 +17,8 @@ pub struct Entry {
 
 pub enum Kind {
     Relabel(Rc<Vec<Rule>>),
+    /// A loki.relabel: its rules, results cached.
+    Cached(Rc<Vec<Rule>>, relabel::Cache),
     Process(Vec<Stage>),
     /// A loki.write: its index in `sinks`.
     Write(usize),
@@ -45,12 +47,19 @@ impl Logs {
     }
 
     fn at(&mut self, node: usize, mut entry: Entry) {
-        let kept = match &self.nodes[node].kind {
+        let kept = match &mut self.nodes[node].kind {
             Kind::Write(sink) => {
                 let Entry { labels, ns, line } = &entry;
                 return self.sinks[*sink].add(labels, *ns, line);
             }
             Kind::Relabel(rules) => relabel::apply(rules, &mut entry.labels),
+            Kind::Cached(rules, cache) => {
+                let labels = std::mem::take(&mut entry.labels);
+                cache
+                    .apply(rules, labels)
+                    .map(|l| entry.labels = l)
+                    .is_some()
+            }
             Kind::Process(stages) => stages::run(stages, &mut entry),
         };
         if kept {

@@ -29,11 +29,13 @@ used, in about 1 MiB of memory instead of about 100.
   page, `/metrics`, `/-/ready`, `/-/healthy`, `/-/reload`, and live
   views of each sample and log line sent (`/debug/metrics`,
   `/debug/logs`).
-- One thread around poll(2), and SNMP devices polled apart from it, so
-  a dead one holds nothing up. Metrics Prometheus does not take wait on
-  disk (`<storage>/prometheus.remote_write.<name>`, up to 2 hours and
-  256 MiB) and are
-  sent oldest first when it is back. An outage of Loki pauses the log
+- One thread around poll(2), SNMP devices polled apart from it, so
+  a dead one holds nothing up, and Prometheus's remote-write shards:
+  batches by series, sent in parallel, their number fitted to the
+  load as Prometheus fits it. Metrics Prometheus does not take wait on
+  disk (`<storage>/prometheus.remote_write.<name>`, truncated as
+  Alloy's WAL, up to 256 MiB) and are sent oldest first when it is
+  back. An outage of Loki pauses the log
   sources, which resume from saved positions (journal cursor, Docker
   timestamp, file offset) once the lines are sent.
 
@@ -53,7 +55,10 @@ before systemd 246), `tokio` (SNMP devices polled by tasks on one
 thread instead of a thread each), `tls` (HTTPS for scrapes, remote
 write, Loki and OAuth2 tokens, syslog over TLS and `google_iam`'s
 signed tokens: rustls on ring, +0.9 MB, and a C compiler for the
-target), `yaml` (`encoding.from_yaml`: yaml-rust2), `decompression`
+target), `http2` (HTTP/2 over TLS where the server picks it, as
+`enable_http2` offers it: h2 on a tokio runtime, +0.33 MB), `pkcs12`
+(`azuread` certificates in PKCS #12: p12-keystore, +0.46 MB), `yaml`
+(`encoding.from_yaml`: yaml-rust2), `decompression`
 (`loki.source.file`'s gzip, zlib, bzip2: pure Rust), `encodings`
 (its encodings other than UTF-8, UTF-16 and Latin-1, by WHATWG's
 labels: encoding_rs). A smaller build:
@@ -88,11 +93,11 @@ Alloy's syntax: blocks, attributes, references between components
 Alloy's standard library: `sys.env`, `convert.nonsensitive`,
 `string.*`, `encoding.*` (`from_yaml` with feature `yaml`),
 `array.concat`, `.combine_maps` (on targets that change too),
-`.group_by` (its groups sorted: Alloy's order is random),
+`.group_by` (its groups in random order, as Alloy's),
 `file.path_join`, `coalesce`, `json_path` (as ojg's jp: paths,
 wildcards, slices, unions, filters), and the deprecated names. Numbers
-keep their kind: `7 / 2` is `3`, `string.format("%f", 1.0)` is
-`1.000000`. Components:
+keep their kind (signed, unsigned from 2^63, float): `7 / 2` is `3`,
+`string.format("%f", 1.0)` is `1.000000`. Components:
 
 - `prometheus.exporter.unix`, `.self`, `.cadvisor` (raw cgroups too,
   by `raw_cgroup_prefix_allowlist`, unless `docker_only`), `.snmp`;
@@ -114,26 +119,31 @@ HTTP clients (scrapes, `remote_write` and `loki.write` endpoints)
 take Prometheus's client settings: `basic_auth`, `authorization`,
 `bearer_token[_file]`, `oauth2` (client credentials), `tls_config`,
 `proxy_url`, `no_proxy`, `proxy_from_environment`,
-`proxy_connect_header`, `http_headers`, `follow_redirects`, with
-Prometheus's checks; HTTP/1.1 only. `remote_write` endpoints also sign
-in to clouds: `sigv4` (keys from the config, the environment, the
-shared file, web identity, ECS, EC2; `role_arn`), `azuread` (managed
-or workload identity, client secret, the SDK's chain), `google_iam`
-(a credentials file or the default ones; feature `tls`). The unix
-exporter takes each collector's block, `cpu`'s info, flags and bugs
-included; `processes` and `systemd` are off unless enabled, as in
+`proxy_connect_header`, `http_headers`, `follow_redirects`,
+`enable_http2` (feature `http2`; else HTTP/1.1), with Prometheus's
+checks. `remote_write` endpoints also sign in to clouds: `sigv4` (the
+AWS SDK v2's chain: keys from the config or the environment, shared
+config and credentials files with profiles, `source_profile`, SSO,
+`credential_process`, web identity, ECS, EC2; `role_arn`), `azuread`
+(managed or workload identity, client secret, or azidentity's default
+chain: the environment's secret, certificate or password, workload
+and managed identity, Azure CLI, Azure Developer CLI, PowerShell),
+`google_iam` (a credentials file or the default ones; feature `tls`).
+The unix exporter takes each collector's block, `cpu`'s info, flags
+and bugs included; `processes` and `systemd` are off unless enabled, as in
 Alloy. Templates are Go's text/template with Promtail's functions and
-the string and number functions of sprig; an unknown function is refused when read.
+the string and number functions of sprig; an unknown function is
+refused when read.
 
-Honored as in Alloy: `max_samples_per_send`, `sample_age_limit`, the
-WAL's `max_keepalive_time` (how long unsent chunks wait on disk),
-`loki.write`'s `max_streams` and `max_backoff_retries` (0: forever),
-`refresh_interval` and `sync_period`. Settings for concurrency or
-memory only (queue shards and capacities, the WAL's truncation, cache
-sizes, `enable_http2`: HTTP/1.1 only) are checked for their type and
-have no effect. What it cannot do as Alloy would (another component,
-attribute or block, such as `loki.source.kafka`) is refused with its
-position in the file, never ignored. `logging`, `livedebugging` and
+Honored as in Alloy: all of `queue_config` (shards, `capacity`,
+`batch_send_deadline`, `max_samples_per_send`, `sample_age_limit`,
+the backoff), the `wal` block's truncation (of what waits on disk:
+chunks sent go at once), the relabel caches (`max_cache_size`,
+`cache_ttl`), `loki.write`'s `max_streams` and `max_backoff_retries`
+(0: forever), `refresh_interval` and `sync_period`. What it cannot do
+as Alloy would (another component, attribute or block, such as
+`loki.source.kafka`) is refused with its position in the file, never
+ignored. `logging`, `livedebugging` and
 `tracing` are accepted and ignored.
 
 ## Docker

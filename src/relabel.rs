@@ -4,6 +4,10 @@
 //! sources' relabel_rules).
 
 use regex_lite::Regex;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
@@ -157,6 +161,91 @@ fn set(labels: &mut Labels, name: &str, value: String) {
     }
 }
 
+/// A relabel component's results by the labels' hash, as Alloy keeps
+/// them: past `max` entries the least recently used goes; with a TTL
+/// instead, a scan every quarter of it drops entries unused that long.
+pub struct Cache {
+    max: usize,
+    ttl: Option<Duration>,
+    entries: HashMap<u64, Cached>,
+    /// Hashes by when they were last used, oldest first.
+    by_use: BTreeMap<u64, u64>,
+    tick: u64,
+    scanned: Instant,
+}
+
+struct Cached {
+    original: Labels,
+    /// None: dropped.
+    result: Option<Labels>,
+    tick: u64,
+    used: Instant,
+}
+
+impl Cache {
+    pub fn new(max: usize, ttl: Option<Duration>) -> Cache {
+        Cache {
+            max,
+            ttl,
+            entries: HashMap::new(),
+            by_use: BTreeMap::new(),
+            tick: 0,
+            scanned: Instant::now(),
+        }
+    }
+
+    /// `labels` relabeled by `rules`, None when dropped.
+    pub fn apply(&mut self, rules: &[Rule], labels: Labels) -> Option<Labels> {
+        self.scan();
+        let mut hasher = DefaultHasher::new();
+        labels.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.tick += 1;
+        if let Some(found) = self.entries.get_mut(&hash) {
+            // A different set with the same hash is relabeled anew.
+            if found.original == labels {
+                self.by_use.remove(&found.tick);
+                self.by_use.insert(self.tick, hash);
+                (found.tick, found.used) = (self.tick, Instant::now());
+                return found.result.clone();
+            }
+            self.by_use.remove(&found.tick);
+        }
+        let mut result = labels.clone();
+        let result = apply(rules, &mut result).then_some(result);
+        let entry = Cached {
+            original: labels,
+            result: result.clone(),
+            tick: self.tick,
+            used: Instant::now(),
+        };
+        self.entries.insert(hash, entry);
+        self.by_use.insert(self.tick, hash);
+        if self.ttl.is_none() && self.entries.len() > self.max {
+            if let Some((_, oldest)) = self.by_use.pop_first() {
+                self.entries.remove(&oldest);
+            }
+        }
+        result
+    }
+
+    fn scan(&mut self) {
+        let Some(ttl) = self.ttl else { return };
+        if self.scanned.elapsed() < ttl / 4 {
+            return;
+        }
+        self.scanned = Instant::now();
+        let by_use = &mut self.by_use;
+        self.entries.retain(|_, entry| {
+            let keep = entry.used.elapsed() < ttl;
+            if !keep {
+                by_use.remove(&entry.tick);
+            }
+            keep
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +269,26 @@ mod tests {
             settings.regex = regex.into();
         }
         Rule::new(settings).unwrap()
+    }
+
+    #[test]
+    fn caches_results() {
+        let rules = [rule("drop", "a", "", "x")];
+        let mut cache = Cache::new(2, None);
+        assert!(cache.apply(&rules, labels(&[("a", "x")])).is_none());
+        let kept = cache.apply(&rules, labels(&[("a", "y")]));
+        assert_eq!(kept, Some(labels(&[("a", "y")])));
+        assert!(cache.apply(&rules, labels(&[("a", "x")])).is_none());
+        cache.apply(&rules, labels(&[("a", "z")]));
+        assert_eq!(cache.entries.len(), 2);
+        // `y` was the least recently used.
+        let found: Vec<&Labels> =
+            cache.entries.values().map(|e| &e.original).collect();
+        assert!(!found.contains(&&labels(&[("a", "y")])));
+        let mut aged = Cache::new(0, Some(Duration::ZERO));
+        aged.apply(&rules, labels(&[("a", "y")]));
+        aged.apply(&rules, labels(&[("a", "z")]));
+        assert_eq!(aged.entries.len(), 1, "the scan dropped `y`");
     }
 
     #[test]

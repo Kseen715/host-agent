@@ -59,8 +59,11 @@ pub fn with<'a>(own: &[&'a str], client: &[&'a str]) -> Vec<&'a str> {
 
 /// The client `body` configures, with requests timed out at `timeout`.
 pub fn http(body: &Body, timeout: Duration) -> Result<Client, String> {
-    // HTTP/1.1 only: HTTP/2 changes how, not what, is sent.
-    body.bool_or("enable_http2", true)?;
+    // Without feature http2, HTTP/1.1: as Go's client to a server not
+    // offering h2.
+    let http2 = body.bool_or("enable_http2", true)?;
+    #[cfg(not(feature = "http2"))]
+    let _ = http2;
     let mut client = Client {
         timeout,
         headers: header_lines(body, "http_headers")?,
@@ -69,6 +72,8 @@ pub fn http(body: &Body, timeout: Duration) -> Result<Client, String> {
         proxy: proxy(body)?,
         #[cfg(feature = "tls")]
         tls: None,
+        #[cfg(feature = "http2")]
+        http2,
     };
     tls(body, &mut client)?;
     Ok(client)

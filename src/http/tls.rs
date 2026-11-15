@@ -40,6 +40,9 @@ pub struct Settings {
 #[derive(Clone)]
 pub struct Tls {
     config: Arc<ClientConfig>,
+    /// The same, offering h2 then http/1.1 by ALPN, as Go's client.
+    #[cfg(feature = "http2")]
+    alpn: Arc<ClientConfig>,
     server_name: Option<String>,
 }
 
@@ -90,8 +93,16 @@ impl Tls {
             }
             _ => builder.with_no_client_auth(),
         };
+        #[cfg(feature = "http2")]
+        let alpn = {
+            let mut alpn = config.clone();
+            alpn.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            alpn
+        };
         Ok(Tls {
             config: Arc::new(config),
+            #[cfg(feature = "http2")]
+            alpn: Arc::new(alpn),
             server_name: settings.server_name.clone(),
         })
     }
@@ -127,20 +138,38 @@ pub fn wrap(
     url: &Url,
     tls: Option<&Tls>,
 ) -> io::Result<Box<dyn Stream>> {
+    let tls = or_default(tls)?;
+    let connection =
+        ClientConnection::new(Arc::clone(&tls.config), server(url, tls)?)
+            .map_err(io::Error::other)?;
+    Ok(Box::new(StreamOwned::new(connection, stream)))
+}
+
+/// What a TLS connection to `url` offering h2 is made with.
+#[cfg(feature = "http2")]
+pub fn alpn(
+    url: &Url,
+    tls: Option<&Tls>,
+) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
+    let tls = or_default(tls)?;
+    Ok((Arc::clone(&tls.alpn), server(url, tls)?))
+}
+
+fn or_default(tls: Option<&Tls>) -> io::Result<&Tls> {
     static DEFAULT: OnceLock<Result<Tls, String>> = OnceLock::new();
-    let tls = match tls {
-        Some(tls) => tls,
+    match tls {
+        Some(tls) => Ok(tls),
         None => DEFAULT
             .get_or_init(|| Tls::new(&Settings::default()))
             .as_ref()
-            .map_err(|e| io::Error::other(e.clone()))?,
-    };
+            .map_err(|e| io::Error::other(e.clone())),
+    }
+}
+
+fn server(url: &Url, tls: &Tls) -> io::Result<ServerName<'static>> {
     let name = tls.server_name.as_deref().unwrap_or(&url.name);
-    let name = ServerName::try_from(name.to_owned())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let connection = ClientConnection::new(Arc::clone(&tls.config), name)
-        .map_err(io::Error::other)?;
-    Ok(Box::new(StreamOwned::new(connection, stream)))
+    ServerName::try_from(name.to_owned())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
 /// insecure_skip_verify: any certificate, signatures still checked.

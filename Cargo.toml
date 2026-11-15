@@ -45,20 +45,38 @@ tokio = ["snmp", "dep:tokio"]
 # tls_config): rustls on ring, +~0.9 MB; ring also signs google_iam's
 # service account tokens.
 tls = ["dep:rustls", "dep:ring"]
+# HTTP/2 over TLS where the server picks it by ALPN (enable_http2):
+# h2 on a tokio runtime per sending thread.
+http2 = [
+    "tls",
+    "dep:bytes",
+    "dep:h2",
+    "dep:http",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "tokio/io-util",
+]
 # encoding.from_yaml (yaml-rust2, pure Rust).
 yaml = ["dep:yaml-rust2"]
+# Azure certificates in PKCS #12 (p12-keystore, with x509-parser).
+pkcs12 = ["tls", "dep:p12-keystore"]
 
 [dependencies]
+bytes = { version = "1", optional = true }
 bzip2-rs = { version = "0.1", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true, default-features = false, features = [
     "rust_backend",
 ] }
+h2 = { version = "0.4", optional = true }
+hmac = { version = "0.13", default-features = false }
+http = { version = "1", optional = true }
 libc = "0.2"
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = [
     "safe-decode",
 ] }
 lzma-rs = { version = "0.3", optional = true }
+p12-keystore = { version = "0.4", optional = true }
 regex-lite = "0.1"
 ring = { version = "0.17", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = [
@@ -67,12 +85,16 @@ rustls = { version = "0.23", optional = true, default-features = false, features
     "tls12",
 ] }
 ruzstd = { version = "0.9", optional = true }
+sha1 = { version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+sha3 = { version = "0.11", default-features = false }
 snap = "1"
 tokio = { version = "1", optional = true, default-features = false, features = [
     "net",
     "rt",
     "time",
 ] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false }
 yaml-rust2 = { version = "0.13.0", default-features = false, optional = true }
 
 # Small and lean: an agent on every host, idle between rounds, so size

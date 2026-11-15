@@ -29,6 +29,8 @@ pub enum Kind {
     Bool(bool),
     /// A literal without a fraction or exponent, as Alloy's int.
     Int(i64),
+    /// Such a literal past int64, as Alloy's uint.
+    Uint(u64),
     Number(f64),
     Str(String),
     Array(Vec<Expr>),
@@ -70,6 +72,7 @@ pub fn parse(text: &str) -> Result<Vec<Stmt>, String> {
 enum Token {
     Ident(String),
     Int(i64),
+    Uint(u64),
     Number(f64),
     Str(String),
     Punct(&'static str),
@@ -81,6 +84,7 @@ impl fmt::Display for Token {
         match self {
             Token::Ident(name) => write!(f, "`{name}`"),
             Token::Int(n) => write!(f, "number {n}"),
+            Token::Uint(n) => write!(f, "number {n}"),
             Token::Number(n) => write!(f, "number {n}"),
             Token::Str(_) => write!(f, "a string"),
             Token::Punct(p) => write!(f, "`{p}`"),
@@ -229,14 +233,15 @@ impl Lexer {
             }
         }
         let clean = text.replace('_', "");
-        let int = match clean.strip_prefix("0x") {
-            Some(hex) => i64::from_str_radix(hex, 16).ok(),
-            None => clean.parse().ok(),
+        let (digits, radix) = match clean.strip_prefix("0x") {
+            Some(hex) => (hex, 16),
+            None => (clean.as_str(), 10),
         };
-        // shortcut: an integer past i64 is a float here, a uint in Alloy;
-        // add a uint kind if a config needs such numbers exact.
-        let value = int
+        // Alloy's order: int64, else uint64, else float64.
+        let value = i64::from_str_radix(digits, radix)
             .map(Token::Int)
+            .or_else(|_| u64::from_str_radix(digits, radix).map(Token::Uint))
+            .ok()
             .or_else(|| clean.parse().ok().map(Token::Number));
         value.ok_or_else(|| format!("bad number `{text}`"))
     }
@@ -435,6 +440,7 @@ impl Parser {
         let pos = self.pos();
         let kind = match self.next() {
             Token::Int(n) => Kind::Int(n),
+            Token::Uint(n) => Kind::Uint(n),
             Token::Number(n) => Kind::Number(n),
             Token::Str(s) => Kind::Str(s),
             Token::Ident(name) => match name.as_str() {

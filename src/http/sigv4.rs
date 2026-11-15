@@ -1,9 +1,11 @@
-//! AWS Signature Version 4, as Prometheus's sigv4 signs remote writes:
-//! keys from the configuration, else the SDK's chain (environment,
-//! shared credentials file, web identity, ECS, EC2's metadata), maybe
-//! swapped for a role's through STS AssumeRole.
+//! AWS Signature Version 4, as Prometheus's sigv4 (AWS SDK v2) signs
+//! remote writes: keys from the configuration, else the SDK's chain
+//! (environment, web identity, the shared profile with its source
+//! profiles, roles, SSO and credential_process, ECS, EC2's metadata),
+//! maybe swapped for a role's through STS AssumeRole.
 
 use super::auth::{Expiring, Request};
+use super::aws_profile::{self, Profile};
 use super::{Client, Url};
 use crate::digest::{hex, hmac_sha256, sha256};
 use crate::encoding::{query_escape, unescape, uri_escape};
@@ -12,11 +14,26 @@ use crate::time;
 use std::env;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Keys are asked for again this long before they expire.
-const EARLY: Duration = Duration::from_secs(300);
+/// Keys are asked for again this long before they expire, as
+/// sigv4's credentials cache (without its jitter).
+const EARLY: Duration = Duration::from_secs(30);
+/// AssumeRole's DurationSeconds unless a profile asks for more.
+pub const ROLE_SECONDS: u64 = 15 * 60;
+/// Headers left unsigned: the SDK's IgnoredHeaders, sigv4's denylist,
+/// and content-length, signed from the body instead.
+const UNSIGNED: [&str; 7] = [
+    "authorization",
+    "user-agent",
+    "x-amzn-trace-id",
+    "expect",
+    "transfer-encoding",
+    "uber-trace-id",
+    "content-length",
+];
 /// Metadata servers answer at once or are not there.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(1);
 const STS_VERSION: &str = "2011-06-15";
@@ -33,6 +50,7 @@ pub struct Role {
     pub external_id: String,
     pub session_name: String,
     pub tags: Vec<(String, String)>,
+    pub duration_s: u64,
 }
 
 /// What the configuration says; empty strings are unset.
@@ -49,35 +67,51 @@ pub struct Settings {
 
 pub struct SigV4 {
     settings: Settings,
+    /// The shared profile, if the files have it.
+    profile: Option<Profile>,
+    /// Whether the configuration named the profile: then it is used
+    /// before the environment's keys.
+    explicit: bool,
     kept: Mutex<Option<Expiring<Keys>>>,
 }
 
 impl SigV4 {
-    /// Refused as Prometheus refuses it: without a region, or when no
-    /// keys can be found now.
+    /// Refused as Prometheus refuses it: when the shared files cannot
+    /// be used, no keys can be found now, or there is no region.
     pub fn new(mut settings: Settings) -> Result<SigV4, String> {
-        if settings.profile.is_empty() {
-            settings.profile =
-                env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
+        let explicit = !settings.profile.is_empty();
+        if !explicit {
+            let named = ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"]
+                .iter()
+                .find_map(|n| env::var(n).ok().filter(|v| !v.is_empty()));
+            settings.profile = named.unwrap_or_else(|| "default".into());
         }
+        let profile = aws_profile::load(&settings.profile)
+            .map_err(|e| format!("could not create new AWS session: {e}"))?;
         if settings.region.is_empty() {
-            settings.region = region(&settings.profile);
-        }
-        if settings.region.is_empty() {
-            return Err("region not configured in sigv4 or in default \
-                credentials chain"
-                .into());
+            let from_env = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+                .iter()
+                .find_map(|n| env::var(n).ok().filter(|v| !v.is_empty()));
+            let shared = profile.as_ref().map(|p| p.region.clone());
+            settings.region = from_env.or(shared).unwrap_or_default();
         }
         if settings.service.is_empty() {
             settings.service = "aps".into();
         }
         let sigv4 = SigV4 {
             settings,
+            profile,
+            explicit,
             kept: Mutex::new(None),
         };
         sigv4
             .base()
             .map_err(|e| format!("could not get SigV4 credentials: {e}"))?;
+        if sigv4.settings.region.is_empty() {
+            return Err("region not configured in sigv4 or in default \
+                credentials chain"
+                .into());
+        }
         Ok(sigv4)
     }
 
@@ -105,26 +139,126 @@ impl SigV4 {
         Ok(fresh.0)
     }
 
+    /// The SDK's resolveCredentialChain.
     fn base(&self) -> io::Result<Expiring<Keys>> {
         if let Some(keys) = &self.settings.keys {
             return Ok((keys.clone(), None));
         }
-        if let Some(keys) = from_env().or_else(|| from_file(self.profile())) {
-            return Ok((keys, None));
+        if !self.explicit {
+            if let Some(keys) = from_env() {
+                return Ok((keys, None));
+            }
+            let file = env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok();
+            if let Some(file) = file.filter(|f| !f.is_empty()) {
+                let var = |n| env::var(n).unwrap_or_default();
+                let (arn, name) =
+                    (var("AWS_ROLE_ARN"), var("AWS_ROLE_SESSION_NAME"));
+                return self.web_identity(&file, &arn, &name);
+            }
         }
-        let web = ["AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN"];
-        if let [Ok(file), Ok(arn)] = web.map(env::var) {
-            return self.web_identity(&file, &arn);
-        }
-        if let Some((url, header)) = container_url() {
-            let headers = format!("Accept: application/json\r\n{header}");
-            return metadata_keys(&url, &self.metadata_client(), &headers);
-        }
-        self.ec2()
+        self.profile_keys(self.profile.as_ref())
     }
 
-    fn profile(&self) -> &str {
-        &self.settings.profile
+    /// The SDK's resolveCredsFromProfile: the first source the profile
+    /// names, then its role if it has one.
+    fn profile_keys(
+        &self,
+        profile: Option<&Profile>,
+    ) -> io::Result<Expiring<Keys>> {
+        let Some(p) = profile else {
+            return self.container_or_ec2();
+        };
+        let base = if let Some(source) = &p.source {
+            self.profile_keys(Some(source))?
+        } else if let Some(keys) = &p.keys {
+            (keys.clone(), None)
+        } else if !p.credential_source.is_empty() {
+            self.named_source(&p.credential_source)?
+        } else if !p.web_identity_file.is_empty() {
+            let (file, arn) = (&p.web_identity_file, &p.role_arn);
+            return self.web_identity(file, arn, &p.session_name);
+        } else if p.sso.configured() {
+            aws_profile::sso_keys(&p.sso, &self.settings.client)?
+        } else if !p.credential_process.is_empty() {
+            aws_profile::process_keys(&p.credential_process)?
+        } else {
+            self.container_or_ec2()?
+        };
+        if p.role_arn.is_empty() {
+            return Ok(base);
+        }
+        let role = Role {
+            arn: p.role_arn.clone(),
+            external_id: p.external_id.clone(),
+            session_name: p.session_name.clone(),
+            tags: Vec::new(),
+            // As the SDK: a duration of 15 minutes or less is ignored.
+            duration_s: p
+                .duration_s
+                .filter(|s| s / 60 > 15)
+                .unwrap_or(ROLE_SECONDS),
+        };
+        self.assume(&role, &base.0)
+    }
+
+    /// credential_source: Environment, Ec2InstanceMetadata or
+    /// EcsContainer, checked when the profile was read.
+    fn named_source(&self, source: &str) -> io::Result<Expiring<Keys>> {
+        match source {
+            "Environment" => {
+                from_env().map(|keys| (keys, None)).ok_or_else(|| {
+                    io::Error::other("static credentials are empty")
+                })
+            }
+            "Ec2InstanceMetadata" => self.ec2(),
+            _ => self.container().unwrap_or_else(|| {
+                Err(io::Error::other(
+                    "EcsContainer was specified as the credential_source, \
+                     but neither 'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI' or \
+                     AWS_CONTAINER_CREDENTIALS_FULL_URI' was set",
+                ))
+            }),
+        }
+    }
+
+    fn container_or_ec2(&self) -> io::Result<Expiring<Keys>> {
+        self.container().unwrap_or_else(|| self.ec2())
+    }
+
+    /// ECS's or EKS's credentials endpoint, if the environment names
+    /// one; a full URI over plain HTTP only to loopback or their hosts.
+    fn container(&self) -> Option<io::Result<Expiring<Keys>>> {
+        let var = |name| env::var(name).ok().filter(|v: &String| !v.is_empty());
+        let url = match var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+            Some(path) => format!("http://169.254.170.2{path}"),
+            None => var("AWS_CONTAINER_CREDENTIALS_FULL_URI")?,
+        };
+        let token = match var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+            Some(file) => fs::read_to_string(&file).map_err(|e| {
+                io::Error::other(format!(
+                    "failed to read authorization token from {file}: {e}"
+                ))
+            }),
+            None => {
+                Ok(var("AWS_CONTAINER_AUTHORIZATION_TOKEN").unwrap_or_default())
+            }
+        };
+        Some(token.and_then(|token| {
+            let url = parse(&url)?;
+            if !url.tls && !allowed_host(&url.name) {
+                let message = format!(
+                    "invalid endpoint host, {:?}, only loopback/ecs/eks \
+                     hosts are allowed",
+                    url.host
+                );
+                return Err(io::Error::other(message));
+            }
+            let mut headers = "Accept: application/json\r\n".to_owned();
+            if !token.is_empty() {
+                headers.push_str(&format!("Authorization: {token}\r\n"));
+            }
+            metadata_keys(&url, &self.metadata_client(), &headers)
+        }))
     }
 
     fn metadata_client(&self) -> Client {
@@ -159,10 +293,17 @@ impl SigV4 {
         &self,
         file: &str,
         arn: &str,
+        session: &str,
     ) -> io::Result<Expiring<Keys>> {
-        let token = fs::read_to_string(file)?;
-        let session = env::var("AWS_ROLE_SESSION_NAME")
-            .unwrap_or_else(|_| session_name());
+        let token = fs::read_to_string(file).map_err(|e| {
+            io::Error::other(format!(
+                "failed to retrieve jwt from provide source, {e}"
+            ))
+        })?;
+        let session = match session {
+            "" => time::now_ns().to_string(),
+            name => name.to_owned(),
+        };
         let query = [
             ("Action", "AssumeRoleWithWebIdentity"),
             ("RoleArn", arn),
@@ -174,13 +315,14 @@ impl SigV4 {
 
     fn assume(&self, role: &Role, base: &Keys) -> io::Result<Expiring<Keys>> {
         let session = match role.session_name.as_str() {
-            "" => session_name(),
+            "" => format!("aws-go-sdk-{}", time::now_ns()),
             name => name.to_owned(),
         };
         let mut form = vec![
             ("Action".to_owned(), "AssumeRole".to_owned()),
             ("RoleArn".into(), role.arn.clone()),
             ("RoleSessionName".into(), session),
+            ("DurationSeconds".into(), role.duration_s.to_string()),
         ];
         if !role.external_id.is_empty() {
             form.push(("ExternalId".into(), role.external_id.clone()));
@@ -199,6 +341,10 @@ impl SigV4 {
         signer: Option<&Keys>,
     ) -> io::Result<Expiring<Keys>> {
         let region = &self.settings.region;
+        if region.is_empty() {
+            let message = "Invalid Configuration: Missing Region";
+            return Err(io::Error::other(message));
+        }
         let host = match self.settings.fips {
             true => "sts-fips",
             false => "sts",
@@ -247,11 +393,6 @@ fn parse(url: &str) -> io::Result<Url> {
     Url::parse(url).ok_or_else(|| io::Error::other(format!("url `{url}`")))
 }
 
-/// The v1 SDK's default session name: the time in nanoseconds.
-fn session_name() -> String {
-    time::now_ns().to_string()
-}
-
 fn from_env() -> Option<Keys> {
     let first = |names: &[&str]| {
         names
@@ -263,83 +404,6 @@ fn from_env() -> Option<Keys> {
         secret: first(&["AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY"])?,
         token: first(&["AWS_SESSION_TOKEN"]).unwrap_or_default(),
     })
-}
-
-/// The shared credentials file's keys for `profile`.
-// shortcut: profiles that name a role, SSO or a credential_process
-// are not followed; add them when a host here uses one.
-fn from_file(profile: &str) -> Option<Keys> {
-    let path = shared_file("AWS_SHARED_CREDENTIALS_FILE", "credentials")?;
-    let section = ini(&fs::read_to_string(path).ok()?, profile);
-    let get = |key: &str| {
-        let found = section.iter().find(|(k, _)| k == key);
-        found.map(|(_, v)| v.clone())
-    };
-    let id = get("aws_access_key_id").filter(|v| !v.is_empty())?;
-    Some(Keys {
-        id,
-        secret: get("aws_secret_access_key")?,
-        token: get("aws_session_token").unwrap_or_default(),
-    })
-}
-
-/// The region from the environment, else the shared config file.
-fn region(profile: &str) -> String {
-    let from_env = ["AWS_REGION", "AWS_DEFAULT_REGION"]
-        .iter()
-        .find_map(|n| env::var(n).ok().filter(|v| !v.is_empty()));
-    if let Some(region) = from_env {
-        return region;
-    }
-    let section = match profile {
-        "default" => "default".to_owned(),
-        name => format!("profile {name}"),
-    };
-    let text = shared_file("AWS_CONFIG_FILE", "config")
-        .and_then(|path| fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    let found = ini(&text, &section)
-        .into_iter()
-        .find(|(k, _)| k == "region");
-    found.map(|(_, v)| v).unwrap_or_default()
-}
-
-fn shared_file(variable: &str, name: &str) -> Option<String> {
-    env::var(variable).ok().or_else(|| {
-        let home = env::var("HOME").ok()?;
-        Some(format!("{home}/.aws/{name}"))
-    })
-}
-
-/// The `key = value` lines of an INI file's `[section]`.
-fn ini(text: &str, section: &str) -> Vec<(String, String)> {
-    let mut inside = false;
-    let mut found = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.starts_with(['#', ';']) || line.is_empty() {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix('[') {
-            inside = name.trim_end_matches(']').trim() == section;
-        } else if let Some((key, value)) =
-            line.split_once('=').filter(|_| inside)
-        {
-            found.push((key.trim().to_owned(), value.trim().to_owned()));
-        }
-    }
-    found
-}
-
-/// ECS's credentials endpoint, and the header its token goes in.
-fn container_url() -> Option<(Url, String)> {
-    let header = env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN")
-        .map(|token| format!("Authorization: {token}\r\n"))
-        .unwrap_or_default();
-    let url = match env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
-        Ok(path) => format!("http://169.254.170.2{path}"),
-        Err(_) => env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").ok()?,
-    };
-    Some((Url::parse(&url)?, header))
 }
 
 /// Keys as ECS and EC2 give them: AccessKeyId, SecretAccessKey, Token,
@@ -381,16 +445,37 @@ fn sts_keys(xml: &str) -> io::Result<Expiring<Keys>> {
     Ok((keys, expiry(&tag("Expiration").unwrap_or_default())))
 }
 
+/// Whether a plain-HTTP container endpoint may be used: loopback, or
+/// ECS's or EKS's address, every address a name has.
+fn allowed_host(host: &str) -> bool {
+    let allowed = |ip: IpAddr| {
+        ip.is_loopback()
+            || ip == IpAddr::from([169, 254, 170, 2])
+            || ip == IpAddr::from([169, 254, 170, 23])
+            || ip == IpAddr::from([0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x23])
+    };
+    if let Ok(ip) = host.parse() {
+        return allowed(ip);
+    }
+    match (host, 0).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+            !ips.is_empty() && ips.into_iter().all(allowed)
+        }
+        Err(_) => false,
+    }
+}
+
 /// An RFC 3339 expiry as an instant.
-fn expiry(text: &str) -> Option<Instant> {
+pub fn expiry(text: &str) -> Option<Instant> {
     let at_ns = time::parse_rfc3339(text)?;
     let left = (at_ns - time::now_ns()).max(0) as u64;
     Some(Instant::now() + Duration::from_nanos(left))
 }
 
 /// The header lines that sign `request` at `now_s`: AWS's canonical
-/// request over every header but Authorization and User-Agent, the
-/// path cleaned as Prometheus cleans it.
+/// request over every header but the UNSIGNED ones, the path cleaned
+/// as Prometheus cleans it, then escaped again as the SDK's signer does.
 fn signed(
     keys: &Keys,
     region: &str,
@@ -428,39 +513,46 @@ fn signed(
 /// The canonical request and its signed headers' names.
 fn canonical(request: &Request, lines: &str) -> (String, String) {
     let mut headers = vec![("host".to_owned(), request.url.host.clone())];
+    if !request.body.is_empty() {
+        let length = request.body.len().to_string();
+        headers.push(("content-length".to_owned(), length));
+    }
     for line in lines.split("\r\n") {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if matches!(name.as_str(), "authorization" | "user-agent") {
+        if UNSIGNED.contains(&name.as_str()) {
             continue;
         }
         let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        headers.push((name, value));
+        // A repeated header is signed once, its values joined by commas.
+        match headers.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, values)) => *values = format!("{values},{value}"),
+            None => headers.push((name, value)),
+        }
     }
     headers.sort();
     let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
     let block: String =
         headers.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
-    let (path, query) = request
-        .url
-        .path
-        .split_once('?')
-        .unwrap_or((&request.url.path, ""));
-    let uri: String = crate::glob::clean(path)
-        .split('/')
-        .map(uri_escape)
-        .collect::<Vec<_>>()
-        .join("/");
+    let path = &request.url.path;
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let canonical = format!(
-        "{}\n{uri}\n{}\n{block}\n{}\n{}",
+        "{}\n{}\n{}\n{block}\n{}\n{}",
         request.method,
+        canonical_uri(path),
         canonical_query(query),
         names.join(";"),
         hex(&sha256(request.body)),
     );
     (canonical, names.join(";"))
+}
+
+fn canonical_uri(path: &str) -> String {
+    let parts = crate::glob::clean(path);
+    let parts: Vec<String> = parts.split('/').map(uri_escape).collect();
+    parts.join("/")
 }
 
 fn canonical_query(query: &str) -> String {
@@ -510,7 +602,14 @@ mod tests {
         assert!(lines.ends_with(
             "Signature=b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500\r\n"
         ));
-        let text = "[default]\nregion = x\n[profile p]\n; c\nregion = eu\n";
-        assert_eq!(ini(text, "profile p"), [("region".into(), "eu".into())]);
+        let posted = Request {
+            method: "POST",
+            headers: "X-A: 1\r\nX-A: 2\r\nUser-Agent: u\r\n",
+            body: b"data",
+            ..request
+        };
+        let lines = signed(&keys, "r", "s", &posted, 0);
+        let names = "SignedHeaders=content-length;host;x-a;x-amz-date,";
+        assert!(lines.contains(names), "{lines}");
     }
 }

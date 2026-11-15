@@ -8,6 +8,7 @@ use crate::encoding;
 use crate::json::Json;
 use crate::targets::{Targets, combine};
 use crate::template::{Val, printf};
+use std::collections::HashMap;
 
 /// The deprecated names and the functions they stand for.
 const DEPRECATED: [(&str, &str); 16] = [
@@ -125,6 +126,7 @@ fn format(args: &[Value]) -> Result<Value, String> {
             Ok(match value {
                 Value::String(s) => Val::Str(s.clone()),
                 Value::Int(n) => Val::Int(*n),
+                Value::Uint(n) => Val::Uint(*n),
                 Value::Number(n) => Val::Float(*n),
                 Value::Bool(b) => Val::Bool(*b),
                 Value::Null => Val::Str("<nil>".into()),
@@ -146,6 +148,7 @@ fn join(args: &[Value]) -> Result<Value, String> {
         .map(|item| match item {
             Value::String(s) => Ok(s.clone()),
             Value::Int(n) => Ok(n.to_string()),
+            Value::Uint(n) => Ok(n.to_string()),
             Value::Number(n) => Ok(Val::Float(*n).text()),
             other => Err(format!("cannot join a {}", other.kind())),
         })
@@ -275,6 +278,7 @@ fn json_of(value: &Value) -> Result<Json, String> {
         Value::Null => Json::Null,
         Value::Bool(b) => Json::Bool(*b),
         Value::Int(n) => Json::Num(*n as f64),
+        Value::Uint(n) => Json::Num(*n as f64),
         Value::Number(n) => Json::Num(*n),
         Value::String(s) => Json::Str(s.clone()),
         Value::Array(items) => {
@@ -386,7 +390,8 @@ fn group_by(args: &[Value]) -> Result<Value, String> {
     let [array, Value::String(key), Value::Bool(drop)] = args else {
         return Err("takes an array, a string and a bool".into());
     };
-    let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+    // A hash map: its order is random, as Go's map that Alloy ranges.
+    let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
     for item in objects(array)? {
         let name = match item.iter().find(|(k, _)| k == key) {
             Some((_, Value::String(name))) => name.clone(),
@@ -396,13 +401,8 @@ fn group_by(args: &[Value]) -> Result<Value, String> {
             None if *drop => continue,
             None => String::new(),
         };
-        let item = Value::Object(item);
-        match groups.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, items)) => items.push(item),
-            None => groups.push((name, vec![item])),
-        }
+        groups.entry(name).or_default().push(Value::Object(item));
     }
-    groups.sort_by(|a, b| a.0.cmp(&b.0));
     let grouped = groups.into_iter().map(|(name, items)| {
         let mut fields = vec![("items".to_owned(), Value::Array(items))];
         if key != "items" {
@@ -422,6 +422,7 @@ fn coalesce(args: Vec<Value>) -> Value {
         Value::Null => true,
         Value::Bool(b) => !b,
         Value::Int(n) => *n == 0,
+        Value::Uint(n) => *n == 0,
         Value::Number(n) => *n == 0.0,
         Value::String(s) => s.is_empty(),
         Value::Array(a) => a.is_empty(),
@@ -518,17 +519,19 @@ mod tests {
         assert_eq!(json(found), r#"{"a":[1,2.5,"x"],"b":{"3":null,"c":true}}"#);
     }
 
+    fn map(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(
+            pairs.iter().map(|(k, v)| (k.to_string(), s(v))).collect(),
+        )
+    }
+
+    fn ips() -> Value {
+        Value::Array(vec![map(&[("ip", "1"), ("a", "x")]), map(&[("ip", "2")])])
+    }
+
     #[test]
-    fn combines_and_groups_maps() {
-        let map = |pairs: &[(&str, &str)]| {
-            Value::Object(
-                pairs.iter().map(|(k, v)| (k.to_string(), s(v))).collect(),
-            )
-        };
-        let left = Value::Array(vec![
-            map(&[("ip", "1"), ("a", "x")]),
-            map(&[("ip", "2")]),
-        ]);
+    fn combines_maps() {
+        let left = ips();
         let right = Value::Array(vec![map(&[("ip", "1"), ("a", "y")])]);
         let on = Value::Array(vec![s("ip")]);
         let args =
@@ -540,19 +543,27 @@ mod tests {
         assert!(
             call(
                 "array.combine_maps",
-                vec![left.clone(), right, Value::Array(vec![])]
+                vec![left, right, Value::Array(vec![])]
             )
             .is_err()
         );
-        let grouped =
-            call("array.group_by", vec![left, s("a"), Value::Bool(false)])
-                .unwrap();
+    }
+
+    #[test]
+    fn groups_maps() {
+        let args = vec![ips(), s("a"), Value::Bool(false)];
+        let grouped = call("array.group_by", args).unwrap();
+        let Value::Array(groups) = grouped else {
+            panic!("not an array");
+        };
+        let mut groups: Vec<String> = groups.into_iter().map(json).collect();
+        groups.sort();
         assert_eq!(
-            json(grouped),
-            concat!(
-                r#"[{"a":"","items":[{"ip":"2"}]},"#,
-                r#"{"a":"x","items":[{"a":"x","ip":"1"}]}]"#,
-            )
+            groups,
+            [
+                r#"{"a":"","items":[{"ip":"2"}]}"#,
+                r#"{"a":"x","items":[{"a":"x","ip":"1"}]}"#,
+            ]
         );
     }
 }

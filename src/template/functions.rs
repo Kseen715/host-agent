@@ -12,6 +12,8 @@ use regex_lite::{NoExpand, Regex};
 pub enum Val {
     Str(String),
     Int(i64),
+    /// Only from Alloy's string.format: a uint past int64.
+    Uint(u64),
     Float(f64),
     Bool(bool),
     /// A field the entry lacks.
@@ -101,6 +103,7 @@ impl Val {
         match self {
             Val::Str(text) => text.clone(),
             Val::Int(int) => int.to_string(),
+            Val::Uint(uint) => uint.to_string(),
             Val::Float(float) => go_float(*float),
             Val::Bool(bool) => bool.to_string(),
             Val::Nil => "<no value>".into(),
@@ -112,6 +115,7 @@ impl Val {
         match self {
             Val::Str(text) => !text.is_empty(),
             Val::Int(int) => *int != 0,
+            Val::Uint(uint) => *uint != 0,
             Val::Float(float) => *float != 0.0,
             Val::Bool(bool) => *bool,
             Val::Nil => false,
@@ -122,6 +126,7 @@ impl Val {
         match self {
             Val::Str(_) => "string",
             Val::Int(_) => "int",
+            Val::Uint(_) => "uint64",
             Val::Float(_) => "float64",
             Val::Bool(_) => "bool",
             Val::Nil => "nil",
@@ -165,6 +170,7 @@ fn int(value: &Val) -> Result<i64, String> {
 fn to_int(value: &Val) -> i64 {
     match value {
         Val::Int(int) => *int,
+        Val::Uint(uint) => *uint as i64,
         Val::Float(float) => *float as i64,
         Val::Bool(bool) => i64::from(*bool),
         Val::Str(text) => text.trim().parse().unwrap_or(0),
@@ -430,17 +436,10 @@ fn verb_text(verb: char, spec: &str, value: &Val) -> String {
     let zero =
         spec.starts_with('0') || spec.contains("+0") || spec.contains("-0");
     let plus = spec.contains('+');
-    let (width, precision) = match spec
-        .trim_start_matches(['-', '+', '0', ' ', '#'])
-        .split_once('.')
-    {
+    let digits = spec.trim_start_matches(['-', '+', '0', ' ', '#']);
+    let (width, precision) = match digits.split_once('.') {
         Some((w, p)) => (w.parse().ok(), Some(p.parse().unwrap_or(0))),
-        None => (
-            spec.trim_start_matches(['-', '+', '0', ' ', '#'])
-                .parse()
-                .ok(),
-            None,
-        ),
+        None => (digits.parse().ok(), None),
     };
     let body = match (verb, value) {
         ('s' | 'v', Val::Str(s)) => match precision {
@@ -450,10 +449,14 @@ fn verb_text(verb: char, spec: &str, value: &Val) -> String {
         ('v', other) => other.text(),
         ('d', Val::Int(i)) if plus && *i >= 0 => format!("+{i}"),
         ('d', Val::Int(i)) => i.to_string(),
+        ('d', Val::Uint(u)) if plus => format!("+{u}"),
+        ('d', Val::Uint(u)) => u.to_string(),
         ('f' | 'F', Val::Float(f)) => format!("{f:.*}", precision.unwrap_or(6)),
         ('f' | 'F', Val::Int(i)) => return format!("%!f(int={i})"),
         ('x', Val::Int(i)) => format!("{i:x}"),
         ('X', Val::Int(i)) => format!("{i:X}"),
+        ('x', Val::Uint(u)) => format!("{u:x}"),
+        ('X', Val::Uint(u)) => format!("{u:X}"),
         ('x', Val::Str(s)) => hex(s.as_bytes()),
         ('t', Val::Bool(b)) => b.to_string(),
         ('q', Val::Str(s)) => go_quote(s, '"'),

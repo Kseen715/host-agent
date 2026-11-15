@@ -1,8 +1,8 @@
 //! One thread around poll(2): log sources are read as lines arrive and
 //! sent within a second; each prometheus.scrape scrapes its targets
 //! every scrape_interval (SNMP devices are polled apart: crate::snmp).
-//! Nothing is buffered beyond one log batch per Loki and one metrics
-//! chunk per remote write.
+//! Nothing is buffered beyond one log batch per Loki and each remote
+//! write's queue, whose shards' threads post the metrics.
 
 use crate::alloy::syntax::Stmt;
 use crate::alloy::{self, Exporter, Plan, ScrapeJob};
@@ -118,7 +118,6 @@ impl Agent {
             self.scrape(index, &docker);
         }
         self.writer.end_target();
-        self.writer.flush();
         docker
     }
 
@@ -233,8 +232,7 @@ impl Agent {
         let mut next_files = Instant::now();
         while !STOP.load(Ordering::Relaxed) {
             if RELOAD.swap(false, Ordering::Relaxed) {
-                self.flush_logs(true);
-                return Ended::Reload;
+                return self.end(Ended::Reload);
             }
             let now = Instant::now();
             if now >= next_follow || self.scrapes.iter().any(|s| s.1 <= now) {
@@ -245,10 +243,12 @@ impl Agent {
             for part in &mut self.parts {
                 part.prepare(&self.positions);
             }
-            let next_scrape = self.scrapes.iter().map(|s| s.1).min();
-            let wake = [next_scrape, Some(next_follow), Some(next_files)];
-            let wake = wake.into_iter().chain([self.logs.due_at()]);
-            self.poll_sources(wake.flatten().min().unwrap_or(next_follow));
+            let next = [Some(next_follow), Some(next_files)];
+            let wake = next.into_iter().chain(self.due()).flatten().min();
+            self.poll_sources(wake.unwrap_or(next_follow));
+            // Each turn, at least every FILES_EVERY: the senders' results
+            // and retries are looked at here.
+            self.writer.tick();
 
             if Instant::now() >= next_files {
                 self.read_files();
@@ -258,8 +258,20 @@ impl Agent {
                 self.flush_logs(false);
             }
         }
+        self.end(Ended::Stop)
+    }
+
+    /// When the next scrape, log batch or metrics batch is due.
+    fn due(&self) -> [Option<Instant>; 3] {
+        let next_scrape = self.scrapes.iter().map(|s| s.1).min();
+        [next_scrape, self.logs.due_at(), self.writer.due()]
+    }
+
+    /// The last sends before the agent ends, positions saved.
+    fn end(&mut self, ended: Ended) -> Ended {
+        self.writer.close();
         self.flush_logs(true);
-        Ended::Stop
+        ended
     }
 
     /// Opens or closes log sources for the containers and files now.
@@ -532,8 +544,13 @@ fn keep_in_spools(
     for sink in &mut plan.metrics.sinks {
         let dir =
             storage.join(format!("prometheus.remote_write.{}", sink.name));
-        let spool = Spool::open(dir.clone(), SPOOL_MAX, sink.max_age)
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        let spool = Spool::open(
+            dir.clone(),
+            SPOOL_MAX,
+            sink.age_limit,
+            sink.truncation,
+        )
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
         sink.keep_in(spool);
     }
     Ok(())
@@ -552,7 +569,7 @@ impl Own {
     fn of(writer: &Writer, logs: &Logs, loaded: bool) -> Own {
         let remotes = writer.metrics.sinks.iter();
         let remotes =
-            remotes.map(|r| (r.name.clone(), r.url_text.clone(), r.stats));
+            remotes.map(|r| (r.name.clone(), r.url_text.clone(), r.stats()));
         let lokis = logs
             .sinks
             .iter()
@@ -621,6 +638,11 @@ fn remote_metrics(w: &mut Writer, name: &str, url: &str, stats: &Stats) {
             &remote[..],
             stats.newest_sent,
         ),
+        ("shards", &remote[..], stats.shards),
+        ("shards_desired", &remote[..], stats.shards_desired),
+        ("shards_min", &remote[..], stats.shards_min),
+        ("shards_max", &remote[..], stats.shards_max),
+        ("shard_capacity", &remote[..], stats.shard_capacity),
     ];
     for (metric, labels, value) in values {
         w.add(&format!("{prefix}{metric}"), labels, value);

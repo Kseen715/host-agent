@@ -49,6 +49,7 @@ mod node;
 mod otlp;
 mod parts;
 mod process;
+mod queue;
 mod relabel;
 mod remote;
 mod scrape;

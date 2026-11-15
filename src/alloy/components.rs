@@ -12,8 +12,10 @@ use crate::files::{Compression, Files, Reading};
 use crate::http::Retry;
 use crate::logs::{self, Source};
 use crate::loki::Loki;
-use crate::relabel::Labels;
+use crate::queue;
+use crate::relabel::{self, Labels};
 use crate::remote::{self, RemoteWrite};
+use crate::spool::Truncation;
 use crate::targets::{self, Targets};
 use std::rc::Rc;
 use std::time::Duration;
@@ -97,28 +99,37 @@ fn receiver(capsule: Capsule) -> Value {
     export(vec![("receiver", Value::Capsule(capsule))])
 }
 
-/// The `wal` block's max_keepalive_time, when set: the spool's age.
-fn keepalive(body: &Body) -> Result<Option<Duration>, String> {
+/// The `wal` block's truncation, as Alloy checks it.
+fn wal(body: &Body) -> Result<Truncation, String> {
     let Some(wal) = body.block("wal") else {
-        return Ok(None);
+        return Ok(Truncation::default());
     };
-    let attrs = [
-        "truncate_frequency",
-        "min_keepalive_time",
-        "max_keepalive_time",
-    ];
-    wal.check(&attrs, &[])?;
-    // A spool, not a WAL: chunks go once sent, nothing to truncate.
-    wal.tuning(&attrs[..2], &[])?;
-    match wal.value("max_keepalive_time")? {
-        Some(_) => Ok(Some(wal.duration_or("max_keepalive_time", "8h")?)),
-        None => Ok(None),
-    }
+    wal.check(
+        &[
+            "truncate_frequency",
+            "min_keepalive_time",
+            "max_keepalive_time",
+        ],
+        &[],
+    )?;
+    let truncation = Truncation {
+        every: wal.duration_or("truncate_frequency", "2h")?,
+        min_keep: wal.duration_or("min_keepalive_time", "5m")?,
+        max_keep: wal.duration_or("max_keepalive_time", "8h")?,
+    };
+    let message = if truncation.every.is_zero() {
+        "truncate_frequency must not be 0"
+    } else if truncation.max_keep <= truncation.min_keep {
+        "min_keepalive_time must be smaller than max_keepalive_time"
+    } else {
+        return Ok(truncation);
+    };
+    Err(wal.error(wal.block.pos, message))
 }
 
 fn remote_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["external_labels"], &["endpoint", "wal"])?;
-    let keepalive = keepalive(body)?;
+    let truncation = wal(body)?;
     let external = body.labels("external_labels")?;
     let mut writes = Vec::new();
     for (index, endpoint) in body.blocks("endpoint").enumerate() {
@@ -128,7 +139,7 @@ fn remote_write(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         }
         let mut sink =
             remote_endpoint(&endpoint, &name, external.clone(), plan)?;
-        sink.max_age = sink.max_age.min(keepalive.unwrap_or(sink.max_age));
+        sink.truncation = truncation;
         plan.metrics.sinks.push(sink);
         let kind = remote::Kind::Write(plan.metrics.sinks.len() - 1);
         let mut node = metrics_at(plan, kind, Rc::from([]));
@@ -208,23 +219,22 @@ fn remote_endpoint(
     Ok(sink)
 }
 
-/// queue_config: the backoff, retries on 429, samples per request and
-/// their age limit apply. batch_send_deadline holds: each round is sent
-/// as it ends. The shards and their capacity are Prometheus's way to
-/// send in parallel; this agent sends in turn (README).
+const QUEUE_ATTRS: [&str; 9] = [
+    "min_backoff",
+    "max_backoff",
+    "retry_on_http_429",
+    "max_samples_per_send",
+    "sample_age_limit",
+    "batch_send_deadline",
+    "capacity",
+    "max_shards",
+    "min_shards",
+];
+
+/// queue_config, as Prometheus's queue manager takes it
+/// (crate::queue).
 fn queue_config(queue: &Body, sink: &mut RemoteWrite) -> Result<(), String> {
-    let numbers = ["capacity", "max_shards", "min_shards"];
-    let mut attrs = vec![
-        "min_backoff",
-        "max_backoff",
-        "retry_on_http_429",
-        "max_samples_per_send",
-        "sample_age_limit",
-        "batch_send_deadline",
-    ];
-    attrs.extend(numbers);
-    queue.check(&attrs, &[])?;
-    queue.tuning(&["batch_send_deadline"], &numbers)?;
+    queue.check(&QUEUE_ATTRS, &[])?;
     let given = |name: &str, default| match queue.value(name)? {
         Some(_) => queue.duration_or(name, "0s"),
         None => Ok(default),
@@ -234,18 +244,37 @@ fn queue_config(queue: &Body, sink: &mut RemoteWrite) -> Result<(), String> {
         max: given("max_backoff", sink.retry.max)?,
         on_429: queue.bool_or("retry_on_http_429", true)?,
     };
-    if let Some(max) = queue.number("max_samples_per_send")? {
-        if max < 1.0 {
-            let pos = queue.attr_pos("max_samples_per_send");
-            return Err(queue.error(pos, "max_samples_per_send: at least 1"));
-        }
-        sink.max_samples = max as u64;
-    }
+    sink.queue = queue::Queue::new(queue_sizes(queue)?);
     let limit = queue.duration_or("sample_age_limit", "0s")?;
-    if !limit.is_zero() {
-        sink.max_age = sink.max_age.min(limit);
-    }
+    sink.age_limit = (!limit.is_zero()).then_some(limit);
     Ok(())
+}
+
+fn queue_sizes(queue: &Body) -> Result<queue::Config, String> {
+    let defaults = queue::Config::default();
+    // Prometheus would divide by 0 (shards, samples) or make a channel
+    // of negative size (capacity).
+    let at_least =
+        |name: &str, least: f64, default: u64| match queue.number(name)? {
+            Some(n) if n < least => {
+                let message = format!("{name}: at least {least}");
+                Err(queue.error(queue.attr_pos(name), &message))
+            }
+            Some(n) => Ok(n as u64),
+            None => Ok(default),
+        };
+    let max_shards = defaults.max_shards as u64;
+    Ok(queue::Config {
+        capacity: at_least("capacity", 0.0, defaults.capacity)?,
+        min_shards: at_least("min_shards", 1.0, 1)? as usize,
+        max_shards: at_least("max_shards", 1.0, max_shards)? as usize,
+        max_samples: at_least(
+            "max_samples_per_send",
+            1.0,
+            defaults.max_samples,
+        )?,
+        deadline: queue.duration_or("batch_send_deadline", "5s")?,
+    })
 }
 
 /// An endpoint's `headers`, as Prometheus checks them.
@@ -263,12 +292,45 @@ fn endpoint_headers(endpoint: &Body) -> Result<String, String> {
     client::headers(endpoint, "headers", pairs)
 }
 
+/// prometheus.relabel's cache: max_cache_size entries (100000), or
+/// entries used within cache_ttl, as Alloy validates them.
+fn relabel_cache(body: &Body) -> Result<relabel::Cache, String> {
+    let size = body.number("max_cache_size")?.unwrap_or(100_000.0);
+    let ttl = body.duration_or("cache_ttl", "0s")?;
+    let pos = body.block.pos;
+    let refused = if size < 0.0 {
+        Some(format!("max_cache_size must be >= 0; got {size}"))
+    } else if size > 0.0 && !ttl.is_zero() {
+        Some(
+            "max_cache_size and cache_ttl are mutually exclusive: set \
+             max_cache_size = 0 to use cache_ttl, or unset cache_ttl to keep \
+             the bounded LRU cache"
+                .into(),
+        )
+    } else if size == 0.0 && ttl.is_zero() {
+        Some("one of max_cache_size or cache_ttl must be set".into())
+    } else if !ttl.is_zero() && ttl < Duration::from_secs(60) {
+        Some(format!(
+            "cache_ttl must be at least 1m0s when set; got {ttl:?}"
+        ))
+    } else {
+        None
+    };
+    match refused {
+        Some(message) => Err(body.error(pos, &message)),
+        None => Ok(relabel::Cache::new(
+            size as usize,
+            (!ttl.is_zero()).then_some(ttl),
+        )),
+    }
+}
+
 fn prometheus_relabel(body: &Body, plan: &mut Plan) -> Result<Value, String> {
-    body.check(&["forward_to", "max_cache_size"], &["rule"])?;
-    body.tuning(&[], &["max_cache_size"])?;
+    body.check(&["forward_to", "max_cache_size", "cache_ttl"], &["rule"])?;
+    let cache = relabel_cache(body)?;
     let rules = Rc::new(body.rules()?);
     let to = body.receivers("forward_to", metrics_node)?;
-    let kind = remote::Kind::Relabel(Rc::clone(&rules));
+    let kind = remote::Kind::Cached(Rc::clone(&rules), cache);
     let node = metrics_at(plan, kind, to);
     Ok(export(vec![
         ("receiver", Value::Capsule(Capsule::Metrics(node))),
@@ -599,10 +661,16 @@ fn loki_endpoint(
 
 fn loki_relabel(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     body.check(&["forward_to", "max_cache_size"], &["rule"])?;
-    body.tuning(&[], &["max_cache_size"])?;
+    let size = body.number("max_cache_size")?.unwrap_or(10_000.0);
+    if size <= 0.0 {
+        let message = "must provide a positive size";
+        return Err(body.error(body.attr_pos("max_cache_size"), message));
+    }
+    let cache = relabel::Cache::new(size as usize, None);
     let rules = Rc::new(body.rules()?);
     let to = body.receivers("forward_to", logs_node)?;
-    let node = logs_at(plan, logs::Kind::Relabel(Rc::clone(&rules)), to);
+    let kind = logs::Kind::Cached(Rc::clone(&rules), cache);
+    let node = logs_at(plan, kind, to);
     Ok(export(vec![
         ("receiver", Value::Capsule(Capsule::Logs(node))),
         ("rules", Value::Capsule(Capsule::Rules(rules))),
