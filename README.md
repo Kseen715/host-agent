@@ -1,5 +1,14 @@
 # host-agent
 
+[![coverage][coverage]][ci] [![lines of code][lines]][ci]
+[![RAM, minimal][ram-minimal]][ci] [![RAM, all features][ram-full]][ci]
+
+[ci]: https://github.com/Kseen715/host-agent/actions/workflows/badges.yml
+[coverage]: https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Kseen715/host-agent/badges/coverage.json
+[lines]: https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Kseen715/host-agent/badges/lines.json
+[ram-minimal]: https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Kseen715/host-agent/badges/ram-minimal.json
+[ram-full]: https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Kseen715/host-agent/badges/ram-full.json
+
 Pushes a Linux host's metrics to Prometheus (remote write) and its logs
 to Loki: the part of Grafana Alloy that the homelab's configuration
 used, in about 1 MiB of memory instead of about 100.
@@ -65,6 +74,16 @@ labels: encoding_rs). A smaller build:
 `--no-default-features --features journal,filesystems`. A
 configuration that needs a part the build lacks is refused.
 
+Each push to `main` runs [badges.yml](.github/workflows/badges.yml):
+tests with every feature under cargo-llvm-cov, cloc by the rules in
+[ci/cloc.txt](ci/cloc.txt) (our own code: not Markdown, `Cargo.lock`,
+IANA's interface types, nor azidentity's PowerShell script), and a
+minute of each static x86_64 build, without features and with all,
+on [ci/minimal.alloy](ci/minimal.alloy) and
+[ci/full.alloy](ci/full.alloy) against a sink (`ci/bench-ram.sh`: peak
+RSS, VmHWM). Their numbers go to the branch `badges` as shields.io
+endpoint files; the details are in the job's log.
+
 Static with musl, so the binary runs on any Linux of its architecture;
 the homelab's Ansible role builds it with `RUSTFLAGS=-C linker=rust-lld`
 for each host's architecture.
@@ -124,14 +143,15 @@ take Prometheus's client settings: `basic_auth`, `authorization`,
 checks. `remote_write` endpoints also sign in to clouds: `sigv4` (the
 AWS SDK v2's chain: keys from the config or the environment, shared
 config and credentials files with profiles, `source_profile`, SSO,
-`credential_process`, web identity, ECS, EC2; `role_arn`), `azuread`
-(managed or workload identity, client secret, or azidentity's default
-chain: the environment's secret, certificate or password, workload
-and managed identity, Azure CLI, Azure Developer CLI, PowerShell),
+`aws login` sessions (feature `tls`), `credential_process`, web
+identity, ECS, EC2; `role_arn`), `azuread` (managed or workload
+identity, client secret, or azidentity's default chain: the
+environment's secret, certificate or password, workload and managed
+identity, Azure CLI, Azure Developer CLI, PowerShell),
 `google_iam` (a credentials file or the default ones; feature `tls`).
 The unix exporter takes each collector's block, `cpu`'s info, flags
-and bugs included; `processes` and `systemd` are off unless enabled, as in
-Alloy. Templates are Go's text/template with Promtail's functions and
+and bugs included; `processes` and `systemd` are off unless enabled,
+as in Alloy. Templates are Go's text/template with Promtail's functions and
 the string and number functions of sprig; an unknown function is
 refused when read.
 

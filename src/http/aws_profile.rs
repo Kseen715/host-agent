@@ -56,7 +56,7 @@ pub struct Profile {
     pub credential_process: String,
     pub web_identity_file: String,
     pub sso: Sso,
-    login_session: String,
+    pub login_session: String,
 }
 
 /// SSO's settings; with `session`, its section's region and start URL.
@@ -415,11 +415,9 @@ impl Profile {
             return Ok(());
         } else if self.sso.configured() {
             self.check_sso()?;
-        } else if !self.login_session.is_empty() {
-            // shortcut: `aws login` sessions (DPoP-signed refreshes) are
-            // refused; add them when a host here signs in that way.
+        } else if !self.login_session.is_empty() && cfg!(not(feature = "tls")) {
             return Err(format!(
-                "profile {}: login_session is not supported",
+                "profile {}: login_session needs feature tls",
                 self.name
             ));
         }
@@ -565,9 +563,7 @@ fn refreshed(
 /// it back.
 fn updated(token: Json, json: &Json) -> Json {
     let seconds = json.get("expiresIn").and_then(Json::num).unwrap_or(0.0);
-    let [y, mo, d, h, mi, s] =
-        time::civil(time::now_ms() / 1000 + seconds as i64);
-    let at = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+    let at = time::rfc3339(time::now_ms() / 1000 + seconds as i64);
     let new = |key| json.get(key).and_then(Json::str).unwrap_or("");
     let mut fields = token.obj().to_vec();
     let updates = [
@@ -580,6 +576,21 @@ fn updated(token: Json, json: &Json) -> Json {
         fields.push((key.to_owned(), Json::Str(value)));
     }
     Json::Obj(fields)
+}
+
+/// An `aws login` session's keys (refused when read without `tls`).
+pub fn login_keys(
+    session: &str,
+    region: &str,
+    client: &Client,
+) -> io::Result<Expiring<Keys>> {
+    #[cfg(feature = "tls")]
+    return super::aws_login::keys(session, region, client);
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (session, region, client);
+        Err(io::Error::other("login_session needs feature tls"))
+    }
 }
 
 /// credential_process run by `sh -c`, its JSON answer read as the

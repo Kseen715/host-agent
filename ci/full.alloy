@@ -1,0 +1,73 @@
+// What a build with every feature does: minimal.alloy, plus
+// containers, the journal, syslog and OTLP.
+prometheus.exporter.unix "host" { }
+
+prometheus.exporter.self "agent" { }
+
+prometheus.exporter.cadvisor "containers" { }
+
+prometheus.scrape "host" {
+  targets = array.concat(
+    prometheus.exporter.unix.host.targets,
+    prometheus.exporter.self.agent.targets,
+    prometheus.exporter.cadvisor.containers.targets,
+  )
+  forward_to      = [prometheus.remote_write.sink.receiver]
+  scrape_interval = "5s"
+  scrape_timeout  = "4s"
+}
+
+prometheus.remote_write "sink" {
+  endpoint {
+    url = "http://127.0.0.1:19099/api/v1/write"
+  }
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.containers.targets
+  forward_to = [loki.write.sink.receiver]
+}
+
+loki.source.journal "journal" {
+  forward_to = [loki.write.sink.receiver]
+}
+
+loki.source.syslog "syslog" {
+  listener {
+    address  = "127.0.0.1:5514"
+    protocol = "udp"
+  }
+  forward_to = [loki.write.sink.receiver]
+}
+
+loki.source.file "logs" {
+  targets    = [{"__path__" = "/var/log/*.log"}]
+  forward_to = [loki.write.sink.receiver]
+}
+
+loki.write "sink" {
+  endpoint {
+    url = "http://127.0.0.1:19099/loki/api/v1/push"
+  }
+}
+
+otelcol.receiver.otlp "apps" {
+  http {
+    endpoint = "127.0.0.1:4318"
+  }
+  output {
+    metrics = [otelcol.exporter.otlphttp.sink.input]
+    logs    = [otelcol.exporter.otlphttp.sink.input]
+  }
+}
+
+otelcol.exporter.otlphttp "sink" {
+  client {
+    endpoint = "http://127.0.0.1:19099"
+  }
+}

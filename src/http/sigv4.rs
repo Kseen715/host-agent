@@ -11,16 +11,19 @@ use crate::digest::{hex, hmac_sha256, sha256};
 use crate::encoding::{query_escape, unescape, uri_escape};
 use crate::json::Json;
 use crate::time;
+use std::collections::hash_map::RandomState;
 use std::env;
 use std::fs;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Keys are asked for again this long before they expire, as
-/// sigv4's credentials cache (without its jitter).
+/// sigv4's credentials cache: keys are asked for again up to this
+/// long before they expire, less up to this share of it at random.
 const EARLY: Duration = Duration::from_secs(30);
+const JITTER: f64 = 0.5;
 /// AssumeRole's DurationSeconds unless a profile asks for more.
 pub const ROLE_SECONDS: u64 = 15 * 60;
 /// Headers left unsigned: the SDK's IgnoredHeaders, sigv4's denylist,
@@ -126,17 +129,18 @@ impl SigV4 {
     fn keys(&self) -> io::Result<Keys> {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((keys, expiry)) = kept.as_ref() {
-            if expiry.is_none_or(|at| Instant::now() + EARLY < at) {
+            if expiry.is_none_or(|at| Instant::now() < at) {
                 return Ok(keys.clone());
             }
         }
         let base = self.base()?;
-        let fresh = match &self.settings.role {
+        let (keys, expiry) = match &self.settings.role {
             None => base,
             Some(role) => self.assume(role, &base.0)?,
         };
-        *kept = Some(fresh.clone());
-        Ok(fresh.0)
+        let refresh = expiry.map(|at| at.checked_sub(early()).unwrap_or(at));
+        *kept = Some((keys.clone(), refresh));
+        Ok(keys)
     }
 
     /// The SDK's resolveCredentialChain.
@@ -179,26 +183,18 @@ impl SigV4 {
             return self.web_identity(file, arn, &p.session_name);
         } else if p.sso.configured() {
             aws_profile::sso_keys(&p.sso, &self.settings.client)?
+        } else if !p.login_session.is_empty() {
+            let s = &self.settings;
+            aws_profile::login_keys(&p.login_session, &s.region, &s.client)?
         } else if !p.credential_process.is_empty() {
             aws_profile::process_keys(&p.credential_process)?
         } else {
             self.container_or_ec2()?
         };
-        if p.role_arn.is_empty() {
-            return Ok(base);
+        match p.role_arn.is_empty() {
+            true => Ok(base),
+            false => self.assume(&profile_role(p), &base.0),
         }
-        let role = Role {
-            arn: p.role_arn.clone(),
-            external_id: p.external_id.clone(),
-            session_name: p.session_name.clone(),
-            tags: Vec::new(),
-            // As the SDK: a duration of 15 minutes or less is ignored.
-            duration_s: p
-                .duration_s
-                .filter(|s| s / 60 > 15)
-                .unwrap_or(ROLE_SECONDS),
-        };
-        self.assume(&role, &base.0)
     }
 
     /// credential_source: Environment, Ec2InstanceMetadata or
@@ -467,6 +463,31 @@ fn allowed_host(host: &str) -> bool {
 }
 
 /// An RFC 3339 expiry as an instant.
+/// A profile's role_arn and its options.
+fn profile_role(p: &Profile) -> Role {
+    Role {
+        arn: p.role_arn.clone(),
+        external_id: p.external_id.clone(),
+        session_name: p.session_name.clone(),
+        tags: Vec::new(),
+        // As the SDK: a duration of 15 minutes or less is ignored.
+        duration_s: p
+            .duration_s
+            .filter(|s| s / 60 > 15)
+            .unwrap_or(ROLE_SECONDS),
+    }
+}
+
+/// How long before they expire keys are fetched again: the SDK's
+/// cache window less a random part of it, so agents started together
+/// do not ask together.
+fn early() -> Duration {
+    // Random enough to spread agents out; not for secrets.
+    let random = RandomState::new().build_hasher().finish();
+    let fraction = random as f64 / u64::MAX as f64 * JITTER;
+    EARLY.mul_f64(1.0 - fraction)
+}
+
 pub fn expiry(text: &str) -> Option<Instant> {
     let at_ns = time::parse_rfc3339(text)?;
     let left = (at_ns - time::now_ns()).max(0) as u64;
@@ -578,6 +599,14 @@ mod tests {
 
     /// AWS's get-vanilla-query-order-key-case example of the SigV4 test
     /// suite.
+    #[test]
+    fn refreshes_early_at_random() {
+        let range = Duration::from_secs(15)..=EARLY;
+        let found: Vec<Duration> = (0..20).map(|_| early()).collect();
+        assert!(found.iter().all(|e| range.contains(e)), "{found:?}");
+        assert!(found.windows(2).any(|w| w[0] != w[1]));
+    }
+
     #[test]
     fn signs_as_aws() {
         let keys = Keys {

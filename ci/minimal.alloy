@@ -1,0 +1,32 @@
+// What a build without features does: the host's metrics and a log
+// file, to the sink (ci/sink.py).
+prometheus.exporter.unix "host" { }
+
+prometheus.exporter.self "agent" { }
+
+prometheus.scrape "host" {
+  targets = array.concat(
+    prometheus.exporter.unix.host.targets,
+    prometheus.exporter.self.agent.targets,
+  )
+  forward_to      = [prometheus.remote_write.sink.receiver]
+  scrape_interval = "5s"
+  scrape_timeout  = "4s"
+}
+
+prometheus.remote_write "sink" {
+  endpoint {
+    url = "http://127.0.0.1:19099/api/v1/write"
+  }
+}
+
+loki.source.file "logs" {
+  targets    = [{"__path__" = "/var/log/*.log"}]
+  forward_to = [loki.write.sink.receiver]
+}
+
+loki.write "sink" {
+  endpoint {
+    url = "http://127.0.0.1:19099/loki/api/v1/push"
+  }
+}

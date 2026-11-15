@@ -1,0 +1,157 @@
+---
+# The README's badges: test coverage, lines of code, and the peak memory
+# of a minimal and an all-features build, measured on each push to
+# main and kept as shields.io endpoint files on the orphan branch
+# `badges`.
+name: badges
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: badges
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN: "1.100.0"
+  LLVM_COV: "0.9.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Rust with llvm-tools
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal \
+            --component llvm-tools-preview
+          rustup default "$TOOLCHAIN"
+
+      - name: cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov --version "$LLVM_COV"
+
+      - name: Tests with every feature, measured
+        run: |
+          cargo llvm-cov --locked --all-features --no-report
+          cargo llvm-cov report --summary-only
+          cargo llvm-cov report --summary-only --json \
+            --output-path coverage.json
+
+      - name: Badge
+        run: |
+          percent=$(jq '.data[0].totals.lines.percent' coverage.json)
+          color=$(awk -v p="$percent" 'BEGIN {
+            print p >= 80 ? "brightgreen" : p >= 60 ? "yellow" : "red" }')
+          mkdir badges
+          ci/badge.sh badges/coverage.json coverage \
+            "$(printf '%.1f%%' "$percent")" "$color"
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: coverage
+          path: badges/
+
+  lines:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: cloc
+        run: sudo apt-get update && sudo apt-get install -y cloc
+
+      - name: Lines of code by language, then by file (ci/cloc.txt)
+        run: |
+          cloc --config ci/cloc.txt
+          cloc --config ci/cloc.txt --by-file
+
+      - name: Badge
+        run: |
+          code=$(cloc --config ci/cloc.txt --json | jq '.SUM.code')
+          message=$(awk -v n="$code" 'BEGIN {
+            if (n >= 1000) printf "%.1fk", n / 1000; else print n }')
+          mkdir badges
+          ci/badge.sh badges/lines.json "lines of code" "$message" blue
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: lines
+          path: badges/
+
+  memory:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Rust for musl, and a C compiler for ring
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal \
+            --target x86_64-unknown-linux-musl
+          rustup default "$TOOLCHAIN"
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # As the homelab's role builds it: static musl, linked by rust-lld.
+      - name: Build minimal and all features
+        env:
+          RUSTFLAGS: -C linker=rust-lld
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          target=x86_64-unknown-linux-musl
+          for build in minimal full; do
+            features=--no-default-features
+            [ "$build" = full ] && features=--all-features
+            cargo build --release --locked --target "$target" "$features"
+            cp "target/$target/release/host-agent" "host-agent-$build"
+          done
+          ls -l host-agent-*
+
+      - name: Bench, a minute each
+        run: |
+          for build in minimal full; do
+            echo "::group::$build"
+            sudo ci/bench-ram.sh "./host-agent-$build" \
+              "ci/$build.alloy" 60 | tee "$build.txt"
+            echo "::endgroup::"
+          done
+
+      - name: Badges
+        run: |
+          mib() {
+            awk -v kib="$(tail -n 1 "$1.txt")" \
+              'BEGIN { printf "%.1f MiB", kib / 1024 }'
+          }
+          mkdir badges
+          ci/badge.sh badges/ram-minimal.json "RAM, minimal" \
+            "$(mib minimal)" blue
+          ci/badge.sh badges/ram-full.json "RAM, all features" \
+            "$(mib full)" blue
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: memory
+          path: badges/
+
+  publish:
+    needs: [coverage, lines, memory]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: ${{ runner.temp }}/badges
+          merge-multiple: true
+
+      # Run from outside the tree: switching to `badges` removes it.
+      - name: Commit to the branch badges
+        run: |
+          cp ci/publish-badges.sh "$RUNNER_TEMP/"
+          "$RUNNER_TEMP/publish-badges.sh" "$RUNNER_TEMP/badges"

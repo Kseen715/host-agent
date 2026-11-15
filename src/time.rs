@@ -66,6 +66,12 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
+/// Seconds since the epoch as `2026-10-25T17:29:39Z`.
+pub fn rfc3339(seconds: i64) -> String {
+    let [y, mo, d, h, mi, s] = civil(seconds);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
 /// `seconds` since the epoch as UTC's year, month, day, hour, minute,
 /// second (Howard Hinnant's civil_from_days).
 pub fn civil(seconds: i64) -> [i64; 6] {

@@ -43,8 +43,8 @@ syslog = []
 tokio = ["snmp", "dep:tokio"]
 # HTTPS for scrapes and pushes, and syslog over TLS (its listeners'
 # tls_config): rustls on ring, +~0.9 MB; ring also signs google_iam's
-# service account tokens.
-tls = ["dep:rustls", "dep:ring"]
+# service account tokens, p256 `aws login` sessions' DPoP proofs.
+tls = ["dep:rustls", "dep:ring", "dep:p256"]
 # HTTP/2 over TLS where the server picks it by ALPN (enable_http2):
 # h2 on a tokio runtime per sending thread.
 http2 = [
@@ -77,6 +77,10 @@ lz4_flex = { version = "0.14", optional = true, default-features = false, featur
 ] }
 lzma-rs = { version = "0.3", optional = true }
 p12-keystore = { version = "0.4", optional = true }
+p256 = { version = "0.14", optional = true, default-features = false, features = [
+    "ecdsa",
+    "pem",
+] }
 regex-lite = "0.1"
 ring = { version = "0.17", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = [

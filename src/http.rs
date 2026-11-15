@@ -4,6 +4,8 @@
 //! close`), so a response ends where the stream does.
 
 pub mod auth;
+#[cfg(feature = "tls")]
+mod aws_login;
 mod aws_profile;
 pub mod azure;
 #[cfg(feature = "tls")]

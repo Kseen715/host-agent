@@ -144,7 +144,7 @@ impl Certificate {
 }
 
 /// A random (version 4) UUID.
-fn uuid(rng: &SystemRandom) -> io::Result<String> {
+pub fn uuid(rng: &SystemRandom) -> io::Result<String> {
     let mut b = [0u8; 16];
     rng.fill(&mut b)
         .map_err(|_| io::Error::other("no randomness"))?;
