@@ -46,11 +46,11 @@ cargo test
 Each part a host may lack is a cargo feature, all on by default:
 `docker` (containers' metrics and logs), `journal` (through
 journalctl), `journal-files` (from the files, without journalctl),
-`filesystems` (btrfs, XFS, ZFS), `snmp`, `syslog`, `otlp`, `server`. Off
-by
-default: `journal-xz` (fields journald compressed with xz, before
-systemd 246), `tokio` (SNMP devices polled by tasks on one thread
-instead of a thread each). A smaller build:
+`filesystems` (btrfs, XFS, ZFS), `snmp`, `syslog`, `otlp`, `server`.
+Off by default: `journal-xz` (fields journald compressed with xz,
+before systemd 246), `tokio` (SNMP devices polled by tasks on one
+thread instead of a thread each), `tls` (syslog over TLS, rustls on
+ring: +0.9 MB, and a C compiler for the target). A smaller build:
 `--no-default-features --features journal,filesystems`. A
 configuration that needs a part the build lacks is refused.
 
@@ -85,8 +85,9 @@ Alloy's syntax: blocks, attributes, references between components
   `prometheus.scrape`, `prometheus.relabel`, `prometheus.remote_write`;
 - `discovery.docker`, `discovery.file`, `discovery.relabel`,
   `local.file_match`;
-- `loki.source.journal`, `.file`, `.docker`, `.syslog` (UDP or TCP,
-  RFC 5424 or 3164); `loki.relabel`, `loki.write`, `loki.process`
+- `loki.source.journal` (with `path` and `matches`), `.file`,
+  `.docker` (Docker's or Podman's socket), `.syslog` (UDP, TCP or
+  TLS, RFC 5424 or 3164); `loki.relabel`, `loki.write`, `loki.process`
   with the stages `regex`, `template`, `replace`, `labels`,
   `static_labels`, `label_drop`, `label_keep`, `drop`, `json`,
   `logfmt`, `timestamp` (zones from the host's tz database),
@@ -96,7 +97,7 @@ Alloy's syntax: blocks, attributes, references between components
   `otelcol.processor.batch` in between is let through).
 
 What it cannot do as Alloy would (another component, attribute or
-block, such as syslog over TLS or the journal's `matches`) is refused
+block, such as `loki.source.kafka` or syslog's `raw` format) is refused
 with its position in the file, never ignored. `logging`,
 `livedebugging` and `tracing` are accepted and ignored.
 

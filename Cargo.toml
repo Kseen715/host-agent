@@ -36,6 +36,8 @@ snmp = []
 syslog = []
 # SNMP devices polled by tasks on one thread instead of a thread each.
 tokio = ["snmp", "dep:tokio"]
+# Syslog over TLS (its listeners' tls_config): rustls on ring, +~0.9 MB.
+tls = ["syslog", "dep:rustls"]
 
 [dependencies]
 libc = "0.2"
@@ -44,6 +46,11 @@ lz4_flex = { version = "0.14", optional = true, default-features = false, featur
 ] }
 lzma-rs = { version = "0.3", optional = true }
 regex-lite = "0.1"
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 ruzstd = { version = "0.9", optional = true }
 snap = "1"
 tokio = { version = "1", optional = true, default-features = false, features = [

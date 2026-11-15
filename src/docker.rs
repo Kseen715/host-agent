@@ -16,8 +16,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-pub const SOCKET: &str = "/var/run/docker.sock";
-
 pub struct Container {
     pub id: String,
     pub name: String,
@@ -67,9 +65,12 @@ pub struct Docker {
 
 impl Docker {
     /// Docker on its socket, whether it runs yet or not.
-    pub fn new(logs: Vec<(String, Targets, Source)>) -> Docker {
+    pub fn new(
+        socket: PathBuf,
+        logs: Vec<(String, Targets, Source)>,
+    ) -> Docker {
         Docker {
-            socket: PathBuf::from(SOCKET),
+            socket,
             details: HashMap::new(),
             containers: Vec::new(),
             up: false,
@@ -550,7 +551,7 @@ mod tests {
         assert_eq!(c.name, "crafty-crafty-1");
         let docker = Docker {
             containers: vec![c],
-            ..Docker::new(Vec::new())
+            ..Docker::new("/var/run/docker.sock".into(), Vec::new())
         };
         let targets = docker.targets();
         assert_eq!(targets.len(), 2);

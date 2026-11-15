@@ -9,7 +9,11 @@ mod snmp;
 pub mod syntax;
 mod value;
 
-pub use compile::{Exporter, Plan, ScrapeJob, SyslogListener, compile};
+#[cfg(feature = "tls")]
+pub use compile::ListenerTls;
+pub use compile::{
+    Exporter, JournalSource, Plan, ScrapeJob, SyslogListener, compile,
+};
 pub use components::INTERNAL;
 
 use std::fs;

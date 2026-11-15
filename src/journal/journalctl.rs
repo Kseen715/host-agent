@@ -4,8 +4,9 @@
 //! a restart resumes after the last line sent.
 
 use super::{Fields, deliver};
+use crate::alloy::JournalSource;
 use crate::host;
-use crate::logs::{Logs, Source};
+use crate::logs::Logs;
 use crate::parts::Part;
 use crate::state::Positions;
 use std::io::{self, Read};
@@ -22,10 +23,7 @@ pub struct Journal {
     read_any: bool,
     buf: Vec<u8>,
     restart_at: Instant,
-    max_age: Duration,
-    source: Source,
-    /// The component's id: where its cursor is kept.
-    id: String,
+    config: JournalSource,
 }
 
 /// An entry's cursor and the fields sent.
@@ -36,20 +34,16 @@ struct Entry<'a> {
 }
 
 impl Journal {
-    /// None on a host without systemd.
-    pub fn new(
-        id: String,
-        max_age: Duration,
-        source: Source,
-    ) -> Option<Journal> {
-        host::path("/run/systemd/system").is_dir().then(|| Journal {
+    /// None on a host without systemd, unless given a directory.
+    pub fn new(config: JournalSource) -> Option<Journal> {
+        let present =
+            config.path.is_some() || host::path("/run/systemd/system").is_dir();
+        present.then(|| Journal {
             child: None,
             read_any: false,
             buf: Vec::new(),
             restart_at: Instant::now(),
-            max_age,
-            source,
-            id,
+            config,
         })
     }
 
@@ -64,10 +58,14 @@ impl Journal {
         }
         let mut command = Command::new("journalctl");
         command.args(["--follow", "--output=export", "--no-pager"]);
+        if let Some(path) = &self.config.path {
+            command.arg(format!("--directory={}", host::path(path).display()));
+        }
         match cursor {
             Some(cursor) => command.arg(format!("--after-cursor={cursor}")),
             None => {
-                command.arg(format!("--since=-{}s", self.max_age.as_secs()))
+                let age = self.config.max_age.as_secs();
+                command.arg(format!("--since=-{age}s"))
             }
         };
         command.stdin(Stdio::null()).stdout(Stdio::piped());
@@ -118,7 +116,7 @@ impl Journal {
             eprintln!("Journal: journalctl stopped: {status:?}");
             let failed = !status.is_ok_and(|status| status.success());
             if failed && !self.read_any {
-                positions.forget_cursor(&self.id);
+                positions.forget_cursor(&self.config.id);
             }
         }
         self.buf.clear();
@@ -132,9 +130,9 @@ impl Journal {
             self.read_any = true;
             if let Some(cursor) = entry.cursor {
                 let cursor = String::from_utf8_lossy(cursor).into_owned();
-                positions.set_cursor(&self.id, cursor);
+                positions.set_cursor(&self.config.id, cursor);
             }
-            deliver(&self.source, &entry.fields, logs);
+            deliver(&self.config, &entry.fields, logs);
         }
         self.buf.drain(..at);
         if self.buf.capacity() > 4 * READ_AT_ONCE
@@ -147,7 +145,7 @@ impl Journal {
 
 impl Part for Journal {
     fn prepare(&mut self, positions: &Positions) {
-        self.ensure_running(positions.cursor(&self.id));
+        self.ensure_running(positions.cursor(&self.config.id));
     }
 
     fn fds(&self) -> Vec<RawFd> {

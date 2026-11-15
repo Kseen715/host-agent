@@ -11,7 +11,8 @@ pub use files::Journal;
 #[cfg(not(feature = "journal-files"))]
 pub use journalctl::Journal;
 
-use crate::logs::{Logs, Source};
+use crate::alloy::JournalSource;
+use crate::logs::Logs;
 
 /// The journal's words for its priorities 0 to 7.
 const PRIORITIES: [&str; 8] = [
@@ -25,10 +26,14 @@ pub struct Fields<'a> {
     pub pairs: Vec<(&'a [u8], &'a [u8])>,
 }
 
-/// An entry as Alloy's loki.source.journal gives it: MESSAGE the line,
-/// every field a label `__journal_<name>` for the source's rules, and
-/// `__journal_priority_keyword` the priority's word.
-pub fn deliver(source: &Source, entry: &Fields, logs: &mut Logs) {
+/// An entry as Alloy's loki.source.journal gives it, if its `matches`
+/// pass: MESSAGE the line, every field a label `__journal_<name>` for
+/// the source's rules, and `__journal_priority_keyword` the priority's
+/// word.
+pub fn deliver(config: &JournalSource, entry: &Fields, logs: &mut Logs) {
+    if !passes(&config.matches, entry) {
+        return;
+    }
     let mut message = None;
     let mut labels = Vec::with_capacity(entry.pairs.len() + 1);
     for &(name, value) in &entry.pairs {
@@ -52,5 +57,42 @@ pub fn deliver(source: &Source, entry: &Fields, logs: &mut Logs) {
     let ns = entry
         .realtime_us
         .map_or_else(crate::time::now_ns, |us| us * 1000);
-    source.emit(logs, labels, ns, &message);
+    config.source.emit(logs, labels, ns, &message);
+}
+
+/// For each field the matches name, the entry has one of its values.
+fn passes(matches: &[(String, String)], entry: &Fields) -> bool {
+    let has = |field: &str, value: &str| {
+        let pair = (field.as_bytes(), value.as_bytes());
+        entry.pairs.contains(&pair)
+    };
+    matches.iter().all(|(field, _)| {
+        let mut values = matches.iter().filter(|(f, _)| f == field);
+        values.any(|(_, value)| has(field, value))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matches(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(f, v)| (f.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn matches_as_sd_journal() {
+        let entry = Fields {
+            realtime_us: None,
+            pairs: vec![(b"_SYSTEMD_UNIT", b"a.service"), (b"PRIORITY", b"3")],
+        };
+        assert!(passes(&[], &entry));
+        let unit = "_SYSTEMD_UNIT";
+        let either = matches(&[(unit, "b.service"), (unit, "a.service")]);
+        assert!(passes(&either, &entry));
+        let both = matches(&[(unit, "a.service"), ("PRIORITY", "4")]);
+        assert!(!passes(&both, &entry));
+    }
 }

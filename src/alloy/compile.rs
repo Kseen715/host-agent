@@ -51,6 +51,30 @@ pub enum Otel {
     Export(Vec<(String, String)>),
 }
 
+/// A loki.source.journal.
+pub struct JournalSource {
+    /// The component's id: where its cursor is kept.
+    pub id: String,
+    pub max_age: Duration,
+    /// The directory to read instead of the system's journal.
+    pub path: Option<String>,
+    /// `FIELD=value` matches: an entry passes with one of the values
+    /// of each field named, as sd_journal_add_match combines them.
+    pub matches: Vec<(String, String)>,
+    pub source: Source,
+}
+
+/// A syslog listener's `tls_config`: PEM certificates and key; with a
+/// CA, clients must present a certificate it signed.
+// Without feature `tls` a tls_config is refused, so none is ever read.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+pub struct ListenerTls {
+    pub cert: String,
+    pub key: String,
+    pub ca: Option<String>,
+    pub tls13_only: bool,
+}
+
 /// A loki.source.syslog `listener`, with its component's source.
 pub struct SyslogListener {
     pub address: String,
@@ -61,6 +85,8 @@ pub struct SyslogListener {
     pub use_incoming_timestamp: bool,
     pub use_rfc5424_message: bool,
     pub max_message_length: usize,
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls: Option<ListenerTls>,
     pub source: Source,
 }
 
@@ -72,13 +98,13 @@ pub struct Plan {
     pub exporters: Vec<(String, Exporter)>,
     /// prometheus.exporter.unix's rootfs_path (crate::host).
     pub root: Option<PathBuf>,
-    /// Each loki.source.journal: its id, max_age and source.
-    pub journal: Vec<(String, Duration, Source)>,
+    pub journal: Vec<JournalSource>,
     pub files: Vec<Files>,
     /// Each loki.source.docker: its id, targets and source.
     pub docker_logs: Vec<(String, Targets, Source)>,
     /// Whether a component reads Docker.
-    pub docker: bool,
+    /// The Docker API's socket, if a component uses Docker.
+    pub docker: Option<String>,
     pub syslogs: Vec<SyslogListener>,
     /// Each otelcol.receiver.otlp's address and each signal's URLs.
     pub otlp: Vec<(String, Vec<(String, String)>)>,
@@ -504,5 +530,33 @@ mod tests {
         assert!(error.contains("cycle"), "{error}");
         let twice = parse(r#"a "x" { } a "x" { }"#).unwrap();
         assert!(components(&twice).unwrap_err().contains("twice"));
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn reads_syslog_tls_config() {
+        let config = |protocol: &str, tls: &str| {
+            let text = format!(
+                r#"loki.write "w" {{ endpoint {{ url = "http://l/" }} }}
+                loki.source.syslog "s" {{
+                    listener {{
+                        address = "127.0.0.1:6514"
+                        protocol = "{protocol}"
+                        tls_config {{ {tls} }}
+                    }}
+                    forward_to = [loki.write.w.receiver]
+                }}"#
+            );
+            compile(&parse(&text).unwrap(), false)
+        };
+        let pem = r#"cert_pem = "C" key_pem = "K" min_version = "TLS13""#;
+        let plan = config("tcp", pem).unwrap();
+        let tls = plan.syslogs[0].tls.as_ref().unwrap();
+        assert_eq!((tls.cert.as_str(), tls.key.as_str()), ("C", "K"));
+        assert!(tls.tls13_only && tls.ca.is_none());
+        let error = config("udp", pem).err().unwrap();
+        assert!(error.contains("TCP only"), "{error}");
+        let error = config("tcp", r#"cert_pem = "C""#).err().unwrap();
+        assert!(error.contains("needs key"), "{error}");
     }
 }

@@ -30,8 +30,8 @@ pub fn build(plan: &mut Plan) -> Result<Vec<Box<dyn Part>>, String> {
         return Ok(parts);
     }
     #[cfg(feature = "journal")]
-    for (id, max_age, source) in std::mem::take(&mut plan.journal) {
-        match crate::journal::Journal::new(id, max_age, source) {
+    for config in std::mem::take(&mut plan.journal) {
+        match crate::journal::Journal::new(config) {
             Some(journal) => parts.push(Box::new(journal)),
             None => eprintln!("Journal: this host has none"),
         }

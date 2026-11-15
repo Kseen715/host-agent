@@ -9,8 +9,9 @@
 mod format;
 
 use super::{Fields, deliver};
+use crate::alloy::JournalSource;
 use crate::host;
-use crate::logs::{Logs, Source};
+use crate::logs::Logs;
 use crate::parts::Part;
 use crate::state::Positions;
 use format::JournalFile;
@@ -20,7 +21,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Entries read per wake: the loop has other sources.
 const ENTRIES_AT_ONCE: usize = 512;
@@ -35,10 +36,7 @@ pub struct Journal {
     seen: HashSet<(u64, u64)>,
     /// None until the saved cursor is known (`prepare`).
     start: Option<Start>,
-    max_age: Duration,
-    source: Source,
-    /// The component's id: where its cursor is kept.
-    id: String,
+    config: JournalSource,
 }
 
 /// An entry's seqnum_id, seqnum and realtime.
@@ -91,17 +89,11 @@ impl Start {
 
 impl Journal {
     /// None on a host without journal directories.
-    pub fn new(
-        id: String,
-        max_age: Duration,
-        source: Source,
-    ) -> Option<Journal> {
-        let machine = fs::read_to_string(host::path("/etc/machine-id")).ok()?;
-        let dirs: Vec<PathBuf> = ["/var/log/journal", "/run/log/journal"]
-            .iter()
-            .map(|root| host::path(&format!("{root}/{}", machine.trim())))
-            .filter(|dir| dir.is_dir())
-            .collect();
+    pub fn new(config: JournalSource) -> Option<Journal> {
+        let dirs = match &config.path {
+            Some(path) => directory(path),
+            None => system_dirs()?,
+        };
         if dirs.is_empty() {
             return None;
         }
@@ -112,9 +104,7 @@ impl Journal {
             files: Vec::new(),
             seen: HashSet::new(),
             start: None,
-            max_age,
-            source,
-            id,
+            config,
         })
     }
 
@@ -206,9 +196,7 @@ impl Journal {
             let reading = &mut self.files[index];
             let (offset, _) = reading.next.expect("earliest has one");
             match reading.file.entry(offset) {
-                Ok(entry) => {
-                    send((&self.source, &self.id), &entry, logs, positions)
-                }
+                Ok(entry) => send(&self.config, &entry, logs, positions),
                 Err(error) => eprintln!("Journal: entry {offset}: {error}"),
             }
             reading.file.advance(1);
@@ -225,10 +213,10 @@ impl Part for Journal {
         if self.start.is_some() {
             return;
         }
-        let cursor = positions.cursor(&self.id).and_then(parse_cursor);
+        let cursor = positions.cursor(&self.config.id).and_then(parse_cursor);
         self.start = Some(cursor.unwrap_or_else(|| {
             let now_us = crate::time::now_ns() as u64 / 1000;
-            let age_us = self.max_age.as_micros() as u64;
+            let age_us = self.config.max_age.as_micros() as u64;
             Start::Since(now_us.saturating_sub(age_us))
         }));
         self.open_new();
@@ -257,7 +245,7 @@ fn earliest(places: impl Iterator<Item = Option<Place>>) -> Option<usize> {
 }
 
 fn send(
-    (source, id): (&Source, &str),
+    config: &JournalSource,
     entry: &format::Entry,
     logs: &mut Logs,
     p: &mut Positions,
@@ -270,8 +258,8 @@ fn send(
         realtime_us: i64::try_from(entry.realtime).ok(),
         pairs: pairs.collect(),
     };
-    deliver(source, &fields, logs);
-    p.set_cursor(id, cursor(entry));
+    deliver(config, &fields, logs);
+    p.set_cursor(&config.id, cursor(entry));
 }
 
 /// journalctl's cursor for an entry.
@@ -309,6 +297,27 @@ fn hex(bytes: &[u8]) -> String {
 
 /// An inotify descriptor on the directories: journald writing,
 /// creating and renaming files.
+/// The machine's journal directories, persistent and volatile.
+fn system_dirs() -> Option<Vec<PathBuf>> {
+    let machine = fs::read_to_string(host::path("/etc/machine-id")).ok()?;
+    let dirs = ["/var/log/journal", "/run/log/journal"]
+        .iter()
+        .map(|root| host::path(&format!("{root}/{}", machine.trim())));
+    Some(dirs.filter(|dir| dir.is_dir()).collect())
+}
+
+/// `path` and the directories in it, as journald keeps a machine's
+/// files in one named by its id.
+fn directory(path: &str) -> Vec<PathBuf> {
+    let root = host::path(path);
+    let below = fs::read_dir(&root).into_iter().flatten().flatten();
+    let below = below.map(|entry| entry.path()).filter(|p| p.is_dir());
+    let mut dirs: Vec<PathBuf> = below.collect();
+    dirs.sort();
+    dirs.insert(0, root.clone());
+    dirs.into_iter().filter(|dir| dir.is_dir()).collect()
+}
+
 fn watch(dirs: &[PathBuf]) -> Option<OwnedFd> {
     // SAFETY: a new descriptor, owned from here on.
     let fd =

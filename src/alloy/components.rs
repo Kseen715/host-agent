@@ -2,7 +2,8 @@
 //! exports returned for the components after it.
 
 use super::compile::{
-    Body, Exporter, Otel, Plan, ScrapeJob, SyslogListener, export,
+    Body, Exporter, JournalSource, ListenerTls, Otel, Plan, ScrapeJob,
+    SyslogListener, export,
 };
 use super::value::{Capsule, Value};
 use crate::files::Files;
@@ -276,21 +277,27 @@ fn agent(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     Ok(targets_value(vec![internal_target(body.id, "alloy")]))
 }
 
-fn docker_host(body: &Body) -> Result<(), String> {
+/// The Docker API's socket (Docker's, or Podman's compatible one): one
+/// per agent, as one engine's containers are one cAdvisor's.
+fn docker_host(body: &Body, plan: &mut Plan) -> Result<(), String> {
     let host = body.string_or("host", DOCKER_HOST)?;
     let host = body.string_or("docker_host", &host)?;
-    if host != DOCKER_HOST {
-        let message = format!("Docker only at {DOCKER_HOST}");
-        return Err(body.error(body.block.pos, &message));
+    let pos = body.block.pos;
+    let Some(socket) = host.strip_prefix("unix://") else {
+        return Err(body.error(pos, &format!("{host}: only unix://")));
+    };
+    if plan.docker.as_ref().is_some_and(|s| s != socket) {
+        let message = format!("{host}: one Docker host per agent");
+        return Err(body.error(pos, &message));
     }
+    plan.docker = Some(socket.to_owned());
     Ok(())
 }
 
 fn cadvisor(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "docker", cfg!(feature = "docker"))?;
     body.check(&["docker_host", "docker_only", "storage_duration"], &[])?;
-    docker_host(body)?;
-    plan.docker = true;
+    docker_host(body, plan)?;
     #[cfg(feature = "docker")]
     plan.exporters
         .push((body.id.to_owned(), Exporter::Cadvisor));
@@ -311,8 +318,7 @@ fn discovery_relabel(body: &Body) -> Result<Value, String> {
 fn discovery_docker(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "docker", cfg!(feature = "docker"))?;
     body.check(&["host", "refresh_interval"], &[])?;
-    docker_host(body)?;
-    plan.docker = true;
+    docker_host(body, plan)?;
     let targets = Value::Capsule(Capsule::Targets(Targets::Docker));
     Ok(export(vec![("targets", targets)]))
 }
@@ -394,11 +400,38 @@ fn source(body: &Body) -> Result<Source, String> {
 
 fn journal(body: &Body, plan: &mut Plan) -> Result<Value, String> {
     built(body, "journal", cfg!(feature = "journal"))?;
-    body.check(&["max_age", "labels", "relabel_rules", "forward_to"], &[])?;
-    let max_age = body.duration_or("max_age", "7h")?;
-    plan.journal
-        .push((body.id.to_owned(), max_age, source(body)?));
+    let attrs = [
+        "max_age",
+        "path",
+        "matches",
+        "labels",
+        "relabel_rules",
+        "forward_to",
+    ];
+    body.check(&attrs, &[])?;
+    let matches = body.string_or("matches", "")?;
+    let matches = journal_matches(&matches)
+        .map_err(|e| body.error(body.block.pos, &format!("matches: {e}")))?;
+    plan.journal.push(JournalSource {
+        id: body.id.to_owned(),
+        max_age: body.duration_or("max_age", "7h")?,
+        path: body.string("path")?.filter(|p| !p.is_empty()),
+        matches,
+        source: source(body)?,
+    });
     Ok(export(Vec::new()))
+}
+
+/// `_SYSTEMD_UNIT=a.service PRIORITY=3`: no `+` (OR), as Alloy.
+fn journal_matches(text: &str) -> Result<Vec<(String, String)>, String> {
+    text.split_whitespace()
+        .map(|word| match word.split_once('=') {
+            Some((field, value)) if !field.is_empty() => {
+                Ok((field.to_owned(), value.to_owned()))
+            }
+            _ => Err(format!("`{word}` is not FIELD=value")),
+        })
+        .collect()
 }
 
 fn file(body: &Body, plan: &mut Plan) -> Result<Value, String> {
@@ -415,8 +448,7 @@ fn docker_logs(body: &Body, plan: &mut Plan) -> Result<Value, String> {
         &["host", "targets", "forward_to", "labels", "relabel_rules"],
         &[],
     )?;
-    docker_host(body)?;
-    plan.docker = true;
+    docker_host(body, plan)?;
     let targets = body.targets("targets")?;
     plan.docker_logs
         .push((body.id.to_owned(), targets, source(body)?));
@@ -450,7 +482,7 @@ fn syslog_listener(
         "syslog_format",
         "rfc3164_default_to_current_year",
     ];
-    listener.check(&attrs, &[])?;
+    listener.check(&attrs, &["tls_config"])?;
     let pos = listener.block.pos;
     let one_of = |name: &str, default: &str, values: [&str; 2]| {
         let value = listener.string_or(name, default)?;
@@ -467,9 +499,15 @@ fn syslog_listener(
         }
         None => 8192,
     };
+    let tcp = one_of("protocol", "tcp", ["tcp", "udp"])?;
+    let tls = listener_tls(listener)?;
+    if tls.is_some() && !tcp {
+        return Err(listener.error(pos, "tls_config: TCP only"));
+    }
     Ok(SyslogListener {
         address: listener.required("address")?,
-        tcp: one_of("protocol", "tcp", ["tcp", "udp"])?,
+        tcp,
+        tls,
         rfc5424: one_of("syslog_format", "rfc5424", ["rfc5424", "rfc3164"])?,
         idle_timeout: listener.duration_or("idle_timeout", "120s")?,
         label_structured_data: listener
@@ -483,6 +521,54 @@ fn syslog_listener(
             ..shared.clone()
         },
     })
+}
+
+/// A listener's `tls_config`; its client-side settings are refused.
+fn listener_tls(listener: &Body) -> Result<Option<ListenerTls>, String> {
+    let Some(tls) = listener.block("tls_config") else {
+        return Ok(None);
+    };
+    built(&tls, "tls", cfg!(feature = "tls"))?;
+    let attrs = [
+        "ca_pem",
+        "ca_file",
+        "cert_pem",
+        "cert_file",
+        "key_pem",
+        "key_file",
+        "min_version",
+    ];
+    tls.check(&attrs, &[])?;
+    let pos = tls.block.pos;
+    let pem = |name| pem(&tls, name);
+    let tls13_only = match tls.string_or("min_version", "TLS12")?.as_str() {
+        "TLS12" => false,
+        "TLS13" => true,
+        other => {
+            let message = format!("min_version `{other}`: TLS12 or TLS13");
+            return Err(tls.error(pos, &message));
+        }
+    };
+    let needs = |name: &str| tls.error(pos, &format!("needs {name}"));
+    Ok(Some(ListenerTls {
+        cert: pem("cert")?.ok_or_else(|| needs("cert_pem or cert_file"))?,
+        key: pem("key")?.ok_or_else(|| needs("key_pem or key_file"))?,
+        ca: pem("ca")?,
+        tls13_only,
+    }))
+}
+
+/// A tls_config's `<name>_pem`, or the file `<name>_file` names.
+fn pem(tls: &Body, name: &str) -> Result<Option<String>, String> {
+    if let Some(text) = tls.string(&format!("{name}_pem"))? {
+        return Ok(Some(text));
+    }
+    let Some(path) = tls.string(&format!("{name}_file"))? else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path);
+    text.map(Some)
+        .map_err(|e| tls.error(tls.block.pos, &format!("{path}: {e}")))
 }
 
 /// An `output` block's components for each signal.

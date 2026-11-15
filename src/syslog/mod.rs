@@ -1,9 +1,12 @@
 //! loki.source.syslog's listeners, UDP or TCP: each message with the
 //! `__syslog_*` labels Alloy gives it, for the source's rules. Over TCP
 //! a message is framed by its length (`123 <PRI>...`, RFC 6587's octet
-//! counting) or ends at a newline, as each one starts.
+//! counting) or ends at a newline, as each one starts; with feature
+//! `tls`, inside TLS where the listener has a `tls_config`.
 
 mod format;
+#[cfg(feature = "tls")]
+mod tls;
 
 use crate::alloy::SyslogListener;
 use crate::logs::Logs;
@@ -31,12 +34,35 @@ struct Connection {
     from: IpAddr,
     buf: Vec<u8>,
     last: Instant,
+    #[cfg(feature = "tls")]
+    tls: Option<rustls::ServerConnection>,
+}
+
+impl Connection {
+    /// Reads what arrived into `buf`; false when the stream ended.
+    fn fill(&mut self, chunk: &mut [u8]) -> bool {
+        self.last = Instant::now();
+        #[cfg(feature = "tls")]
+        if let Some(session) = &mut self.tls {
+            return tls::fill(session, &mut self.stream, &mut self.buf, chunk);
+        }
+        match self.stream.read(chunk) {
+            Ok(0) => false,
+            Ok(length) => {
+                self.buf.extend_from_slice(&chunk[..length]);
+                true
+            }
+            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+        }
+    }
 }
 
 pub struct Syslog {
     socket: Socket,
     listener: SyslogListener,
     buf: Vec<u8>,
+    #[cfg(feature = "tls")]
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 impl Syslog {
@@ -50,10 +76,14 @@ impl Syslog {
             socket.set_nonblocking(true)?;
             Socket::Udp(socket)
         };
+        #[cfg(feature = "tls")]
+        let tls = listener.tls.as_ref().map(tls::config).transpose();
         Ok(Syslog {
             socket,
             buf: vec![0; listener.max_message_length.max(READ_SIZE)],
             listener,
+            #[cfg(feature = "tls")]
+            tls: tls.map_err(io::Error::other)?,
         })
     }
 
@@ -83,14 +113,27 @@ impl Syslog {
             return;
         };
         while let Ok((stream, from)) = socket.accept() {
-            if stream.set_nonblocking(true).is_ok() {
-                connections.push(Connection {
-                    stream,
-                    from: from.ip(),
-                    buf: Vec::new(),
-                    last: Instant::now(),
-                });
+            if stream.set_nonblocking(true).is_err() {
+                continue;
             }
+            #[cfg(feature = "tls")]
+            let tls = match self.tls.as_ref().map(|config| {
+                rustls::ServerConnection::new(std::sync::Arc::clone(config))
+            }) {
+                Some(Err(error)) => {
+                    eprintln!("Syslog: TLS: {error}");
+                    continue;
+                }
+                session => session.and_then(Result::ok),
+            };
+            connections.push(Connection {
+                stream,
+                from: from.ip(),
+                buf: Vec::new(),
+                last: Instant::now(),
+                #[cfg(feature = "tls")]
+                tls,
+            });
         }
     }
 
@@ -102,16 +145,7 @@ impl Syslog {
         let Some(connection) = connections.get_mut(index) else {
             return;
         };
-        let read = connection.stream.read(&mut self.buf);
-        let open = match read {
-            Ok(0) => false,
-            Ok(length) => {
-                connection.buf.extend_from_slice(&self.buf[..length]);
-                connection.last = Instant::now();
-                true
-            }
-            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
-        };
+        let open = connection.fill(&mut self.buf);
         let max = self.listener.max_message_length;
         while let Some(raw) = frame(&mut connection.buf, max, !open) {
             let raw = String::from_utf8_lossy(&raw);
