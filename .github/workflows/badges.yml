@@ -19,7 +19,8 @@ permissions:
 
 env:
   TOOLCHAIN: "1.100.0"
-  LLVM_COV: "0.9.1"
+  # Not LLVM_COV: cargo-llvm-cov reads that as llvm-cov's path.
+  LLVM_COV_VERSION: "0.9.1"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -35,7 +36,7 @@ jobs:
           rustup default "$TOOLCHAIN"
 
       - name: cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov --version "$LLVM_COV"
+        run: cargo install --locked cargo-llvm-cov --version "$LLVM_COV_VERSION"
 
       - name: Tests with every feature, measured
         run: |
