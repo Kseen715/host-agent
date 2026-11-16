@@ -451,4 +451,82 @@ mod tests {
         let error = value("nope.x").err().unwrap();
         assert!(error.contains("names nothing"));
     }
+
+    fn holds(text: &str) -> bool {
+        match value(text) {
+            Ok(Value::Bool(b)) => b,
+            other => panic!("{text}: {:?}", other.map(|v| v.kind())),
+        }
+    }
+
+    fn error(text: &str) -> String {
+        let found = value(text).err().unwrap_or_default();
+        found
+            .split_once(": ")
+            .map_or(found.clone(), |(_, e)| e.to_owned())
+    }
+
+    /// Alloy's (Go's) arithmetic: kinds widen uint, int, float; ints
+    /// wrap; a power of 0 is 1, a negative one leaves an int as it is.
+    #[test]
+    fn computes_as_alloy_does() {
+        let max = "18446744073709551615";
+        assert!(
+            matches!(value(&format!("{max} + {max}")), Ok(Value::Uint(m))
+            if m == u64::MAX - 1)
+        );
+        assert!(matches!(value(&format!("{max} % 10")), Ok(Value::Int(-1))));
+        let zero = format!("{max} ^ ({max} - {max})");
+        assert!(matches!(value(&zero), Ok(Value::Uint(1))));
+        let odd = format!("{max} ^ {max}");
+        assert!(matches!(value(&odd), Ok(Value::Uint(u64::MAX))));
+        let wide = format!("{max} - {max} * 1");
+        assert!(matches!(value(&wide), Ok(Value::Int(0))));
+        assert!(matches!(value(&format!("-{max}")), Ok(Value::Int(1))));
+        assert!(matches!(value("2 ^ 0"), Ok(Value::Int(1))));
+        assert!(matches!(value("2 ^ -3"), Ok(Value::Int(2))));
+        assert!(matches!(value("-7 % 3"), Ok(Value::Int(-1))));
+        assert!(matches!(value("-1.5"), Ok(Value::Number(n)) if n == -1.5));
+        assert!(matches!(value("7.5 % 2"), Ok(Value::Number(n)) if n == 1.5));
+        assert!(matches!(value("4.0 ^ 0.5"), Ok(Value::Number(n)) if n == 2.0));
+        assert_eq!(error("1.5 / 0"), "divide by zero error");
+        assert_eq!(error(r#""a" * 2"#), "`*` on a string and a number");
+        assert_eq!(error("true + null"), "`+` on a bool and a null");
+        assert_eq!(error(r#"-"a""#), "`-` on a string");
+    }
+
+    #[test]
+    fn compares_and_indexes_as_alloy_does() {
+        assert!(holds(r#""a" < "b" && "b" >= "b" && 1 < 2.5"#));
+        assert!(holds("null == null && true != false && 3 > 2"));
+        assert!(holds("[1, {a = 1}] == [1.0, {a = 1}]"));
+        assert!(holds("{a = 1, b = 2} == {b = 2, a = 1}"));
+        assert!(!holds("{a = 1} == {a = 1, b = 2}"));
+        assert!(!holds(r#""1" == 1 || [1] == [1, 2]"#));
+        // The right side is not evaluated: its name need not resolve.
+        assert!(!holds("false && nope.x"));
+        assert!(holds("true || nope.x"));
+        assert_eq!(error("1 && true"), "expected bool, got number");
+        assert_eq!(error("!\"a\""), "expected bool, got string");
+
+        assert!(matches!(value("[1, 2, 3][1]"), Ok(Value::Int(2))));
+        assert!(matches!(value(r#"{k = "v"}["k"]"#), Ok(Value::String(v))
+            if v == "v"));
+        assert!(matches!(value("[{a = 1}][0].a"), Ok(Value::Int(1))));
+        assert!(matches!(value("{a = 1}.b"), Ok(Value::Null)));
+        assert_eq!(error("[1][3]"), "index 3 out of range");
+        assert_eq!(error("[1][-1]"), "index -1 out of range");
+        assert_eq!(error(r#"[1]["a"]"#), "cannot index a array with a string");
+        assert_eq!(error(r#""s".x"#), "`.x` of a string");
+        assert_eq!(error("a.b.c.d"), "`.d` of a number");
+    }
+
+    #[test]
+    fn names_the_platform_as_go_does() {
+        let os = value("constants.os");
+        assert!(matches!(os, Ok(Value::String(s)) if s == "linux"));
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(string("constants.arch"), "amd64");
+        assert_eq!(string("constants.hostname"), crate::host::hostname());
+    }
 }

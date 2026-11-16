@@ -400,3 +400,160 @@ mod tests {
         assert!(!s.systemd.exclude.is_match("ssh.service"));
     }
 }
+
+/// A sysfs directory for a test: each file's path under `dir` and its
+/// text.
+#[cfg(test)]
+fn sysfs(dir: &Path, files: &[(&str, &str)]) {
+    for (path, text) in files {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().expect("a file in a directory"))
+            .unwrap();
+        fs::write(path, text).unwrap();
+    }
+}
+
+/// The collectors on the Linux the tests run on, its /proc read as is:
+/// what they report is checked against the kernel's own files.
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    /// Collectors whose sources every Linux has, in a VM or container.
+    const EVERYWHERE: [&str; 11] = [
+        "cpu", "filefd", "loadavg", "meminfo", "netdev", "netstat", "sockstat",
+        "stat", "time", "uname", "vmstat",
+    ];
+
+    fn round(settings: Settings) -> String {
+        let mut w = Writer::text();
+        Node::new(settings).collect(&mut w);
+        w.into_text()
+    }
+
+    fn set(names: &[&str]) -> Settings {
+        let names = names.iter().map(|n| (*n).to_owned()).collect();
+        Settings {
+            set: Some(names),
+            ..Settings::default()
+        }
+    }
+
+    /// The value of the first series starting with `series`.
+    fn value(text: &str, series: &str) -> Option<f64> {
+        let line = text.lines().find(|l| l.starts_with(series))?;
+        line.rsplit_once(' ')?.1.parse().ok()
+    }
+
+    fn kernel(path: &str) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn every_linux_collector_reads_this_host() {
+        let text = round(set(&EVERYWHERE));
+        for name in EVERYWHERE {
+            let series = format!(
+                "node_scrape_collector_success{{collector=\"{name}\"}} 1"
+            );
+            assert!(text.contains(&series), "{name} failed:\n{text}");
+        }
+        let total = kernel("/proc/meminfo");
+        let total = total.lines().find_map(|l| l.strip_prefix("MemTotal:"));
+        let kib: f64 = total
+            .unwrap()
+            .trim()
+            .trim_end_matches(" kB")
+            .parse()
+            .unwrap();
+        let reported = value(&text, "node_memory_MemTotal_bytes ");
+        assert_eq!(reported, Some(kib * 1024.0));
+        let boot = value(&text, "node_boot_time_seconds ");
+        assert_eq!(boot, Some(host::boot_time()));
+        let release = kernel("/proc/sys/kernel/osrelease");
+        let release = format!("release=\"{}\"", release.trim());
+        let uname = text.lines().find(|l| l.starts_with("node_uname_info"));
+        assert!(uname.unwrap().contains(&release), "{uname:?}");
+        let idle = "node_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} ";
+        assert!(value(&text, idle).unwrap() > 0.0);
+        let lo = "node_network_receive_bytes_total{device=\"lo\"} ";
+        assert!(value(&text, lo).is_some());
+        let now = crate::time::now_ms() as f64 / 1e3;
+        let clock = value(&text, "node_time_seconds ").unwrap();
+        assert!((clock - now).abs() < 60.0, "{clock} vs {now}");
+        assert!(value(&text, "node_load1 ").unwrap() >= 0.0);
+    }
+
+    /// Only the fields Alloy's defaults let through.
+    #[test]
+    fn netstat_and_vmstat_keep_their_default_fields() {
+        let text = round(set(&["netstat", "vmstat"]));
+        assert!(text.contains("node_netstat_Tcp_CurrEstab "));
+        assert!(!text.contains("node_netstat_TcpExt_TCPOFOQueue "));
+        assert!(text.contains("node_vmstat_pgfault "));
+        assert!(!text.contains("node_vmstat_nr_free_pages "));
+    }
+
+    #[test]
+    fn filters_devices_and_collectors() {
+        let mut settings = set(&["netdev", "loadavg"]);
+        settings.netdev.include = Some(regex("^lo$"));
+        settings.disable = vec!["loadavg".into()];
+        let text = round(settings);
+        let devices: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("node_network_receive_bytes_total"))
+            .collect();
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        assert!(devices[0].contains("device=\"lo\""));
+        assert!(!text.contains("collector=\"loadavg\""));
+        let text = round(Settings {
+            enable: vec!["processes".into()],
+            ..Settings::default()
+        });
+        assert!(text.contains("collector=\"processes\"} 1"));
+        assert!(!text.contains("collector=\"systemd\""));
+        assert!(text.contains("node_exporter_build_info{"));
+    }
+
+    /// What only a setting turns on: /proc/cpuinfo's CPUs, the flags
+    /// let through, and the addresses of the interfaces.
+    #[test]
+    fn reports_cpu_info_and_addresses_when_asked() {
+        let mut settings = set(&["cpu", "netdev"]);
+        settings.cpu.info = true;
+        settings.cpu.flags_include = Some(regex("^(fpu|sse2)$"));
+        settings.netdev_address_info = true;
+        let text = round(settings);
+        let count = |prefix: &str| {
+            text.lines().filter(|l| l.starts_with(prefix)).count()
+        };
+        let cpuinfo = kernel("/proc/cpuinfo");
+        let processors = cpuinfo.lines().filter(|l| l.starts_with("processor"));
+        let processors = processors.count();
+        assert_eq!(count("node_cpu_info{"), processors);
+        // Without cpufreq, the frequencies are cpuinfo's.
+        assert_eq!(count("node_cpu_frequency_hertz{"), processors);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(count("node_cpu_flag_info{"), 2, "{text}");
+        let lo = concat!(
+            r#"node_network_address_info{address="127.0.0.1","#,
+            r#"device="lo",netmask="8",scope="link-local"} 1"#
+        );
+        assert!(text.lines().any(|l| l == lo), "{text}");
+    }
+
+    /// Each collector, its source on this host or not, says once
+    /// whether it succeeded.
+    #[test]
+    fn every_collector_reports_success_once() {
+        let names: Vec<&str> = COLLECTORS.iter().map(|(n, _)| *n).collect();
+        let text = round(set(&names));
+        for name in names {
+            let series = format!(
+                "node_scrape_collector_success{{collector=\"{name}\"}}"
+            );
+            assert_eq!(text.matches(&series).count(), 1, "{name}");
+        }
+    }
+}

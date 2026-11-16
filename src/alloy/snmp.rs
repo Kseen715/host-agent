@@ -158,5 +158,84 @@ mod tests {
         assert_eq!(found, [("router".to_owned(), "a b".to_owned())]);
         assert!(auths("modules:\n  x: 1\n").is_err());
         assert!(auths("auths:\n  r:\n    version: 3\n").is_err());
+        assert_eq!(unquote("'it''s'"), "it's");
+        assert_eq!(unquote("plain"), "plain");
+    }
+
+    fn plan(snmp: &str) -> Result<super::super::compile::Plan, String> {
+        let text = format!(
+            "prometheus.exporter.snmp \"net\" {{ {snmp} }}
+             prometheus.scrape \"net\" {{
+               targets = prometheus.exporter.snmp.net.targets
+               forward_to = []
+             }}"
+        );
+        let stmts = super::super::syntax::parse(&text)?;
+        super::super::compile::compile(&stmts, false)
+    }
+
+    /// The targets the scrape of `snmp` gets, each as `key=value`s.
+    fn targets(snmp: &str) -> Vec<Vec<String>> {
+        let plan = plan(snmp).unwrap();
+        let crate::targets::Targets::Static(found) = &plan.scrapes[0].targets
+        else {
+            panic!("static targets");
+        };
+        let pairs = |t: &Labels| -> Vec<String> {
+            let params = t.iter().filter(|(k, _)| k.starts_with("__param"));
+            params.map(|(k, v)| format!("{k}={v}")).collect()
+        };
+        found.iter().map(pairs).collect()
+    }
+
+    #[cfg(feature = "snmp")]
+    #[test]
+    fn exports_a_target_per_device() {
+        let found = targets(
+            r#"
+            config = "auths:\n  lan:\n    version: 2\n    community: s\n"
+            targets = [{"name" = "switch", "address" = "10.0.0.2",
+                        "module" = "system,if_mib"}]
+            target "router" {
+              address = "10.0.0.1"
+              auth = "lan"
+            }"#,
+        );
+        let expected = [
+            ["switch", "10.0.0.2", "system,if_mib", "public_v2"],
+            ["router", "10.0.0.1", "if_mib", "lan"],
+        ];
+        for (found, [name, address, module, auth]) in found.iter().zip(expected)
+        {
+            assert_eq!(
+                *found,
+                [
+                    format!("__param_name={name}"),
+                    format!("__param_target={address}"),
+                    format!("__param_module={module}"),
+                    format!("__param_auth={auth}"),
+                ]
+            );
+        }
+        assert_eq!(found.len(), 2);
+    }
+
+    #[cfg(feature = "snmp")]
+    #[test]
+    fn refuses_what_snmp_exporter_would() {
+        for (body, error) in [
+            (r#"config_merge_strategy = "append""#, "replace or merge"),
+            (r#"config = "modules:\n""#, "only `auths`"),
+            (r#"targets = "r""#, "list of objects"),
+            (
+                r#"target "r" { auth = "lan" }"#,
+                "r: no auth `lan` in config",
+            ),
+            (r#"target "r" { module = "bgp" }"#, "no SNMP module `bgp`"),
+            (r#"target "r" { community = "c" }"#, "community"),
+        ] {
+            let found = plan(body).err().unwrap_or_default();
+            assert!(found.contains(error), "{body}: {found}");
+        }
     }
 }

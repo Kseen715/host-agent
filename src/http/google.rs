@@ -207,3 +207,105 @@ fn assertion(
 fn unpadded(data: &[u8]) -> String {
     base64_url(data).trim_end_matches('=').to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::from_base64_url;
+    use crate::testing::{self, RSA_KEY, response};
+    use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+
+    fn token(_: &testing::Request) -> String {
+        let body = r#"{"access_token":"ya29.t","expires_in":3600}"#;
+        response("200 OK", "application/json", body)
+    }
+
+    fn credentials(test: &str, json: &str) -> String {
+        let file = testing::scratch(test).join("credentials.json");
+        fs::write(&file, json).unwrap();
+        file.display().to_string()
+    }
+
+    /// A service account's key signs the assertion it trades at its
+    /// token_uri for a token.
+    #[test]
+    fn trades_a_signed_assertion_for_a_token() {
+        let server = testing::serve(token);
+        let account = Json::Obj(vec![
+            ("type".into(), Json::Str("service_account".into())),
+            ("client_email".into(), Json::Str("agent@p.iam".into())),
+            ("private_key_id".into(), Json::Str("k1".into())),
+            ("private_key".into(), Json::Str(RSA_KEY.into())),
+            ("token_uri".into(), Json::Str(server.url("/token"))),
+        ]);
+        let file = credentials("google-service", &account.go_text());
+        let google = Google {
+            source: source(&file).unwrap(),
+            client: Client::default(),
+        };
+        let (token, expiry) = google.ask().unwrap();
+        assert_eq!(token, "Bearer ya29.t");
+        assert!(expiry.is_some());
+        let request = &server.requests()[0];
+        let body = String::from_utf8_lossy(&request.body).into_owned();
+        let jwt = body.split('&').find_map(|p| p.strip_prefix("assertion="));
+        let (message, signature) = jwt.unwrap().rsplit_once('.').unwrap();
+        let (header, claims) = message.split_once('.').unwrap();
+        let text = |part| String::from_utf8(from_base64_url(part).unwrap());
+        let header = text(header).unwrap();
+        assert!(
+            header.contains(r#""alg":"RS256""#)
+                && header.contains(r#""kid":"k1""#)
+        );
+        let claims = text(claims).unwrap();
+        assert!(claims.contains(r#""iss":"agent@p.iam""#), "{claims}");
+        let audience = format!(r#""aud":"{}""#, server.url("/token"));
+        assert!(claims.contains(&audience), "{claims}");
+        let Source::Service { key, .. } = &google.source else {
+            unreachable!()
+        };
+        let public = UnparsedPublicKey::new(
+            &RSA_PKCS1_2048_8192_SHA256,
+            key.public().as_ref(),
+        );
+        let signature = from_base64_url(signature).unwrap();
+        public.verify(message.as_bytes(), &signature).unwrap();
+    }
+
+    #[test]
+    fn reads_credential_files() {
+        let user = credentials(
+            "google-user",
+            r#"{"type":"authorized_user","client_id":"c",
+            "client_secret":"s","refresh_token":"r"}"#,
+        );
+        let Ok(Source::User {
+            client_id, refresh, ..
+        }) = source(&user)
+        else {
+            panic!("not a user's credentials");
+        };
+        assert_eq!((client_id.as_str(), refresh.as_str()), ("c", "r"));
+        let cases = [
+            (
+                r#"{"type":"external_account"}"#,
+                "credentials of type `external_account`",
+            ),
+            ("[", "not JSON"),
+            (
+                r#"{"type":"service_account","private_key":"x"}"#,
+                "no items found",
+            ),
+        ];
+        for (json, wanted) in cases {
+            let file = credentials("google-bad", json);
+            let error = source(&file).err().unwrap();
+            assert!(error.contains(wanted), "{json}: {error}");
+        }
+        let missing = source("/no/such/credentials.json").err().unwrap();
+        assert!(missing.starts_with("/no/such/credentials.json: "));
+        assert!(
+            tokens("/no/such/credentials.json", Client::default()).is_err()
+        );
+    }
+}

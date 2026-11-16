@@ -476,4 +476,77 @@ unused devices: <none>
         assert_eq!(dehumanize(b"2M"), Some(2 << 20));
         assert_eq!(signed("-1.0k"), Some(-1024.0));
     }
+
+    /// A bcache set with a backing and a cache device, in procfs's
+    /// fixture's shape.
+    #[test]
+    fn reads_a_bcache_set() {
+        let dir = crate::testing::scratch("bcache")
+            .join("deaddd54-c735-46d5-868e-f331c5fd7c74");
+        super::super::sysfs(
+            &dir,
+            &[
+                ("average_key_size", "0\n"),
+                ("btree_cache_size", "0\n"),
+                ("cache_available_percent", "100\n"),
+                ("congested", "0\n"),
+                ("root_usage_percent", "0\n"),
+                ("tree_depth", "0\n"),
+                ("internal/active_journal_entries", "1\n"),
+                ("internal/btree_nodes", "2\n"),
+                ("internal/btree_read_average_duration_us", "1305\n"),
+                ("internal/cache_read_races", "0\n"),
+                ("bdev0/dirty_data", "1.5k\n"),
+                (
+                    "bdev0/writeback_rate_debug",
+                    "rate:\t\t1.1M/sec\ndirty:\t\t20.4G\ntarget:\t\t20.4G\n\
+                     proportional:\t427.5k\nintegral:\t-790.0k\n\
+                     change:\t\t321.5k/sec\nnext io:\t17ms\n",
+                ),
+                ("bdev0/stats_total/bypassed", "0\n"),
+                ("bdev0/stats_total/cache_hits", "546\n"),
+                ("bdev0/stats_total/cache_readaheads", "13\n"),
+                ("cache0/io_errors", "0\n"),
+                ("cache0/metadata_written", "512\n"),
+                ("cache0/written", "0\n"),
+                (
+                    "cache0/priority_stats",
+                    "Unused:\t\t99%\nMetadata:\t0%\nAverage:\t10473\n",
+                ),
+            ],
+        );
+        let metrics = bcache_set(&dir, true).unwrap();
+        let find = |name: &str| {
+            let found = metrics.iter().find(|(n, _, _)| *n == name);
+            found.map(|(_, device, value)| (device.clone(), *value))
+        };
+        assert_eq!(find("btree_nodes"), Some((None, 2.0)));
+        assert_eq!(
+            find("btree_read_average_duration_seconds"),
+            Some((None, 1305e-9))
+        );
+        let backing = Some(("backing_device", "bdev0".to_owned()));
+        assert_eq!(
+            find("dirty_data_bytes"),
+            Some((backing.clone(), 1024.0 + 500.0))
+        );
+        assert_eq!(
+            find("writeback_rate"),
+            Some((backing.clone(), 1_150_976.0))
+        );
+        assert_eq!(
+            find("writeback_rate_integral_term"),
+            Some((backing.clone(), -808_960.0))
+        );
+        assert_eq!(find("cache_hits_total"), Some((backing.clone(), 546.0)));
+        assert_eq!(find("cache_readaheads_total"), Some((backing, 13.0)));
+        let cache = Some(("cache_device", "cache0".to_owned()));
+        assert_eq!(
+            find("metadata_written_bytes_total"),
+            Some((cache.clone(), 512.0))
+        );
+        assert_eq!(find("priority_stats_unused_percent"), Some((cache, 99.0)));
+        fs::write(dir.join("congested"), "lots\n").unwrap();
+        assert!(bcache_set(&dir, false).is_err());
+    }
 }

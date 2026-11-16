@@ -350,4 +350,189 @@ mod tests {
         assert_eq!(frame(&mut raw, 8, false, b'\0').unwrap(), b"a\0");
         assert_eq!(long.len(), 12);
     }
+
+    /// Messages over UDP and TCP, through the source's rules, to Loki.
+    #[test]
+    fn listens_over_udp_and_tcp() {
+        use crate::testing::{self, response};
+        use std::io::Write;
+        let loki =
+            testing::serve(|_| response("204 No Content", "text/plain", ""));
+        let text = format!(
+            r#"loki.write "w" {{ endpoint {{ url = "{}" }} }}
+            loki.relabel "syslog" {{
+                rule {{
+                    source_labels = ["__syslog_message_hostname"]
+                    target_label = "host"
+                }}
+                rule {{
+                    source_labels = ["__syslog_message_app_name"]
+                    target_label = "app"
+                }}
+                rule {{
+                    source_labels = ["__syslog_message_sd_ex_32473_user"]
+                    target_label = "user"
+                }}
+                forward_to = []
+            }}
+            loki.source.syslog "s" {{
+                listener {{
+                    address = "127.0.0.1:0"
+                    protocol = "udp"
+                    labels = {{"via" = "udp"}}
+                    label_structured_data = true
+                }}
+                listener {{
+                    address = "127.0.0.1:0"
+                    protocol = "tcp"
+                    syslog_format = "rfc3164"
+                    labels = {{"via" = "tcp"}}
+                }}
+                relabel_rules = loki.relabel.syslog.rules
+                forward_to = [loki.write.w.receiver]
+            }}"#,
+            loki.url("/loki/api/v1/push"),
+        );
+        let stmts = crate::alloy::parse(&text).unwrap();
+        let mut plan = crate::alloy::compile(&stmts, false).unwrap();
+        let mut logs = std::mem::take(&mut plan.logs);
+        let mut positions =
+            Positions::load(testing::scratch("syslog").join("positions"));
+        let mut listeners: Vec<Syslog> = std::mem::take(&mut plan.syslogs)
+            .into_iter()
+            .map(|l| Syslog::bind(l).unwrap())
+            .collect();
+        let address = |s: &Syslog| match &s.socket {
+            Socket::Udp(socket) => socket.local_addr().unwrap(),
+            Socket::Tcp(socket, _) => socket.local_addr().unwrap(),
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let message = "<34>1 2026-11-15T10:00:00Z web01 sshd 42 ID47 \
+            [ex@32473 user=\"ann\"] Failed password\n";
+        udp.send_to(message.as_bytes(), address(&listeners[0]))
+            .unwrap();
+        let mut tcp = TcpStream::connect(address(&listeners[1])).unwrap();
+        let counted = "<13>Nov 15 10:00:01 web02 cron[7]: counted";
+        let framed = format!("{} {counted}", counted.len());
+        tcp.write_all(framed.as_bytes()).unwrap();
+        tcp.write_all(b"<13>Nov 15 10:00:02 web02 cron[7]: by line\n")
+            .unwrap();
+        drop(tcp);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for listener in &mut listeners {
+                for index in (0..listener.fds().len()).rev() {
+                    listener.read(index, &mut logs, &mut positions);
+                }
+            }
+            logs.flush();
+            if logs.sinks[0].sent >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pushed: String = loki
+            .requests()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for wanted in [
+            r#""host":"web01""#,
+            r#""app":"sshd""#,
+            r#""user":"ann""#,
+            r#""via":"udp""#,
+            "Failed password",
+            r#""host":"web02""#,
+            r#""via":"tcp""#,
+            "counted",
+            "by line",
+        ] {
+            assert!(pushed.contains(wanted), "{wanted} not in {pushed}");
+        }
+        assert!(!pushed.contains("__syslog_"), "{pushed}");
+    }
+
+    /// RFC 5425: syslog inside TLS, the client's certificate checked
+    /// against the listener's CA.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn listens_over_tls() {
+        use crate::testing::{self, CA, CLIENT_CERT, CLIENT_KEY};
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+        use std::io::Write;
+        use std::sync::Arc;
+        let loki = testing::serve(|_| {
+            testing::response("204 No Content", "text/plain", "")
+        });
+        let text = format!(
+            r#"loki.write "w" {{ endpoint {{ url = "{}" }} }}
+            loki.source.syslog "s" {{
+                listener {{
+                    address = "127.0.0.1:0"
+                    tls_config {{
+                        cert_pem = {:?}
+                        key_pem = {:?}
+                        ca_pem = {:?}
+                    }}
+                }}
+                forward_to = [loki.write.w.receiver]
+            }}"#,
+            loki.url("/push"),
+            testing::SERVER_CERT,
+            testing::SERVER_KEY,
+            CA,
+        );
+        let stmts = crate::alloy::parse(&text).unwrap();
+        let mut plan = crate::alloy::compile(&stmts, false).unwrap();
+        let mut logs = std::mem::take(&mut plan.logs);
+        let mut positions =
+            Positions::load(testing::scratch("syslog-tls").join("positions"));
+        let mut syslog = Syslog::bind(plan.syslogs.remove(0)).unwrap();
+        let Socket::Tcp(socket, _) = &syslog.socket else {
+            unreachable!()
+        };
+        let address = socket.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in CertificateDer::pem_slice_iter(CA.as_bytes()) {
+                roots.add(cert.unwrap()).unwrap();
+            }
+            let chain = CertificateDer::pem_slice_iter(CLIENT_CERT.as_bytes());
+            let key = PrivateKeyDer::from_pem_slice(CLIENT_KEY.as_bytes());
+            let provider = rustls::crypto::ring::default_provider();
+            let config =
+                rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(
+                        chain.map(Result::unwrap).collect(),
+                        key.unwrap(),
+                    )
+                    .unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let tls = rustls::ClientConnection::new(Arc::new(config), name);
+            let tcp = TcpStream::connect(address).unwrap();
+            let mut stream = rustls::StreamOwned::new(tls.unwrap(), tcp);
+            let message = "<165>1 2026-11-15T10:00:00Z gw app - - - over tls";
+            write!(stream, "{} {message}", message.len()).unwrap();
+            stream.flush().unwrap();
+            stream.conn.send_close_notify();
+            stream.flush().unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && logs.sinks[0].sent == 0 {
+            for index in (0..syslog.fds().len()).rev() {
+                syslog.read(index, &mut logs, &mut positions);
+            }
+            syslog.prepare(&positions);
+            logs.flush();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.join().unwrap();
+        let pushed =
+            String::from_utf8_lossy(&loki.requests()[0].body).into_owned();
+        assert!(pushed.contains("over tls"), "{pushed}");
+    }
 }

@@ -488,4 +488,218 @@ mod tests {
         assert_eq!(devices[0].1, [("Read".into(), 5.0), ("Write".into(), 6.0)]);
         fs::remove_file(dir).unwrap();
     }
+
+    fn write_all(dir: &Path, files: &[(&str, &str)]) {
+        fs::create_dir_all(dir).unwrap();
+        for (name, text) in files {
+            fs::write(dir.join(name), text).unwrap();
+        }
+    }
+
+    /// A container's cgroup v2 directory, as the kernel writes it.
+    #[test]
+    fn reads_a_v2_cgroup() {
+        let dir = crate::testing::scratch("cgroup-v2");
+        write_all(
+            &dir,
+            &[
+                (
+                    "cpu.stat",
+                    "usage_usec 2500000\nuser_usec 2000000\n\
+                    system_usec 500000\n",
+                ),
+                ("memory.current", "1048576\n"),
+                (
+                    "memory.stat",
+                    "anon 4096\nfile 8192\npgfault 7\n\
+                    pgmajfault 2\n",
+                ),
+                (
+                    "memory.events",
+                    "low 0\nhigh 3\nmax 4\noom 1\n\
+                    oom_kill 1\n",
+                ),
+                ("memory.swap.current", "0\n"),
+                ("memory.peak", "2097152\n"),
+                ("memory.max", "max\n"),
+                ("memory.low", "65536\n"),
+                (
+                    "io.stat",
+                    "8:0 rbytes=10 wbytes=20 rios=1 wios=2 \
+                    dbytes=0 dios=0\n259:0 rbytes=5\n",
+                ),
+                ("cpu.max", "50000 100000\n"),
+                ("cpu.weight", "10000\n"),
+                (
+                    "cpu.pressure",
+                    "some avg10=0.00 avg60=0.00 \
+                    avg300=0.00 total=1500000\n\
+                    full avg10=0.00 avg60=0.00 avg300=0.00 total=500000\n",
+                ),
+            ],
+        );
+        let cgroup = Cgroup::V2(dir.clone());
+        let cpu = cgroup.cpu();
+        assert_eq!(cpu.usage, [("total".to_owned(), 2.5)]);
+        assert_eq!((cpu.user, cpu.system), (Some(2.0), Some(0.5)));
+        let memory = cgroup.memory();
+        assert_eq!((memory.usage, memory.peak), (1_048_576.0, 2_097_152.0));
+        assert_eq!(memory.faults, [(7.0, 7.0), (2.0, 2.0)]);
+        assert_eq!(
+            (memory.high, memory.max, memory.oom_kills),
+            (3.0, 4.0, 1.0)
+        );
+        let io = cgroup.io();
+        assert_eq!(io.len(), 2);
+        assert_eq!(io[0].numbers, "8:0");
+        let counts = (
+            io[0].read_bytes,
+            io[0].write_bytes,
+            io[0].reads,
+            io[0].writes,
+        );
+        assert_eq!(counts, (10.0, 20.0, 1.0, 2.0));
+        assert_eq!((io[1].read_bytes, io[1].writes), (5.0, 0.0));
+        let pressure = cgroup.pressure();
+        assert!(pressure.contains(&("cpu", "waiting", 1.5)));
+        assert!(pressure.contains(&("cpu", "stalled", 0.5)));
+        let spec = cgroup.spec();
+        assert_eq!((spec.quota, spec.period), (Some(50_000.0), 100_000.0));
+        // runc's top weight is v1's top shares.
+        assert_eq!(spec.shares, 262_144.0);
+        assert_eq!(spec.memory, Some((0.0, 65_536.0, 0.0)));
+    }
+
+    /// The host's root cgroup has no memory.current: anon + file.
+    #[test]
+    fn a_v2_root_counts_anon_and_file() {
+        let dir = crate::testing::scratch("cgroup-v2-root");
+        write_all(&dir, &[("memory.stat", "anon 4096\nfile 8192\n")]);
+        let cgroup = Cgroup::V2(dir);
+        assert_eq!(cgroup.memory().usage, 12_288.0);
+        let spec = cgroup.spec();
+        assert_eq!((spec.quota, spec.shares, spec.memory), (None, 0.0, None));
+        assert!(cgroup.io().is_empty());
+    }
+
+    /// Docker's directories on cgroup v1, one per controller.
+    #[test]
+    fn reads_v1_controllers() {
+        let root = crate::testing::scratch("cgroup-v1");
+        let (cpu, memory, blkio) =
+            (root.join("cpu"), root.join("memory"), root.join("blkio"));
+        write_all(
+            &cpu,
+            &[
+                ("cpuacct.usage_percpu", "1000000000 500000000\n"),
+                ("cpuacct.stat", "user 150\nsystem 50\n"),
+                ("cpu.cfs_quota_us", "-1\n"),
+                ("cpu.cfs_period_us", "100000\n"),
+                ("cpu.shares", "512\n"),
+            ],
+        );
+        write_all(
+            &memory,
+            &[
+                ("memory.usage_in_bytes", "1000\n"),
+                ("memory.memsw.usage_in_bytes", "1500\n"),
+                (
+                    "memory.stat",
+                    "rss 1\npgfault 9\npgmajfault 1\n\
+                    total_rss 600\ntotal_cache 300\n",
+                ),
+                ("memory.max_usage_in_bytes", "2000\n"),
+                ("memory.failcnt", "3\n"),
+                (
+                    "memory.oom_control",
+                    "oom_kill_disable 0\n\
+                    under_oom 0\noom_kill 2\n",
+                ),
+                ("memory.limit_in_bytes", "9223372036854771712\n"),
+                ("memory.soft_limit_in_bytes", "4096\n"),
+            ],
+        );
+        write_all(
+            &blkio,
+            &[
+                (
+                    "blkio.throttle.io_service_bytes",
+                    "8:0 Read 100\n8:0 Write 200\n8:0 Total 300\nTotal 300\n",
+                ),
+                (
+                    "blkio.throttle.io_serviced",
+                    "8:0 Read 1\n8:0 Write 2\nTotal 3\n",
+                ),
+            ],
+        );
+        let dirs = [
+            ("cpu", &cpu),
+            ("cpuacct", &cpu),
+            ("memory", &memory),
+            ("blkio", &blkio),
+        ];
+        let cgroup = Cgroup::V1(
+            dirs.iter()
+                .map(|(c, d)| ((*c).to_owned(), (*d).clone()))
+                .collect(),
+        );
+        let usage = cgroup.cpu();
+        assert_eq!(
+            usage.usage,
+            [("cpu00".to_owned(), 1.0), ("cpu01".to_owned(), 0.5)]
+        );
+        assert_eq!((usage.user, usage.system), (Some(1.5), Some(0.5)));
+        let m = cgroup.memory();
+        assert_eq!(
+            (m.usage, m.swap, m.peak, m.failcnt),
+            (1000.0, 500.0, 2000.0, 3.0)
+        );
+        assert_eq!(m.oom_kills, 2.0);
+        assert_eq!(m.faults, [(9.0, 9.0), (1.0, 1.0)]);
+        assert_eq!(find(&m.stat, "anon"), Some(600.0));
+        assert_eq!(find(&m.stat, "file"), Some(300.0));
+        let io = cgroup.io();
+        let counts = (
+            io[0].read_bytes,
+            io[0].write_bytes,
+            io[0].reads,
+            io[0].writes,
+        );
+        assert_eq!(counts, (100.0, 200.0, 1.0, 2.0));
+        assert!(cgroup.pressure().iter().all(|(_, _, v)| *v == 0.0));
+        let spec = cgroup.spec();
+        assert_eq!(
+            (spec.quota, spec.period, spec.shares),
+            (None, 100_000.0, 512.0)
+        );
+        // v1's "no limit" is i64::MAX rounded to a page: 0, as cAdvisor.
+        assert_eq!(spec.memory, Some((0.0, 4096.0, 0.0)));
+    }
+
+    /// Without the memory controller, zeros, as cAdvisor reports.
+    #[test]
+    fn no_memory_controller_is_zeros() {
+        let cgroup = Cgroup::V1(Vec::new());
+        assert_eq!(cgroup.memory().usage, 0.0);
+        assert!(cgroup.spec().memory.is_none());
+        assert!(cgroup.cpu().usage.is_empty());
+    }
+
+    #[test]
+    fn lists_cgroups_below_a_root_parents_first() {
+        let dir = crate::testing::scratch("cgroup-below");
+        fs::create_dir_all(dir.join("system.slice/docker-1.scope")).unwrap();
+        fs::create_dir_all(dir.join("init.scope")).unwrap();
+        fs::write(dir.join("cgroup.procs"), "").unwrap();
+        let mut found = Vec::new();
+        below(&dir, "", &mut found);
+        assert_eq!(
+            found,
+            [
+                "/init.scope",
+                "/system.slice",
+                "/system.slice/docker-1.scope"
+            ]
+        );
+    }
 }

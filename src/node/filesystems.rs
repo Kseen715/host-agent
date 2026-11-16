@@ -90,7 +90,13 @@ const XFS: [(&str, &[Option<&str>]); 8] = [
 ];
 
 pub fn xfs(_: &Node, w: &mut Writer) -> io::Result<()> {
-    for (dir, device) in entries(&host::path("/sys/fs/xfs"), "") {
+    xfs_in(&host::path("/sys/fs/xfs"), w);
+    Ok(())
+}
+
+/// Each device's counters in `root`, /sys/fs/xfs.
+fn xfs_in(root: &Path, w: &mut Writer) {
+    for (dir, device) in entries(root, "") {
         let Some(text) = read(dir.join("stats/stats")) else {
             continue;
         };
@@ -108,7 +114,6 @@ pub fn xfs(_: &Node, w: &mut Writer) -> io::Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 const BLOCK_GROUPS: [&str; 3] = ["data", "metadata", "system"];
@@ -116,8 +121,14 @@ const DEVICE_ERRORS: [&str; 5] =
     ["write", "read", "flush", "corruption", "generation"];
 
 pub fn btrfs(_: &Node, w: &mut Writer) -> io::Result<()> {
-    let mounts = btrfs_mounts();
-    for (dir, uuid) in entries(&host::path("/sys/fs/btrfs"), "") {
+    btrfs_in(&host::path("/sys/fs/btrfs"), &btrfs_mounts(), w);
+    Ok(())
+}
+
+/// Each file system in `root`, /sys/fs/btrfs; its devices through the
+/// mount point of the same UUID in `mounts`.
+fn btrfs_in(root: &Path, mounts: &[(String, String)], w: &mut Writer) {
+    for (dir, uuid) in entries(root, "") {
         if !dir.join("allocation").is_dir() {
             continue;
         }
@@ -138,7 +149,6 @@ pub fn btrfs(_: &Node, w: &mut Writer) -> io::Result<()> {
             btrfs_devices(w, point, &uuid);
         }
     }
-    Ok(())
 }
 
 fn block_group(
@@ -322,5 +332,76 @@ mod tests {
         assert_eq!(allocation_ratio("dup", 1.0), 2.0);
         assert_eq!(allocation_ratio("raid5", 3.0), 1.5);
         assert_eq!(allocation_ratio("single", 1.0), 1.0);
+    }
+
+    fn lines(text: &str, prefix: &str) -> Vec<String> {
+        let found = text.lines().filter(|l| l.starts_with(prefix));
+        found.map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn reads_xfs_counters() {
+        let root = crate::testing::scratch("xfs");
+        let stats = "extent_alloc 4 7 3 5\nrw 21 32\nxs_unknown 1 2\n\
+            vnodes 62578 15959 0 0 15959 15959 15959 0\n";
+        super::super::sysfs(&root, &[("sda1/stats/stats", stats)]);
+        let mut w = Writer::text();
+        xfs_in(&root, &mut w);
+        let text = w.into_text();
+        let device = r#"{device="sda1"}"#;
+        for line in [
+            format!(
+                "node_xfs_extent_allocation_extents_allocated_total{device} 4"
+            ),
+            format!("node_xfs_extent_allocation_blocks_freed_total{device} 5"),
+            format!("node_xfs_write_calls_total{device} 21"),
+            format!("node_xfs_read_calls_total{device} 32"),
+            format!("node_xfs_vnode_active_total{device} 62578"),
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+        }
+        // vnodes' eighth field has no name in node_exporter.
+        assert_eq!(lines(&text, "node_xfs_vnode_").len(), 7);
+        assert_eq!(text.lines().count(), 4 + 2 + 7);
+    }
+
+    #[test]
+    fn reads_a_btrfs_file_system() {
+        let root = crate::testing::scratch("btrfs");
+        let uuid = "0abb23a9-9aa5-4ef8-8c5d-2ae7e7e5d2c1";
+        super::super::sysfs(
+            &root.join(uuid),
+            &[
+                ("label", "data\n"),
+                ("allocation/global_rsv_size", "16777216\n"),
+                ("allocation/data/bytes_reserved", "4096\n"),
+                ("allocation/data/raid5/total_bytes", "3221225472\n"),
+                ("allocation/data/raid5/used_bytes", "1073741824\n"),
+                ("allocation/metadata/raid1/total_bytes", "268435456\n"),
+                ("devices/sda", ""),
+                ("devices/sdb", ""),
+                ("devices/sdc", ""),
+            ],
+        );
+        super::super::sysfs(&root, &[("features/raid56", "0\n")]);
+        let mut w = Writer::text();
+        btrfs_in(&root, &[], &mut w);
+        let text = w.into_text();
+        let fs = format!(r#"uuid="{uuid}""#);
+        let data = format!(r#"block_group_type="data",mode="raid5",{fs}"#);
+        let meta = format!(r#"block_group_type="metadata",mode="raid1",{fs}"#);
+        let reserved = format!(r#"block_group_type="data",{fs}"#);
+        let expected = [
+            format!(r#"node_btrfs_info{{label="data",{fs}}} 1"#),
+            format!("node_btrfs_global_rsv_size_bytes{{{fs}}} 16777216"),
+            format!("node_btrfs_reserved_bytes{{{reserved}}} 4096"),
+            format!("node_btrfs_size_bytes{{{data}}} 3221225472"),
+            format!("node_btrfs_used_bytes{{{data}}} 1073741824"),
+            // Three devices in RAID 5: one of three bytes is parity.
+            format!("node_btrfs_allocation_ratio{{{data}}} 1.5"),
+            format!("node_btrfs_size_bytes{{{meta}}} 268435456"),
+            format!("node_btrfs_allocation_ratio{{{meta}}} 2"),
+        ];
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
     }
 }

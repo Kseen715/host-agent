@@ -256,4 +256,41 @@ mod tests {
         assert_eq!(sanitize("a_-_b"), "a_b");
         assert_eq!(sanitize("psys-"), "psys_");
     }
+
+    /// A laptop's battery: numbers scaled as node_exporter scales them,
+    /// text in the info series.
+    #[test]
+    fn reads_a_power_supply() {
+        let dir = crate::testing::scratch("power-supply").join("BAT0");
+        super::super::sysfs(
+            &dir,
+            &[
+                ("capacity", "87\n"),
+                ("cycle_count", "123\n"),
+                ("voltage_now", "12500000\n"),
+                ("energy_full", "0x2faf080\n"),
+                ("temp", "305\n"),
+                ("status", "Discharging\n"),
+                ("manufacturer", "ACME\n"),
+                ("type", "Battery\n"),
+            ],
+        );
+        let values = attributes(&dir).unwrap();
+        let mut w = Writer::text();
+        supply(&mut w, "BAT0", &values).unwrap();
+        let text = w.into_text();
+        for wanted in [
+            "node_power_supply_capacity{power_supply=\"BAT0\"} 87",
+            "node_power_supply_cyclecount{power_supply=\"BAT0\"} 123",
+            "node_power_supply_voltage_volt{power_supply=\"BAT0\"} 12.5",
+            "node_power_supply_energy_full{power_supply=\"BAT0\"} 50",
+            "node_power_supply_temp_celsius{power_supply=\"BAT0\"} 30.5",
+            "manufacturer=\"ACME\"",
+            "status=\"Discharging\"",
+        ] {
+            assert!(text.contains(wanted), "{wanted} not in\n{text}");
+        }
+        fs::write(dir.join("capacity"), "full\n").unwrap();
+        assert!(attributes(&dir).is_err(), "a number that is not one");
+    }
 }

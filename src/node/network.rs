@@ -297,3 +297,32 @@ fn add_netstat(
         w.add(&format!("node_netstat_{key}"), &[], value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go's scope() in node_exporter, address by address.
+    #[test]
+    fn scopes_addresses_as_node_exporter() {
+        for (address, expected) in [
+            ("127.0.0.1", "link-local"),
+            ("169.254.10.1", "link-local"),
+            ("224.0.0.251", "link-local"),
+            ("10.0.0.1", "global"),
+            ("239.1.1.1", ""),
+            ("255.255.255.255", ""),
+            ("0.0.0.0", ""),
+            ("::1", "link-local"),
+            ("fe80::1", "link-local"),
+            ("ff02::1", "link-local"),
+            ("ff01::1", "interface-local"),
+            ("2001:db8::1", "global"),
+            ("ff05::2", ""),
+            ("::", ""),
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert_eq!(scope(ip), expected, "{address}");
+        }
+    }
+}

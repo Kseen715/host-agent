@@ -212,3 +212,93 @@ impl ServerCertVerifier for Unverified {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{Client, get};
+    use crate::testing::{self, CA, CLIENT_CERT, CLIENT_KEY, response};
+
+    fn client(settings: Settings) -> Client {
+        Client {
+            tls: Some(Tls::new(&settings).unwrap()),
+            ..Client::default()
+        }
+    }
+
+    fn ca() -> Settings {
+        Settings {
+            ca: Some(CA.into()),
+            ..Settings::default()
+        }
+    }
+
+    /// HTTPS to a server whose certificate the given CA signed, by its
+    /// name or address; not to one the CA does not vouch for.
+    #[test]
+    fn verifies_the_server_against_the_ca() {
+        let server = testing::serve_tls(|r| {
+            response("200 OK", "text/plain", &format!("hello {}", r.path))
+        });
+        let port = server.address.port();
+        let by_ip = Url::parse(&format!("https://127.0.0.1:{port}/a")).unwrap();
+        let answer = get(&by_ip, &client(ca()), "text/plain").unwrap();
+        assert_eq!((answer.status, &answer.body[..]), (200, &b"hello /a"[..]));
+        let by_name =
+            Url::parse(&format!("https://localhost:{port}/b")).unwrap();
+        let tls13 = Settings {
+            tls13_only: true,
+            ..ca()
+        };
+        assert!(get(&by_name, &client(tls13), "*/*").unwrap().ok());
+        let other = Settings {
+            server_name: Some("other.example".into()),
+            ..ca()
+        };
+        let error = get(&by_ip, &client(other), "*/*").err().unwrap();
+        assert!(error.to_string().contains("certificate"), "{error}");
+        // The system's roots, where the host has them, do not know it.
+        if let Ok(system) = Tls::new(&Settings::default()) {
+            let system = Client {
+                tls: Some(system),
+                ..Client::default()
+            };
+            let error = get(&by_ip, &system, "*/*").err().unwrap();
+            assert!(error.to_string().contains("certificate"), "{error}");
+        }
+        let insecure = Settings {
+            insecure_skip_verify: true,
+            ..Settings::default()
+        };
+        assert!(get(&by_ip, &client(insecure), "*/*").unwrap().ok());
+    }
+
+    #[test]
+    fn reads_pem_settings() {
+        assert_eq!(certificates(CA).unwrap().len(), 1);
+        let error = certificates("no pem here").unwrap_err();
+        assert_eq!(error, "no certificate in PEM");
+        let with_client = Settings {
+            cert: Some(CLIENT_CERT.into()),
+            key: Some(CLIENT_KEY.into()),
+            ..ca()
+        };
+        assert!(Tls::new(&with_client).is_ok());
+        let bad_key = Settings {
+            key: Some(
+                "-----BEGIN PRIVATE KEY-----\nAA==\n\
+                 -----END PRIVATE KEY-----\n"
+                    .into(),
+            ),
+            ..with_client
+        };
+        assert!(Tls::new(&bad_key).err().unwrap().starts_with("cert:"));
+        let not_ca = Settings {
+            ca: Some(CLIENT_KEY.into()),
+            ..Settings::default()
+        };
+        assert!(Tls::new(&not_ca).is_err());
+        assert_eq!(versions(true).len(), 1);
+        assert_eq!(versions(false).len(), 2);
+    }
+}

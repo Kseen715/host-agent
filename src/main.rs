@@ -65,6 +65,8 @@ mod syslog;
 mod tap;
 mod targets;
 mod template;
+#[cfg(test)]
+mod testing;
 mod time;
 mod zone;
 

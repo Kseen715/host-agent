@@ -157,3 +157,132 @@ async fn send_request(
 fn other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::request;
+    use super::super::tls::{Settings, Tls};
+    use super::*;
+    use crate::testing::{self, CA, response};
+    use std::sync::{Arc, Mutex};
+
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    /// An HTTPS server that speaks h2 only, agreed on by ALPN: it
+    /// answers what it was sent, and `/moved` with a 303 to `/echo`.
+    fn serve_h2() -> (u16, Seen) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Seen::default();
+        let kept = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let runtime = Builder::new_current_thread().enable_all().build();
+            runtime.unwrap().block_on(accept(listener, kept));
+        });
+        (port, seen)
+    }
+
+    async fn accept(listener: std::net::TcpListener, seen: Seen) {
+        let mut config = testing::server_config();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            // Each stream answered alongside: the connection, polled
+            // here, is what moves their frames.
+            while let Some(Ok((request, respond))) = connection.accept().await {
+                tokio::spawn(answer(request, respond, Arc::clone(&seen)));
+            }
+        }
+    }
+
+    async fn answer(
+        request: http::Request<h2::RecvStream>,
+        mut respond: h2::server::SendResponse<Bytes>,
+        seen: Seen,
+    ) {
+        let (head, mut body) = request.into_parts();
+        let mut data = Vec::new();
+        while let Some(Ok(chunk)) = body.data().await {
+            data.extend_from_slice(&chunk);
+        }
+        let header = head.headers.get("x-a").map(|v| v.to_str().unwrap());
+        let text = format!(
+            "{} {} x-a={} {}",
+            head.method,
+            head.uri.path(),
+            header.unwrap_or_default(),
+            String::from_utf8_lossy(&data)
+        );
+        seen.lock().unwrap().push(text.clone());
+        let status = if head.uri.path() == "/moved" {
+            303
+        } else {
+            200
+        };
+        let answer = http::Response::builder()
+            .status(status)
+            .header("location", "/echo")
+            .body(())
+            .unwrap();
+        let mut send = respond.send_response(answer, false).unwrap();
+        send.send_data(Bytes::from(text), true).unwrap();
+    }
+
+    fn client() -> Client {
+        let settings = Settings {
+            ca: Some(CA.into()),
+            ..Settings::default()
+        };
+        Client {
+            tls: Some(Tls::new(&settings).unwrap()),
+            http2: true,
+            ..Client::default()
+        }
+    }
+
+    #[test]
+    fn speaks_h2_when_the_server_picks_it() {
+        let (port, seen) = serve_h2();
+        let url = |path: &str| {
+            Url::parse(&format!("https://localhost:{port}{path}")).unwrap()
+        };
+        // Connection is HTTP/1.1's alone: h2 refuses a request with it.
+        let headers = "X-A: 1\r\nConnection: close\r\n";
+        let echo = request(&url("/echo"), &client(), "POST", headers, b"hi");
+        let echo = echo.unwrap();
+        assert_eq!(
+            (echo.status, &echo.body[..]),
+            (200, &b"POST /echo x-a=1 hi"[..])
+        );
+        let moved = request(&url("/moved"), &client(), "POST", "", b"x");
+        assert_eq!(&moved.unwrap().body[..], b"GET /echo x-a= ");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "POST /echo x-a=1 hi",
+                "POST /moved x-a= x",
+                "GET /echo x-a= "
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_http1_when_the_server_picks_it() {
+        let server = testing::serve_tls(|r| {
+            response(
+                "200 OK",
+                "text/plain",
+                &format!("{} {}", r.method, r.path),
+            )
+        });
+        let port = server.address.port();
+        let url = Url::parse(&format!("https://localhost:{port}/a")).unwrap();
+        let answer = request(&url, &client(), "GET", "", &[]).unwrap();
+        assert_eq!(&answer.body[..], b"GET /a");
+    }
+}

@@ -674,3 +674,315 @@ fn handle_signals() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{self, Request, response};
+    use std::sync::atomic::AtomicUsize;
+
+    const EXPOSITION: &str = "# TYPE demo_jobs_total counter\n\
+        demo_jobs_total{queue=\"mail\"} 3\n";
+
+    /// An app to scrape and a Prometheus to write to, on one server:
+    /// the first `refusals` writes get a 503.
+    fn backend(refusals: usize) -> testing::Server {
+        let writes = AtomicUsize::new(0);
+        testing::serve(move |request: &Request| {
+            if request.method == "GET" {
+                return response("200 OK", "text/plain", EXPOSITION);
+            }
+            match writes.fetch_add(1, Ordering::Relaxed) < refusals {
+                true => response("503 Service Unavailable", "text/plain", ""),
+                false => response("204 No Content", "text/plain", ""),
+            }
+        })
+    }
+
+    fn config(server: &testing::Server) -> String {
+        format!(
+            r#"
+            prometheus.exporter.self "agent" {{ }}
+            prometheus.scrape "apps" {{
+                targets = array.concat(
+                    [{{"__address__" = "{}", "team" = "core"}}],
+                    prometheus.exporter.self.agent.targets,
+                )
+                params = {{"debug" = ["1"]}}
+                forward_to = [prometheus.relabel.trim.receiver]
+            }}
+            prometheus.relabel "trim" {{
+                rule {{
+                    source_labels = ["__name__"]
+                    regex = "scrape_.*"
+                    action = "drop"
+                }}
+                forward_to = [prometheus.remote_write.prom.receiver]
+            }}
+            prometheus.remote_write "prom" {{
+                external_labels = {{"site" = "home"}}
+                endpoint {{
+                    url = "{}"
+                    queue_config {{
+                        min_backoff = "1ms"
+                        max_backoff = "1ms"
+                    }}
+                }}
+            }}"#,
+            server.address,
+            server.url("/api/v1/write"),
+        )
+    }
+
+    fn agent(server: &testing::Server, test: &str) -> Agent {
+        let options = Options {
+            listen: "127.0.0.1:0".into(),
+            storage: testing::scratch(test),
+            print: false,
+        };
+        let stmts = alloy::parse(&config(server)).unwrap();
+        Agent::new(&stmts, &options).unwrap()
+    }
+
+    /// The samples of every write Prometheus took, as protobuf text.
+    fn written(server: &testing::Server) -> String {
+        let posts = server.requests().into_iter().filter(|r| {
+            r.method == "POST" && r.header("Content-Encoding") == Some("snappy")
+        });
+        let mut decoder = snap::raw::Decoder::new();
+        let bodies = posts.map(|r| decoder.decompress_vec(&r.body).unwrap());
+        String::from_utf8_lossy(&bodies.collect::<Vec<_>>().concat())
+            .into_owned()
+    }
+
+    #[test]
+    fn scrapes_relabels_and_writes_a_round() {
+        let server = backend(0);
+        let mut agent = agent(&server, "round");
+        agent.round();
+        agent.writer.close();
+        let scraped = server.requests();
+        assert_eq!(scraped[0].path, "/metrics?debug=1");
+        let sent = written(&server);
+        for wanted in ["demo_jobs_total", "mail", "team", "core", "site"] {
+            assert!(sent.contains(wanted), "{wanted} not sent");
+        }
+        assert!(sent.contains("alloy_build_info"));
+        assert!(sent.contains("prometheus_remote_storage_samples_total"));
+        assert!(!sent.contains("scrape_samples_scraped"));
+        let stats = agent.writer.metrics.sinks[0].stats();
+        assert!(stats.samples > 0 && stats.failed == 0);
+    }
+
+    /// Prometheus away: the batch waits on disk and goes once it is
+    /// back, its samples counted sent, not failed.
+    #[test]
+    fn keeps_what_prometheus_refuses_until_it_takes_it() {
+        let server = backend(1);
+        let mut agent = agent(&server, "spool");
+        agent.round();
+        agent.writer.close();
+        assert_eq!(agent.writer.metrics.sinks[0].stats().samples, 0);
+        assert!(written(&server).contains("demo_jobs_total"));
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(5));
+            agent.writer.tick();
+            if agent.writer.metrics.sinks[0].stats().samples > 0 {
+                break;
+            }
+        }
+        let stats = agent.writer.metrics.sinks[0].stats();
+        assert!(stats.samples > 0 && stats.failed == 0);
+        let requests = server.requests();
+        let posts = requests.iter().filter(|r| r.method == "POST");
+        assert_eq!(posts.count(), 2);
+    }
+
+    #[test]
+    fn an_unknown_component_target_is_down() {
+        let server = backend(0);
+        let mut agent = agent(&server, "unknown");
+        agent.exporters.clear();
+        agent.round();
+        let team = ("team".to_owned(), "core".to_owned());
+        let (app, own): (Vec<_>, Vec<_>) = agent
+            .writer
+            .targets
+            .iter()
+            .partition(|t| t.labels.contains(&team));
+        assert_eq!((app.len(), own.len()), (1, 1));
+        assert_eq!(app[0].up, Some(true));
+        assert_eq!(own[0].up, Some(false));
+    }
+
+    #[test]
+    fn prepares_targets_as_prometheus_does() {
+        let server = backend(0);
+        let agent = agent(&server, "prepare");
+        let job = &agent.scrapes[0].0;
+        let targets = prepare(job, &[]);
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        let app = &targets[0];
+        assert_eq!(targets::get(app, "job"), "prometheus.scrape.apps");
+        assert_eq!(targets::get(app, "instance"), server.address.to_string());
+        assert_eq!(targets::get(app, "__param_debug"), "1");
+        let url = url(app).unwrap();
+        assert_eq!(url.path, "/metrics?debug=1");
+    }
+
+    /// The HTTP server's routes, answered from the agent's loop.
+    #[cfg(feature = "server")]
+    #[test]
+    fn serves_its_page_metrics_and_health() {
+        let server = backend(0);
+        let mut agent = agent(&server, "serve");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap()
+            .port();
+        agent.server = serve_at(&format!("127.0.0.1:{port}"));
+        agent.round();
+        let ask = |agent: &mut Agent, head: &str| {
+            use std::io::{Read, Write};
+            let mut client =
+                std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            client.write_all(head.as_bytes()).unwrap();
+            agent.poll_sources(Instant::now() + Duration::from_secs(5));
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).unwrap();
+            answer
+        };
+        let page = ask(&mut agent, "GET / HTTP/1.1\r\n\r\n");
+        assert!(page.contains("team=\"core\""), "{page}");
+        assert!(page.contains(&server.url("/api/v1/write")));
+        let metrics = ask(&mut agent, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(metrics.contains("alloy_config_last_load_successful 1"));
+        let requests = "promhttp_metric_handler_requests_total{code=\"200\"}";
+        assert!(metrics.contains(&format!("{requests} 0")));
+        let metrics = ask(&mut agent, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(metrics.contains(&format!("{requests} 1")));
+        let ready = ask(&mut agent, "GET /-/ready HTTP/1.1\r\n\r\n");
+        assert!(ready.ends_with("Alloy is ready.\n"));
+        let healthy = ask(&mut agent, "GET /-/healthy HTTP/1.1\r\n\r\n");
+        assert!(healthy.starts_with("HTTP/1.1 200 OK"));
+        let missing = ask(&mut agent, "GET /nope HTTP/1.1\r\n\r\n");
+        assert!(missing.starts_with("HTTP/1.1 404"));
+        let refused = ask(&mut agent, "DELETE /metrics HTTP/1.1\r\n\r\n");
+        assert!(refused.starts_with("HTTP/1.1 405"));
+        agent.config_failed();
+        let page = ask(&mut agent, "GET / HTTP/1.1\r\n\r\n");
+        assert!(page.contains("failed"));
+    }
+
+    /// A container of Docker's, this test's process standing in for it:
+    /// its id is part of the process's cgroup path, as Docker's is.
+    #[cfg(feature = "docker")]
+    fn fake_docker(socket: &std::path::Path) -> String {
+        let cgroup = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let path = cgroup.lines().last().unwrap().rsplit(':').next().unwrap();
+        let id = path.rsplit('/').next().unwrap().to_owned();
+        let pid = std::process::id();
+        let list = format!(
+            r#"[{{"Id":"{id}","Names":["/web"],"Image":"nginx:1",
+            "Created":1700000000,"Status":"Up 1 hour (healthy)",
+            "Labels":{{"com.docker.compose.service":"web"}},
+            "Ports":[{{"PrivatePort":80,"Type":"tcp"}}],
+            "HostConfig":{{"NetworkMode":"bridge"}},
+            "NetworkSettings":{{"Networks":{{"bridge":
+            {{"NetworkID":"n1","IPAddress":"172.17.0.2"}}}}}}}}]"#
+        );
+        let inspect = format!(
+            r#"{{"State":{{"Pid":{pid},"StartedAt":"2026-01-01T00:00:00Z"}},
+            "Config":{{"Tty":false}}}}"#
+        );
+        let line = b"2099-01-01T00:00:00.000000001Z hello from web\n";
+        let mut frame = vec![1, 0, 0, 0];
+        frame.extend_from_slice(&(line.len() as u32).to_be_bytes());
+        frame.extend_from_slice(line);
+        let logs = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+             {:x}\r\n{}\r\n0\r\n\r\n",
+            frame.len(),
+            String::from_utf8(frame).unwrap(),
+        );
+        let json = |body: &str| response("200 OK", "application/json", body);
+        testing::serve_unix(socket, move |request: &Request| {
+            match request.path.as_str() {
+                "/containers/json" => json(&list),
+                p if p.ends_with("/json") => json(&inspect),
+                p if p.contains("/logs?") => logs.clone(),
+                _ => response("404 Not Found", "text/plain", ""),
+            }
+        });
+        id
+    }
+
+    /// Docker's containers: their targets, their resources under
+    /// cAdvisor's names and their output sent to Loki.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn follows_dockers_containers() {
+        let server = backend(0);
+        let storage = testing::scratch("docker");
+        let socket = storage.join("docker.sock");
+        let id = fake_docker(&socket);
+        let text = format!(
+            r#"
+            prometheus.exporter.cadvisor "containers" {{
+                docker_host = "unix://{socket}"
+            }}
+            prometheus.scrape "containers" {{
+                targets = prometheus.exporter.cadvisor.containers.targets
+                forward_to = [prometheus.remote_write.prom.receiver]
+            }}
+            prometheus.remote_write "prom" {{
+                endpoint {{ url = "{}" }}
+            }}
+            discovery.docker "containers" {{
+                host = "unix://{socket}"
+            }}
+            loki.source.docker "containers" {{
+                host = "unix://{socket}"
+                targets = discovery.docker.containers.targets
+                labels = {{"job" = "docker"}}
+                forward_to = [loki.write.loki.receiver]
+            }}
+            loki.write "loki" {{
+                endpoint {{ url = "{}" }}
+            }}"#,
+            server.url("/api/v1/write"),
+            server.url("/loki/api/v1/push"),
+            socket = socket.display(),
+        );
+        let options = Options {
+            listen: "127.0.0.1:0".into(),
+            storage: storage.join("data"),
+            print: false,
+        };
+        let stmts = alloy::parse(&text).unwrap();
+        let mut agent = Agent::new(&stmts, &options).unwrap();
+        let docker = agent.round();
+        let address = targets::get(&docker[0], "__address__");
+        assert_eq!(address, "172.17.0.2:80");
+        agent.follow(&docker);
+        for _ in 0..100 {
+            if agent.logs.sinks[0].sent > 0 {
+                break;
+            }
+            agent.poll_sources(Instant::now() + Duration::from_millis(20));
+            agent.flush_logs(true);
+        }
+        agent.writer.close();
+        let metrics = written(&server);
+        assert!(metrics.contains("container_cpu_usage_seconds_total"));
+        assert!(metrics.contains("container_label_com_docker_compose_service"));
+        assert!(metrics.contains(&id), "no series of container {id}");
+        assert!(metrics.contains("machine_memory_bytes"));
+        let pushes = server.requests();
+        let push = pushes.iter().find(|r| r.path == "/loki/api/v1/push");
+        let body = String::from_utf8_lossy(&push.unwrap().body).into_owned();
+        assert!(body.contains("hello from web"), "{body}");
+        assert!(body.contains(r#""job":"docker""#), "{body}");
+        assert!(agent.positions.docker.values().any(|ns| *ns > 0));
+    }
+}

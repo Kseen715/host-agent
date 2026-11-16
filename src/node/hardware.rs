@@ -321,4 +321,76 @@ mod tests {
         assert_eq!(unit("fan", "pulses"), ("", 1.0));
         assert_eq!(unit("in", "max"), ("_volts", 0.001));
     }
+
+    /// A chip as the kernel shows it, its device a link to the
+    /// platform device: its sensors' files, one with a label, under
+    /// node_exporter's names and units.
+    #[test]
+    fn reads_hwmon_sensors() {
+        let root = crate::testing::scratch("hwmon");
+        let dir = root.join("hwmon0");
+        let device = root.join("platform/coretemp.0");
+        super::super::sysfs(
+            &dir,
+            &[
+                ("name", "coretemp\n"),
+                ("temp1_input", "45000\n"),
+                ("temp1_crit", "100000\n"),
+                ("temp1_crit_alarm", "0\n"),
+                ("temp1_label", "Package id 0\n"),
+                ("fan2_input", "1200\n"),
+                ("in0_input", "1100\n"),
+                ("power1_average", "15000000\n"),
+                ("update_interval", "1000\n"),
+                ("uevent", "not a sensor\n"),
+            ],
+        );
+        super::super::sysfs(&device, &[("curr1_input", "500\n")]);
+        std::os::unix::fs::symlink(&device, dir.join("device")).unwrap();
+        assert_eq!(chip_name(&dir).as_deref(), Some("platform_coretemp_0"));
+        let mut sensors = BTreeMap::new();
+        sensor_files(&dir, &mut sensors);
+        sensor_files(&dir.join("device"), &mut sensors);
+        let mut w = Writer::text();
+        for (sensor, elements) in &sensors {
+            sensor_metrics(&mut w, "coretemp", sensor, elements);
+        }
+        let text = w.into_text();
+        let series = |name: &str, sensor: &str, value: &str| {
+            format!("{name}{{chip=\"coretemp\",sensor=\"{sensor}\"}} {value}")
+        };
+        for wanted in [
+            series("node_hwmon_temp_celsius", "temp1", "45"),
+            series("node_hwmon_temp_crit_celsius", "temp1", "100"),
+            // node_exporter's quirk: a temperature's alarm in Celsius.
+            series("node_hwmon_temp_crit_alarm_celsius", "temp1", "0"),
+            series("node_hwmon_fan_rpm", "fan2", "1200"),
+            series("node_hwmon_in_volts", "in0", "1.1"),
+            series("node_hwmon_power_average_watt", "power1", "15"),
+            series("node_hwmon_curr_amps", "curr1", "0.5"),
+            series(
+                "node_hwmon_update_interval_seconds",
+                "update_interval0",
+                "1",
+            ),
+        ] {
+            assert!(text.contains(&wanted), "{wanted} not in\n{text}");
+        }
+        let label = "node_hwmon_sensor_label{chip=\"coretemp\",\
+            label=\"Package id 0\",sensor=\"temp1\"} 1";
+        assert!(text.contains(label), "{text}");
+        assert!(!text.contains("uevent"));
+    }
+
+    /// Without a device: the driver's name, else the directory's.
+    #[test]
+    fn names_chips_without_a_device() {
+        let root = crate::testing::scratch("hwmon-chip");
+        let named = root.join("hwmon1");
+        super::super::sysfs(&named, &[("name", "Nouveau PCI\n")]);
+        assert_eq!(chip_name(&named).as_deref(), Some("nouveau_pci"));
+        let unnamed = root.join("hwmon2");
+        fs::create_dir_all(&unnamed).unwrap();
+        assert_eq!(chip_name(&unnamed).as_deref(), Some("hwmon2"));
+    }
 }

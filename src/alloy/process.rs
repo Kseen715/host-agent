@@ -232,3 +232,184 @@ fn matched(body: &Body) -> Result<Stage, String> {
     };
     Ok(Stage::Match(selector, action))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::compile::compile;
+    use super::super::syntax::parse;
+    use super::bytes;
+    use crate::logs::{Entry, Kind};
+    use crate::stages::{self, Stage};
+
+    /// The stages of a loki.process with `body`, as the agent runs them.
+    fn pipeline(body: &str) -> Result<Vec<Stage>, String> {
+        let text = format!(
+            r#"loki.write "w" {{ endpoint {{ url = "http://l/" }} }}
+            loki.process "p" {{
+                {body}
+                forward_to = [loki.write.w.receiver]
+            }}"#
+        );
+        let mut plan = compile(&parse(&text).unwrap(), true)?;
+        let found =
+            plan.logs.nodes.iter_mut().find_map(
+                |node| match std::mem::replace(&mut node.kind, Kind::Write(0)) {
+                    Kind::Process(stages) => Some(stages),
+                    _ => None,
+                },
+            );
+        Ok(found.expect("a loki.process node"))
+    }
+
+    fn entry(job: &str, line: &str) -> Entry {
+        Entry {
+            labels: vec![("job".into(), job.into())],
+            ns: 1,
+            line: line.into(),
+        }
+    }
+
+    fn label<'a>(entry: &'a Entry, name: &str) -> Option<&'a str> {
+        let found = entry.labels.iter().find(|(k, _)| k == name);
+        found.map(|(_, v)| v.as_str())
+    }
+
+    /// A container's JSON line: its level a label, its time the
+    /// entry's, its message the line; debug lines dropped.
+    #[test]
+    fn shapes_json_lines() {
+        let stages = pipeline(
+            r#"stage.json {
+                expressions = {"level" = "", "msg" = "message", "ts" = "time"}
+            }
+            stage.timestamp {
+                source = "ts"
+                format = "RFC3339Nano"
+            }
+            stage.labels { values = {"level" = ""} }
+            stage.static_labels { values = {"site" = "home"} }
+            stage.template {
+                source = "msg"
+                template = "{{ ToUpper .msg }}"
+            }
+            stage.output { source = "msg" }
+            stage.match {
+                selector = "{level=\"debug\"}"
+                action = "drop"
+            }
+            stage.label_drop { values = ["job"] }"#,
+        )
+        .unwrap();
+        let mut info = entry(
+            "docker",
+            concat!(
+                r#"{"level":"info","message":"started","#,
+                r#""time":"2026-11-15T10:00:00.5Z"}"#
+            ),
+        );
+        assert!(stages::run(&stages, &mut info));
+        assert_eq!(info.line, "STARTED");
+        assert_eq!(label(&info, "level"), Some("info"));
+        assert_eq!(label(&info, "site"), Some("home"));
+        assert_eq!(label(&info, "job"), None);
+        let at = crate::time::parse_rfc3339("2026-11-15T10:00:00.5Z");
+        assert_eq!(Some(info.ns), at);
+        let mut debug = entry("docker", r#"{"level":"debug","message":"x"}"#);
+        assert!(!stages::run(&stages, &mut debug));
+    }
+
+    /// logfmt, a secret masked, healthy requests and long lines dropped,
+    /// and a nested pipeline for one job's errors.
+    #[test]
+    fn filters_and_rewrites_logfmt_lines() {
+        let stages = pipeline(
+            r#"stage.logfmt { mapping = {"status" = "", "who" = "user"} }
+            stage.replace {
+                expression = "password=(\\S+)"
+                replace = "***"
+            }
+            stage.drop {
+                source = "status"
+                value = "200"
+            }
+            stage.drop { longer_than = "1KB" }
+            stage.match {
+                selector = "{job=\"app\"} |= \"error\""
+                stage.regex { expression = "code=(?P<code>\\d+)" }
+                stage.labels { values = {"code" = "", "who" = ""} }
+            }
+            stage.label_keep { values = ["job", "code", "who"] }"#,
+        )
+        .unwrap();
+        let line = "status=500 user=ann password=hunter2 error code=42";
+        let mut failed = entry("app", line);
+        assert!(stages::run(&stages, &mut failed));
+        assert_eq!(
+            failed.line,
+            "status=500 user=ann password=*** error code=42"
+        );
+        assert_eq!(label(&failed, "code"), Some("42"));
+        assert_eq!(label(&failed, "who"), Some("ann"));
+        let mut other = entry("web", line);
+        assert!(stages::run(&stages, &mut other));
+        assert_eq!(label(&other, "code"), None);
+        assert!(!stages::run(&stages, &mut entry("app", "status=200 ok")));
+        let long = format!("status=500 {}", "x".repeat(1025));
+        assert!(!stages::run(&stages, &mut entry("app", &long)));
+    }
+
+    #[test]
+    fn refuses_stages_it_cannot_run() {
+        let cases = [
+            ("stage.metrics { }", "stage.metrics"),
+            ("stage.drop { }", "drops nothing"),
+            (r#"stage.drop { source = "a,b" }"#, "one `source` only"),
+            (r#"stage.drop { longer_than = "1XB" }"#, "a size"),
+            (r#"stage.drop { expression = "(" }"#, "closing"),
+            (r#"stage.json { source = "x" }"#, "needs `expressions`"),
+            (
+                r#"stage.json { expressions = {"a" = "[["} }"#,
+                "only fields and indexes",
+            ),
+            (
+                r#"stage.timestamp {
+                    source = "t"
+                    format = "RFC3339"
+                    action_on_failure = "explode"
+                }"#,
+                "action_on_failure `explode`",
+            ),
+            (
+                r#"stage.timestamp {
+                    source = "t"
+                    format = "RFC3339"
+                    location = "Nowhere/Never"
+                }"#,
+                "Nowhere/Never",
+            ),
+            (
+                r#"stage.match {
+                    selector = "{a=\"b\"}"
+                    action = "maybe"
+                }"#,
+                "action `maybe`",
+            ),
+            (r#"stage.match { selector = "a" }"#, "selector"),
+            (r#"stage.template { source = "a" }"#, "template"),
+        ];
+        for (body, wanted) in cases {
+            let error = pipeline(body).err().unwrap_or_default();
+            assert!(error.contains(wanted), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn reads_sizes_as_alloy_does() {
+        assert_eq!(bytes("10"), Some(10));
+        assert_eq!(bytes("8KB"), Some(8 << 10));
+        assert_eq!(bytes("2 MiB"), Some(2 << 20));
+        assert_eq!(bytes("1GB"), Some(1 << 30));
+        assert_eq!(bytes("1TB"), None);
+        assert_eq!(bytes("KB"), None);
+    }
+}

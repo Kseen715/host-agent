@@ -657,4 +657,187 @@ mod tests {
         assert!(super::call("eq", vec![Val::Nil, s("a")]).is_err());
         assert_eq!(call("Sha2Hash", vec![s("a"), s("bc")]).len(), 64);
     }
+
+    /// Each function against what Go's text/template, Promtail and
+    /// sprig give for the same call.
+    #[test]
+    fn string_functions_match_go_and_sprig() {
+        let i = Val::Int;
+        let cases: Vec<(&str, Vec<Val>, &str)> = vec![
+            ("ToLower", vec![s("ABC")], "abc"),
+            ("upper", vec![s("abc")], "ABC"),
+            ("TrimSpace", vec![s("  a \n")], "a"),
+            ("Trim", vec![s("xxaxx"), s("x")], "a"),
+            ("TrimLeft", vec![s("xya"), s("yx")], "a"),
+            ("TrimRight", vec![s("axy"), s("xy")], "a"),
+            ("TrimPrefix", vec![s("app-web"), s("app-")], "web"),
+            ("TrimSuffix", vec![s("a.log"), s(".log")], "a"),
+            ("trimPrefix", vec![s("app-"), s("app-web")], "web"),
+            ("trimSuffix", vec![s(".log"), s("a.log")], "a"),
+            ("Replace", vec![s("aaa"), s("a"), s("b"), i(2)], "bba"),
+            ("Replace", vec![s("aaa"), s("a"), s("b"), i(-1)], "bbb"),
+            ("replace", vec![s("a"), s("b"), s("aa")], "bb"),
+            (
+                "Hash",
+                vec![s("a"), s("bc")],
+                "3a985da74fe225b2045c172d6bd390bd\
+                 855f086e3e9d525b46bfe24511431532",
+            ),
+            (
+                "sha256sum",
+                vec![s("abc")],
+                "ba7816bf8f01cfea414140de5dae2223\
+                 b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "regexReplaceAllLiteral",
+                vec![s("a(x*)b"), s("-ab-axxb-"), s("${1}W")],
+                "-${1}W-${1}W-",
+            ),
+            ("regexMatch", vec![s("^a"), s("abc")], "true"),
+            ("regexFind", vec![s("[0-9]+"), s("ab12cd34")], "12"),
+            ("regexQuoteMeta", vec![s("a.b*")], "a\\.b\\*"),
+            ("contains", vec![s("b"), s("abc")], "true"),
+            ("hasPrefix", vec![s("b"), s("abc")], "false"),
+            ("hasSuffix", vec![s("c"), s("abc")], "true"),
+            ("untitle", vec![s("Hello World")], "hello world"),
+            ("repeat", vec![i(3), s("ab")], "ababab"),
+            ("nospace", vec![s(" a b\tc ")], "abc"),
+            ("indent", vec![i(2), s("a\nb")], "  a\n  b"),
+            ("nindent", vec![i(1), s("a")], "\n a"),
+            ("b64enc", vec![s("hello")], "aGVsbG8="),
+            ("b64dec", vec![s("aGVsbG8=")], "hello"),
+            ("b64dec", vec![s("!!")], "illegal base64 data"),
+            (
+                "quote",
+                vec![s("a\"b\n"), Val::Nil, i(1)],
+                r#""a\"b\n" "1""#,
+            ),
+            ("squote", vec![s("a"), i(2)], "'a' '2'"),
+            ("cat", vec![s("a"), Val::Nil, i(1)], "a 1"),
+            ("toString", vec![Val::Float(1.5)], "1.5"),
+            (
+                "html",
+                vec![s("<a href='x'>\"&\"")],
+                "&lt;a href=&#39;x&#39;&gt;&#34;&amp;&#34;",
+            ),
+            ("urlquery", vec![s("a b&c")], "a+b%26c"),
+            ("println", vec![s("a"), i(1)], "a 1\n"),
+            ("len", vec![s("héllo")], "6"),
+            ("not", vec![s("")], "true"),
+        ];
+        for (name, args, wanted) in cases {
+            let got = call(name, args.clone());
+            assert_eq!(
+                got.map(|v| v.text()),
+                Ok(wanted.into()),
+                "{name}{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_and_numbers_match_sprig() {
+        let i = Val::Int;
+        let cases: Vec<(&str, Vec<Val>, Val)> = vec![
+            ("default", vec![s("d"), s("")], s("d")),
+            ("default", vec![s("d"), s("x")], s("x")),
+            ("default", vec![s("d")], s("d")),
+            ("empty", vec![i(0)], Val::Bool(true)),
+            ("coalesce", vec![Val::Nil, s(""), s("x"), s("y")], s("x")),
+            ("coalesce", vec![Val::Nil], Val::Nil),
+            ("ternary", vec![s("y"), s("n"), Val::Bool(false)], s("n")),
+            ("atoi", vec![s("42")], i(42)),
+            ("atoi", vec![s("x")], i(0)),
+            ("int", vec![Val::Float(7.9)], i(7)),
+            ("int64", vec![Val::Bool(true)], i(1)),
+            ("int", vec![Val::Uint(5)], i(5)),
+            ("float64", vec![s(" 1.5 ")], Val::Float(1.5)),
+            ("float64", vec![i(2)], Val::Float(2.0)),
+            ("add1", vec![s("1")], i(2)),
+            ("mul", vec![i(2), i(3), i(4)], i(24)),
+            ("max", vec![i(1), i(5), i(3)], i(5)),
+            ("biggest", vec![i(1), i(5)], i(5)),
+            ("min", vec![i(4), i(2)], i(2)),
+            ("sub", vec![i(5), i(7)], i(-2)),
+            ("div", vec![i(7), i(2)], i(3)),
+            ("mod", vec![i(7), i(3)], i(1)),
+            ("eq", vec![s("b"), s("a"), s("b")], Val::Bool(true)),
+            (
+                "ne",
+                vec![Val::Bool(true), Val::Bool(false)],
+                Val::Bool(true),
+            ),
+            ("lt", vec![i(1), Val::Float(1.5)], Val::Bool(true)),
+            ("le", vec![Val::Float(2.0), i(2)], Val::Bool(true)),
+            ("gt", vec![s("b"), s("a")], Val::Bool(true)),
+            ("ge", vec![i(1), i(2)], Val::Bool(false)),
+        ];
+        for (name, args, wanted) in cases {
+            assert_eq!(call(name, args.clone()), Ok(wanted), "{name}{args:?}");
+        }
+        let errors = [
+            ("div", vec![i(1), i(0)], "integer divide by zero"),
+            ("mod", vec![i(1), i(0)], "integer divide by zero"),
+            ("ternary", vec![s("y"), s("n"), s("true")], "expected bool"),
+            (
+                "lt",
+                vec![Val::Bool(true), Val::Bool(false)],
+                "incompatible",
+            ),
+            ("lt", vec![i(1), i(2), i(3)], "wrong number of args"),
+            ("eq", vec![], "missing argument"),
+            ("len", vec![i(1)], "len of int"),
+            ("regexMatch", vec![s("("), s("a")], "regexp:"),
+            ("upper", vec![], "wrong number of args for upper: got 0"),
+            ("nosuch", vec![], "wrong number of args"),
+        ];
+        for (name, args, wanted) in errors {
+            let error = call(name, args.clone()).unwrap_err();
+            assert!(error.contains(wanted), "{name}{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn formats_as_fmt_sprintf() {
+        let i = Val::Int;
+        let cases: Vec<(&str, Vec<Val>, &str)> = vec![
+            ("%s-%d", vec![s("a"), i(3)], "a-3"),
+            (
+                "%5d|%-5d|%05d",
+                vec![i(42), i(42), i(-42)],
+                "   42|42   |-0042",
+            ),
+            ("%+d %+d", vec![i(3), Val::Uint(4)], "+3 +4"),
+            (
+                "%.2f %f",
+                vec![Val::Float(1.23456), Val::Float(1.0)],
+                "1.23 1.000000",
+            ),
+            ("%x %X %x", vec![i(255), i(255), s("hi")], "ff FF 6869"),
+            ("%x %X", vec![Val::Uint(255), Val::Uint(255)], "ff FF"),
+            (
+                "%t %v %v",
+                vec![Val::Bool(true), i(1), Val::Nil],
+                "true 1 <no value>",
+            ),
+            ("%q", vec![s("a\"b")], r#""a\"b""#),
+            (
+                "%.3s|%6s|%-3s|",
+                vec![s("abcdef"), s("ab"), s("a")],
+                "abc|    ab|a  |",
+            ),
+            ("100%%", vec![], "100%"),
+            ("%d %d", vec![i(1)], "1 %!d(MISSING)"),
+            ("%d", vec![i(1), s("x")], "1%!(EXTRA string=x)"),
+            ("%d", vec![s("x")], "%!d(string=x)"),
+            ("%f", vec![i(1)], "%!f(int=1)"),
+            ("%", vec![], "%!(NOVERB)"),
+        ];
+        for (format, args, wanted) in cases {
+            assert_eq!(printf(format, &args), wanted, "{format}");
+        }
+        let via_call = call("printf", vec![s("%s=%d"), s("n"), i(1)]);
+        assert_eq!(via_call.unwrap().text(), "n=1");
+    }
 }

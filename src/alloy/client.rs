@@ -377,6 +377,7 @@ fn tls(body: &Body, client: &mut Client) -> Result<(), String> {
 mod tests {
     use super::super::compile::{Plan, compile};
     use super::super::syntax::parse;
+    use crate::testing::{self, Request, Server, response};
 
     fn remote(endpoint: &str) -> Result<Plan, String> {
         let text = format!(
@@ -441,5 +442,149 @@ mod tests {
             "azuread {{ managed_identity {{ client_id = \"{id}\" }} }}"
         );
         assert!(remote(&azure).is_ok());
+    }
+
+    /// A Loki at /push and an OAuth2 token endpoint at /token that, as
+    /// some do, takes the client's credentials in the form only.
+    fn backend() -> Server {
+        testing::serve(|request| match request.path.as_str() {
+            "/token" if request.header("Authorization").is_some() => {
+                response("401 Unauthorized", "application/json", "{}")
+            }
+            "/token" => response(
+                "200 OK",
+                "application/json",
+                r#"{"access_token":"tk","token_type":"Bearer"}"#,
+            ),
+            _ => response("204 No Content", "text/plain", ""),
+        })
+    }
+
+    /// What a loki.write with `endpoint`'s settings sends to `url`.
+    fn push(url: &str, endpoint: &str, server: &Server) -> Request {
+        let text = format!(
+            r#"loki.write "w" {{ endpoint {{ url = "{url}" {endpoint} }} }}"#
+        );
+        let mut plan = compile(&parse(&text).unwrap(), false).unwrap();
+        let loki = &mut plan.logs.sinks[0];
+        loki.add(&vec![("job".into(), "x".into())], 1, "line");
+        assert!(matches!(loki.flush(), crate::loki::Flushed::Done));
+        server.requests().pop().unwrap()
+    }
+
+    #[test]
+    fn sends_the_configured_credentials() {
+        let server = backend();
+        let dir = testing::scratch("client-credentials");
+        let file = dir.join("token");
+        std::fs::write(&file, "from-file").unwrap();
+        let file = file.display();
+        let token = server.url("/token");
+        let url = server.url("/push");
+        for (endpoint, expected) in [
+            (
+                r#"basic_auth { username = "u" password = "p" }"#,
+                "Basic dTpw",
+            ),
+            (
+                &format!(r#"bearer_token_file = "{file}""#),
+                "Bearer from-file",
+            ),
+            (r#"authorization { credentials = "c" }"#, "Bearer c"),
+            (
+                r#"authorization { type = "Token" credentials = "c" }"#,
+                "Token c",
+            ),
+            (
+                &format!(
+                    r#"oauth2 {{
+                        client_id = "id"
+                        client_secret = "s"
+                        token_url = "{token}"
+                        scopes = ["a", "b"]
+                        endpoint_params = {{ "audience" = "x" }}
+                    }}"#
+                ),
+                "Bearer tk",
+            ),
+        ] {
+            let pushed = push(&url, endpoint, &server);
+            assert_eq!(pushed.header("Authorization"), Some(expected));
+        }
+        let form = server.requests().into_iter().rfind(|r| r.path == "/token");
+        assert_eq!(
+            String::from_utf8(form.unwrap().body).unwrap(),
+            "audience=x&client_id=id&client_secret=s\
+             &grant_type=client_credentials&scope=a+b"
+        );
+    }
+
+    #[test]
+    fn sends_through_a_proxy() {
+        let proxy = backend();
+        let elsewhere = "http://loki.invalid/push";
+        let through = format!(r#"proxy_url = "{}""#, proxy.url(""));
+        assert_eq!(push(elsewhere, &through, &proxy).path, elsewhere);
+        let bypass = format!(r#"{through} no_proxy = "127.0.0.1""#);
+        let direct = proxy.url("/push");
+        assert_eq!(push(&direct, &bypass, &proxy).path, "/push");
+    }
+
+    #[test]
+    fn refuses_bad_auth_and_proxy_settings() {
+        let refused = [
+            (r#"oauth2 { client_secret = "s" }"#, "client_id must be"),
+            (
+                r#"oauth2 { client_id = "i" }"#,
+                "either oauth2 client_secret",
+            ),
+            (
+                r#"oauth2 { client_id = "i" client_secret = "s"
+                   token_url = "ftp://t" }"#,
+                "url: only http",
+            ),
+            (
+                r#"basic_auth { password = "p" password_file = "f" }"#,
+                "at most one of password & password_file",
+            ),
+            (
+                r#"proxy_connect_header = { "X" = ["1"] }"#,
+                "proxy_url or proxy_from_environment must also",
+            ),
+            (
+                r#"proxy_from_environment = true proxy_url = "http://p""#,
+                "proxy_url must not be",
+            ),
+            (
+                r#"proxy_from_environment = true no_proxy = "x""#,
+                "no_proxy must not be",
+            ),
+        ];
+        for (endpoint, error) in refused {
+            let found = remote(endpoint).err().unwrap_or_default();
+            assert!(found.contains(error), "{endpoint}: {found}");
+        }
+        assert!(remote("proxy_from_environment = true").is_ok());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn refuses_bad_tls_settings() {
+        let pem = testing::CLIENT_CERT.replace('\n', "\\n");
+        let refused = [
+            (r#"min_version = "TLS11""#, "TLS12 or TLS13"),
+            (&format!(r#"cert_pem = "{pem}""#), "needs its key"),
+            (r#"ca_pem = "not a certificate""#, ""),
+            (r#"verify = true"#, "verify"),
+        ];
+        for (tls, error) in refused {
+            let endpoint = format!("tls_config {{ {tls} }}");
+            let found = remote(&endpoint).err().unwrap_or_default();
+            assert!(
+                !found.is_empty() && found.contains(error),
+                "{tls}: {found}"
+            );
+        }
+        assert!(remote(r#"tls_config { min_version = "TLS13" }"#).is_ok());
     }
 }

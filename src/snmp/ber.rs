@@ -128,7 +128,7 @@ fn request(community: &[u8], id: i64, oid: &str) -> Option<Vec<u8>> {
     Some(tlv(0x30, &[integer(1), tlv(0x04, community), pdu].concat()))
 }
 
-fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+pub(super) fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let length = content.len().to_be_bytes();
     let skip = length.iter().take_while(|&&b| b == 0).count();
@@ -284,6 +284,82 @@ fn decode_oid(content: &[u8]) -> String {
     };
     let rest = arcs[1..].iter().map(|arc| format!(".{arc}"));
     format!("{a}.{b}{}", rest.collect::<String>())
+}
+
+/// A v2c agent on loopback answering each GetBulkRequest from `table`
+/// (OIDs in the MIB's order, values whole TLVs), as a device's would:
+/// it leaves the first `lost` requests unanswered and sends a Trap
+/// before each answer.
+#[cfg(test)]
+pub(super) fn agent(
+    table: Vec<(&'static str, Vec<u8>)>,
+    lost: usize,
+) -> std::net::SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    let mut buf = vec![0; 65536];
+    std::thread::spawn(move || {
+        for _ in 0..lost {
+            socket.recv_from(&mut buf).unwrap();
+        }
+        loop {
+            let (length, from) = socket.recv_from(&mut buf).unwrap();
+            let (id, oid, max) = bulk(&buf[..length]).unwrap();
+            let trap = [integer(id), integer(0), integer(0), tlv(0x30, &[])];
+            let trap = tlv(0xA7, &trap.concat());
+            for pdu in [trap, answer(&table, id, &oid, max)] {
+                let message = [integer(1), tlv(0x04, b"public"), pdu];
+                let message = tlv(0x30, &message.concat());
+                socket.send_to(&message, from).unwrap();
+            }
+        }
+    });
+    address
+}
+
+/// A GetBulkRequest's id, first variable and max-repetitions.
+#[cfg(test)]
+fn bulk(buf: &[u8]) -> Option<(i64, String, i64)> {
+    let (_, message, _) = read(buf)?;
+    let (_, _version, rest) = read(message)?;
+    let (_, _community, rest) = read(rest)?;
+    let (0xA5, pdu, _) = read(rest)? else {
+        return None;
+    };
+    let (_, id, rest) = read(pdu)?;
+    let (_, _non_repeaters, rest) = read(rest)?;
+    let (_, max, rest) = read(rest)?;
+    let (_, binds, _) = read(rest)?;
+    let (_, bind, _) = read(binds)?;
+    let (_, name, _) = read(bind)?;
+    Some((signed(id), decode_oid(name), signed(max)))
+}
+
+/// The Response PDU: up to `max` variables of `table` after `oid`, or
+/// endOfMibView past its end.
+#[cfg(test)]
+fn answer(table: &[(&str, Vec<u8>)], id: i64, oid: &str, max: i64) -> Vec<u8> {
+    let arcs = |oid: &str| -> Vec<u32> {
+        oid.split('.').map(|a| a.parse().unwrap()).collect()
+    };
+    let bind = |oid: &str, value: &[u8]| {
+        tlv(0x30, &[encode_oid(oid).unwrap(), value.to_vec()].concat())
+    };
+    let after = table.iter().filter(|(o, _)| arcs(o) > arcs(oid));
+    let mut binds: Vec<Vec<u8>> = after
+        .take(max as usize)
+        .map(|(o, value)| bind(o, value))
+        .collect();
+    if binds.is_empty() {
+        binds.push(bind(oid, &tlv(0x82, &[])));
+    }
+    let fields = [
+        integer(id),
+        integer(0),
+        integer(0),
+        tlv(0x30, &binds.concat()),
+    ];
+    tlv(0xA2, &fields.concat())
 }
 
 #[cfg(test)]

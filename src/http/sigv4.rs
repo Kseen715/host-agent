@@ -629,7 +629,8 @@ mod tests {
             signed(&keys, "us-east-1", "service", &request, at / 1_000_000_000);
         assert!(lines.contains("SignedHeaders=host;x-amz-date, "));
         assert!(lines.ends_with(
-            "Signature=b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500\r\n"
+            "Signature=b97d918cfa904a5beff61c982a1b6f45\
+             8b799221646efd99d3219ec94cdf2500\r\n"
         ));
         let posted = Request {
             method: "POST",
@@ -640,5 +641,184 @@ mod tests {
         let lines = signed(&keys, "r", "s", &posted, 0);
         let names = "SignedHeaders=content-length;host;x-a;x-amz-date,";
         assert!(lines.contains(names), "{lines}");
+    }
+
+    fn example_keys() -> Keys {
+        Keys {
+            id: "AKIDEXAMPLE".into(),
+            secret: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            token: String::new(),
+        }
+    }
+
+    /// The signature of AWS's SigV4 test suite request `method` with
+    /// `body` at the suite's time.
+    fn suite_signature(method: &str, path: &str, body: &[u8]) -> String {
+        let url = Url::parse(&format!("http://example.amazonaws.com{path}"));
+        let request = Request {
+            method,
+            url: &url.unwrap(),
+            headers: "",
+            body,
+        };
+        let at = time::parse_rfc3339("2015-08-30T12:36:00Z").unwrap();
+        let at = at / 1_000_000_000;
+        let lines =
+            signed(&example_keys(), "us-east-1", "service", &request, at);
+        assert!(lines.starts_with("X-Amz-Date: 20150830T123600Z\r\n"));
+        let credential = "Credential=AKIDEXAMPLE/20150830/us-east-1/service/\
+            aws4_request, ";
+        assert!(lines.contains(credential), "{lines}");
+        let signature = lines.rsplit_once("Signature=").unwrap().1;
+        signature.trim_end().to_owned()
+    }
+
+    #[test]
+    fn signs_the_suites_vanilla_requests() {
+        assert_eq!(
+            suite_signature("GET", "/", b""),
+            "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+        assert_eq!(
+            suite_signature("POST", "/", b""),
+            "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b"
+        );
+        // The suite's get-relative-relative and get-slash-dot-slash: the
+        // path is cleaned before it is signed.
+        let vanilla = suite_signature("GET", "/", b"");
+        assert_eq!(
+            suite_signature("GET", "/example1/example2/../..", b""),
+            vanilla
+        );
+        assert_eq!(suite_signature("GET", "/./", b""), vanilla);
+    }
+
+    #[test]
+    fn a_session_token_is_sent_and_signed() {
+        let keys = Keys {
+            token: "session-token".into(),
+            ..example_keys()
+        };
+        let url = Url::parse("http://aps.example/api/v1/remote_write");
+        let request = Request {
+            method: "POST",
+            url: &url.unwrap(),
+            headers: "Content-Type: application/x-protobuf\r\n",
+            body: b"x",
+        };
+        let lines = signed(&keys, "eu-west-1", "aps", &request, 0);
+        assert!(lines.contains("X-Amz-Security-Token: session-token\r\n"));
+        let names = "SignedHeaders=content-length;content-type;host;\
+            x-amz-date;x-amz-security-token,";
+        assert!(lines.contains(names), "{lines}");
+        assert!(lines.contains("/19700101/eu-west-1/aps/aws4_request"));
+    }
+
+    /// As the SDK's signer: cleaned, each segment escaped; the query's
+    /// pairs decoded, escaped again and sorted by key, then value.
+    #[test]
+    fn canonicalizes_paths_and_queries() {
+        assert_eq!(canonical_uri("/a/b/../c//d/"), "/a/c/d");
+        assert_eq!(canonical_uri("/\u{1234}"), "/%E1%88%B4");
+        assert_eq!(canonical_uri("/example space/"), "/example%20space");
+        assert_eq!(
+            canonical_query("Param1=value2&Param1=Value1"),
+            "Param1=Value1&Param1=value2"
+        );
+        assert_eq!(canonical_query("b&a=1&&c=%7E+x"), "a=1&b=&c=~%20x");
+        let unreserved = "-._~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+            abcdefghijklmnopqrstuvwxyz";
+        let query = format!("{unreserved}={unreserved}");
+        assert_eq!(canonical_query(&query), query);
+    }
+
+    /// An STS answer, as AssumeRole gives it.
+    #[test]
+    fn reads_sts_credentials() {
+        let xml = "<AssumeRoleResponse><AssumeRoleResult><Credentials>\
+            <AccessKeyId>ASIAEXAMPLE</AccessKeyId>\
+            <SecretAccessKey>secret</SecretAccessKey>\
+            <SessionToken>token</SessionToken>\
+            <Expiration>2099-01-01T00:00:00Z</Expiration>\
+            </Credentials></AssumeRoleResult></AssumeRoleResponse>";
+        let (keys, expiry) = sts_keys(xml).unwrap();
+        assert_eq!(
+            (keys.id.as_str(), keys.secret.as_str(), keys.token.as_str()),
+            ("ASIAEXAMPLE", "secret", "token")
+        );
+        assert!(expiry.unwrap() > Instant::now() + Duration::from_secs(3600));
+        let error = sts_keys("<Error>denied</Error>").err().unwrap();
+        assert!(error.to_string().contains("no AccessKeyId"));
+    }
+
+    /// ECS's credentials endpoint, its token sent as Authorization.
+    #[test]
+    fn reads_container_credentials() {
+        use crate::testing::{self, response};
+        let server =
+            testing::serve(|request| match request.header("Authorization") {
+                Some("t0ken") => response(
+                    "200 OK",
+                    "application/json",
+                    r#"{"AccessKeyId":"AK","SecretAccessKey":"SK",
+                "Token":"TK","Expiration":"2099-01-01T00:00:00Z"}"#,
+                ),
+                _ => response("401 Unauthorized", "text/plain", "no"),
+            });
+        let url = Url::parse(&server.url("/v2/credentials/x")).unwrap();
+        let client = Client::default();
+        let headers = "Authorization: t0ken\r\n";
+        let (keys, expiry) = metadata_keys(&url, &client, headers).unwrap();
+        assert_eq!(
+            (keys.id, keys.secret, keys.token),
+            ("AK".into(), "SK".into(), "TK".into())
+        );
+        assert!(expiry.is_some());
+        let error = metadata_keys(&url, &client, "").err().unwrap();
+        assert!(error.to_string().contains("metadata: no"), "{error}");
+    }
+
+    #[test]
+    fn plain_http_credentials_only_from_loopback_or_ecs() {
+        for host in ["127.0.0.1", "::1", "169.254.170.2", "169.254.170.23"] {
+            assert!(allowed_host(host), "{host}");
+        }
+        assert!(allowed_host("fd00:ec2::23"));
+        assert!(allowed_host("localhost"));
+        for host in ["10.0.0.1", "169.254.169.254", "host.invalid"] {
+            assert!(!allowed_host(host), "{host}");
+        }
+    }
+
+    /// Keys from the configuration sign at once; no region anywhere is
+    /// refused.
+    #[test]
+    fn configured_keys_sign_requests() {
+        let settings = |region: &str| Settings {
+            region: region.into(),
+            service: String::new(),
+            keys: Some(example_keys()),
+            profile: "host-agent-test-no-such-profile".into(),
+            role: None,
+            fips: false,
+            client: Client::default(),
+        };
+        let sigv4 = SigV4::new(settings("eu-central-1")).unwrap();
+        let url = Url::parse("http://aps.example/api/v1/remote_write").unwrap();
+        let request = Request {
+            method: "POST",
+            url: &url,
+            headers: "",
+            body: b"x",
+        };
+        let lines = sigv4.sign(&request).unwrap();
+        assert!(lines.contains("Credential=AKIDEXAMPLE/"));
+        assert!(lines.contains("/eu-central-1/aps/aws4_request"));
+        if std::env::var_os("AWS_REGION").is_none()
+            && std::env::var_os("AWS_DEFAULT_REGION").is_none()
+        {
+            let error = SigV4::new(settings("")).err().unwrap();
+            assert!(error.contains("region not configured"), "{error}");
+        }
     }
 }

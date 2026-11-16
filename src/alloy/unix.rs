@@ -280,3 +280,104 @@ fn ipvs_labels(body: &Body) -> Result<Vec<String>, String> {
         .filter(|l| asked.is_empty() || asked.contains(l))
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::compile::{Exporter, compile};
+    use super::super::syntax::parse;
+    use crate::remote::Writer;
+
+    fn plan(body: &str) -> Result<super::super::Plan, String> {
+        let text = format!("prometheus.exporter.unix \"host\" {{ {body} }}");
+        compile(&parse(&text).unwrap(), true)
+    }
+
+    /// One round of the exporter `body` configures.
+    fn round(body: &str) -> String {
+        let plan = plan(body).unwrap();
+        let Some((id, Exporter::Unix(node))) = plan.exporters.first() else {
+            panic!("no unix exporter");
+        };
+        assert_eq!(id, "prometheus.exporter.unix.host");
+        let mut w = Writer::text();
+        node.collect(&mut w);
+        w.into_text()
+    }
+
+    #[test]
+    fn its_blocks_set_the_collectors() {
+        let text = round(
+            r#"set_collectors = ["netdev", "netstat", "vmstat"]
+            netdev { device_include = "^lo$" }
+            netstat { fields = "^Tcp_ActiveOpens$" }
+            vmstat { fields = "^pgfault$" }
+            ntp { server = "127.0.0.1" }"#,
+        );
+        let families: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("node_netstat_"))
+            .collect();
+        assert_eq!(families.len(), 1, "{families:?}");
+        assert!(families[0].starts_with("node_netstat_Tcp_ActiveOpens "));
+        assert!(text.contains("node_vmstat_pgfault "));
+        assert!(!text.contains("node_vmstat_pgmajfault "));
+        let devices = text.matches("node_network_receive_bytes_total{");
+        assert_eq!(devices.count(), 1);
+        assert!(!text.contains("collector=\"cpu\""));
+    }
+
+    #[test]
+    fn enables_and_disables_on_top_of_the_defaults() {
+        let text = round(
+            r#"enable_collectors = ["processes"]
+            disable_collectors = ["cpu"]"#,
+        );
+        assert!(text.contains("collector=\"processes\"}"));
+        assert!(text.contains("collector=\"meminfo\"}"));
+        assert!(!text.contains("collector=\"cpu\"}"));
+        assert!(!text.contains("collector=\"systemd\"}"));
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_do() {
+        let cases = [
+            (r#"enable_collectors = ["perf"]"#, "no collector `perf`"),
+            (r#"procfs_path = "/host/proc""#, "procfs_path"),
+            (
+                "include_exporter_metrics = true",
+                "include_exporter_metrics",
+            ),
+            (
+                r#"netdev {
+                    device_include = "a"
+                    device_exclude = "b"
+                }"#,
+                "one or the other",
+            ),
+            (
+                r#"ipvs { backend_labels = ["nope"] }"#,
+                "unknown IPVS backend label `nope`",
+            ),
+            (r#"vmstat { fields = "(" }"#, "without closing"),
+            (r#"cpu { speed = true }"#, "speed"),
+            (r#"bogus { }"#, "bogus"),
+        ];
+        for (body, wanted) in cases {
+            let error = plan(body).err().unwrap_or_default();
+            assert!(error.contains(wanted), "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_root_elsewhere_is_the_agents_one_root() {
+        let plan = plan(r#"rootfs_path = "/host/root""#).unwrap();
+        assert_eq!(plan.root.unwrap(), std::path::Path::new("/host/root"));
+        let text = r#"
+            prometheus.exporter.unix "a" { rootfs_path = "/a" }
+            prometheus.exporter.unix "b" { rootfs_path = "/b" }"#;
+        let error = compile(&parse(text).unwrap(), true).err().unwrap();
+        assert!(error.contains("a second rootfs_path"), "{error}");
+        let same = r#"rootfs_path = "/r" procfs_path = "/r/proc""#;
+        assert!(super::tests::plan(same).is_ok());
+    }
+}

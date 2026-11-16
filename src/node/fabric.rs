@@ -307,3 +307,73 @@ fn ib_counters(
     out.extend(found.into_iter().map(|(at, v)| (table[at].1, v)));
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An HCA's port as the kernel shows it: state, rate and counters,
+    /// data counted in 4-byte words.
+    #[test]
+    fn reads_an_infiniband_device() {
+        let dir = crate::testing::scratch("infiniband").join("mlx4_0");
+        super::super::sysfs(
+            &dir,
+            &[
+                ("fw_ver", "2.31.5050\n"),
+                ("board_id", "SM_1141000001000\n"),
+                ("ports/1/link_layer", "InfiniBand\n"),
+                ("ports/1/state", "4: ACTIVE\n"),
+                ("ports/1/phys_state", "5: LinkUp\n"),
+                ("ports/1/rate", "40 Gb/sec (4X QDR)\n"),
+                ("ports/1/counters/port_rcv_data", "100\n"),
+                ("ports/1/counters/link_downed", "2\n"),
+                ("ports/1/counters/VL15_dropped", "N/A (no PMA)\n"),
+                ("ports/1/counters/unknown_counter", "7\n"),
+                ("ports/1/counters_ext/port_xmit_data_64", "0x10\n"),
+            ],
+        );
+        let (info, ports) = ib_device(&dir).unwrap();
+        assert_eq!(info[0], ("firmware_version", "2.31.5050".into()));
+        assert_eq!(info[1].0, "board_id");
+        let port = &ports[0];
+        assert_eq!(
+            (port.number.as_str(), port.state, port.physical),
+            ("1", 4.0, 5.0)
+        );
+        assert_eq!(port.rate, 5e9);
+        assert_eq!(
+            port.counters,
+            [
+                ("link_downed_total", 2.0),
+                ("port_data_received_bytes_total", 400.0),
+                ("legacy_data_transmitted_bytes_total", 64.0),
+            ]
+        );
+        super::super::sysfs(&dir, &[("ports/x/state", "")]);
+        assert!(ib_device(&dir).is_err(), "a port that is not a number");
+    }
+
+    #[test]
+    fn reads_a_fibre_channel_host() {
+        let dir = crate::testing::scratch("fc").join("host0");
+        super::super::sysfs(
+            &dir,
+            &[
+                ("speed", "16 Gbit\n"),
+                ("port_state", "Online\n"),
+                ("port_name", "0x1000e0071bce95f2\n"),
+                ("statistics/rx_frames", "0x3\n"),
+                ("statistics/nos_count", "0xffffffffffffffff\n"),
+                ("statistics/reset_statistics", "\n"),
+            ],
+        );
+        let info = fc_attributes(&dir, "host0").unwrap();
+        assert!(info.contains(&("port_name", "1000e0071bce95f2".into())));
+        assert!(info.contains(&("speed", "16 Gbit".into())));
+        let counters = fc_counters(&dir).unwrap();
+        assert_eq!(counters, [("rx_frames_total", 3), ("nos_total", u64::MAX)]);
+        let bare = crate::testing::scratch("fc-bare");
+        assert!(fc_counters(&bare).unwrap().is_empty());
+    }
+}

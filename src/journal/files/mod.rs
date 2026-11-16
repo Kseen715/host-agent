@@ -393,4 +393,272 @@ mod tests {
         assert_eq!(earliest(places.into_iter()), Some(1));
         assert_eq!(earliest([None].into_iter()), None);
     }
+
+    /// One entry of a test journal: its seqnum, realtime and fields,
+    /// each stored as is, or compressed with flag 2 (LZ4) or 4 (zstd).
+    struct Written<'a> {
+        seqnum: u64,
+        realtime: u64,
+        fields: &'a [(&'a [u8], u8)],
+    }
+
+    const SEQNUM_ID: [u8; 16] = [7; 16];
+
+    /// An LZ4 block of literals only: valid LZ4, as a block that found
+    /// nothing to match is.
+    fn lz4_literals(data: &[u8]) -> Vec<u8> {
+        let mut block = vec![(data.len().min(15) as u8) << 4];
+        if data.len() >= 15 {
+            let mut rest = data.len() - 15;
+            while rest >= 255 {
+                block.push(255);
+                rest -= 255;
+            }
+            block.push(rest as u8);
+        }
+        block.extend(data);
+        block
+    }
+
+    fn object(out: &mut Vec<u8>, kind: u8, flags: u8, body: &[u8]) -> u64 {
+        let at = out.len() as u64;
+        out.extend([kind, flags, 0, 0, 0, 0, 0, 0]);
+        out.extend((16 + body.len() as u64).to_le_bytes());
+        out.extend(body);
+        out.resize(out.len().next_multiple_of(8), 0);
+        at
+    }
+
+    fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// A journal file as journald lays one out
+    /// (JOURNAL_FILE_FORMAT.md), with only what a reader follows:
+    /// the header, data and entry objects, and entry arrays of two
+    /// items chained.
+    fn journal(compact: bool, archived: bool, entries: &[Written]) -> Vec<u8> {
+        let mut out = vec![0; 256];
+        let flags: u32 = if compact { 16 | 2 | 8 } else { 2 | 8 };
+        put(&mut out, 0, b"LPKSHHRH");
+        put(&mut out, 12, &flags.to_le_bytes());
+        out[16] = if archived { 2 } else { 1 };
+        put(&mut out, 72, &SEQNUM_ID);
+        let mut offsets = Vec::new();
+        for entry in entries {
+            let mut items = Vec::new();
+            for (field, compression) in entry.fields {
+                let stored = match compression {
+                    2 => {
+                        let mut sized =
+                            (field.len() as u64).to_le_bytes().to_vec();
+                        sized.extend(lz4_literals(field));
+                        sized
+                    }
+                    4 => ruzstd::encoding::compress_to_vec(
+                        *field,
+                        ruzstd::encoding::CompressionLevel::Fastest,
+                    ),
+                    _ => field.to_vec(),
+                };
+                let mut body = vec![0; if compact { 56 } else { 48 }];
+                body.extend(stored);
+                let at = object(&mut out, 1, *compression, &body);
+                match compact {
+                    true => items.extend((at as u32).to_le_bytes()),
+                    false => items.extend([at.to_le_bytes(), [0; 8]].concat()),
+                }
+            }
+            let mut body = Vec::new();
+            body.extend(entry.seqnum.to_le_bytes());
+            body.extend(entry.realtime.to_le_bytes());
+            body.extend(entry.seqnum.to_le_bytes());
+            body.extend([9; 16]);
+            body.extend(0u64.to_le_bytes());
+            body.extend(items);
+            offsets.push(object(&mut out, 3, 0, &body));
+        }
+        let mut next = 0u64;
+        for pair in offsets.chunks(2).rev() {
+            let mut body = next.to_le_bytes().to_vec();
+            for offset in pair {
+                match compact {
+                    true => body.extend((*offset as u32).to_le_bytes()),
+                    false => body.extend(offset.to_le_bytes()),
+                }
+            }
+            next = object(&mut out, 6, 0, &body);
+        }
+        put(&mut out, 176, &next.to_le_bytes());
+        if let Some(last) = entries.last() {
+            put(&mut out, 160, &last.seqnum.to_le_bytes());
+            put(&mut out, 192, &last.realtime.to_le_bytes());
+        }
+        out
+    }
+
+    fn now_us() -> u64 {
+        crate::time::now_ns() as u64 / 1000
+    }
+
+    /// A machine's directory with an archived file and the active one,
+    /// in the compact layout with compressed fields.
+    fn machine_dir(test: &str) -> PathBuf {
+        let root = crate::testing::scratch(test);
+        let dir = root.join("0123456789abcdef0123456789abcdef");
+        fs::create_dir_all(&dir).unwrap();
+        let t = now_us() - 60_000_000;
+        let archived = [
+            Written {
+                seqnum: 1,
+                realtime: t,
+                fields: &[(b"MESSAGE=boot", 0), (b"PRIORITY=6", 0)],
+            },
+            Written {
+                seqnum: 2,
+                realtime: t + 1,
+                fields: &[(b"MESSAGE=disk ok", 0), (b"PRIORITY=5", 0)],
+            },
+            Written {
+                seqnum: 3,
+                realtime: t + 2,
+                fields: &[(b"MESSAGE=net up", 0), (b"PRIORITY=6", 0)],
+            },
+        ];
+        let active = [
+            Written {
+                seqnum: 4,
+                realtime: t + 3,
+                fields: &[(b"MESSAGE=lz4 line", 2), (b"PRIORITY=3", 0)],
+            },
+            Written {
+                seqnum: 5,
+                realtime: t + 4,
+                fields: &[(b"MESSAGE=zstd line", 4), (b"PRIORITY=4", 4)],
+            },
+        ];
+        fs::write(
+            dir.join("system@a-1-2.journal"),
+            journal(false, true, &archived),
+        )
+        .unwrap();
+        fs::write(dir.join("system.journal"), journal(true, false, &active))
+            .unwrap();
+        fs::write(dir.join("notes.txt"), "not a journal").unwrap();
+        root
+    }
+
+    /// Every entry of every file, in journald's order, its priority's
+    /// word for the rules; the cursor kept is the last entry's.
+    #[test]
+    fn reads_journal_files() {
+        use crate::testing::{self, response};
+        let loki =
+            testing::serve(|_| response("204 No Content", "text/plain", ""));
+        let root = machine_dir("journal-read");
+        let text = format!(
+            r#"loki.write "w" {{ endpoint {{ url = "{}" }} }}
+            loki.relabel "j" {{
+                rule {{
+                    source_labels = ["__journal_priority_keyword"]
+                    target_label = "level"
+                }}
+                forward_to = []
+            }}
+            loki.source.journal "j" {{
+                path = "{}"
+                relabel_rules = loki.relabel.j.rules
+                forward_to = [loki.write.w.receiver]
+            }}"#,
+            loki.url("/push"),
+            root.display(),
+        );
+        let stmts = crate::alloy::parse(&text).unwrap();
+        let mut plan = crate::alloy::compile(&stmts, false).unwrap();
+        let mut logs = std::mem::take(&mut plan.logs);
+        let mut positions = Positions::load(root.join("positions"));
+        let mut journal = Journal::new(plan.journal.remove(0)).unwrap();
+        journal.prepare(&positions);
+        journal.read(0, &mut logs, &mut positions);
+        logs.flush();
+        let pushed =
+            String::from_utf8_lossy(&loki.requests()[0].body).into_owned();
+        // Loki's batch groups lines by labels: in time, they are in
+        // journald's order, each at its entry's realtime.
+        let value = regex_lite::Regex::new(r#"\["(\d+)","([^"]+)"\]"#).unwrap();
+        let mut sent: Vec<(u64, &str)> = value
+            .captures_iter(&pushed)
+            .map(|c| (c[1].parse().unwrap(), c.get(2).unwrap().as_str()))
+            .collect();
+        sent.sort();
+        let lines: Vec<&str> = sent.iter().map(|(_, line)| *line).collect();
+        assert_eq!(
+            lines,
+            ["boot", "disk ok", "net up", "lz4 line", "zstd line"]
+        );
+        assert!(sent.windows(2).all(|w| w[1].0 - w[0].0 == 1000));
+        assert!(pushed.contains(r#""level":"err""#), "{pushed}");
+        assert!(pushed.contains(r#""level":"warning""#), "{pushed}");
+        let cursor = positions.cursor("loki.source.journal.j").unwrap();
+        assert!(
+            cursor.starts_with(&format!("s={};i=5;", hex(&SEQNUM_ID))),
+            "{cursor}"
+        );
+        assert_eq!(logs.sinks[0].sent, 5);
+    }
+
+    /// From a saved cursor: the archived file wholly before it is
+    /// passed over, the active one read after it.
+    #[test]
+    fn resumes_after_the_cursor() {
+        let root = machine_dir("journal-resume");
+        let source = JournalSource {
+            id: "j".into(),
+            max_age: std::time::Duration::from_secs(3600),
+            path: Some(root.display().to_string()),
+            matches: Vec::new(),
+            source: crate::logs::Source::default(),
+        };
+        let mut positions = Positions::load(root.join("positions"));
+        let id = hex(&SEQNUM_ID);
+        positions.set_cursor("j", format!("s={id};i=4;b=00;m=4;t=0;x=0"));
+        let mut journal = Journal::new(source).unwrap();
+        journal.prepare(&positions);
+        assert_eq!(journal.files.len(), 1, "the archived file is read");
+        let mut logs = Logs::default();
+        journal.read(0, &mut logs, &mut positions);
+        let cursor = positions.cursor("j").unwrap();
+        assert!(cursor.starts_with(&format!("s={id};i=5;")), "{cursor}");
+        assert!(
+            Journal::new(JournalSource {
+                path: Some("/no/such/journal".into()),
+                ..journal.config
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn refuses_files_it_cannot_read() {
+        let dir = crate::testing::scratch("journal-bad");
+        let mut unknown = journal(false, false, &[]);
+        put(&mut unknown, 12, &(1u32 << 9).to_le_bytes());
+        for (name, bytes) in
+            [("flags", unknown), ("short", b"LPKSHHRH".to_vec())]
+        {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            assert!(
+                File::open(&path).and_then(JournalFile::open).is_err(),
+                "{name}"
+            );
+        }
+        let empty = dir.join("empty.journal");
+        fs::write(&empty, journal(true, false, &[])).unwrap();
+        let (mut file, header) =
+            File::open(&empty).and_then(JournalFile::open).unwrap();
+        assert!(!header.archived);
+        assert!(file.next_entries().unwrap().is_empty());
+        assert!(file.entry(0).is_err());
+    }
 }

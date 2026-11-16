@@ -1095,3 +1095,362 @@ fn ends(otel: &[Otel], signal: &str, next: &[usize], urls: &mut Vec<String>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::compile::{Exporter, Plan, compile};
+    use super::super::syntax::parse;
+    use super::*;
+
+    fn plan(text: &str) -> Result<Plan, String> {
+        compile(&parse(text).unwrap(), false)
+    }
+
+    const LOKI: &str = r#"loki.write "w" { endpoint { url = "http://l/" } }"#;
+
+    /// The configurations CI measures the agent with, in the default
+    /// build.
+    #[cfg(all(
+        feature = "docker",
+        feature = "journal",
+        feature = "otlp",
+        feature = "syslog"
+    ))]
+    #[test]
+    fn compiles_the_ci_configurations() {
+        let full = plan(include_str!("../../ci/full.alloy")).unwrap();
+        assert_eq!(full.scrapes.len(), 1);
+        let exporters: Vec<&str> =
+            full.exporters.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            exporters,
+            [
+                "prometheus.exporter.unix.host",
+                "prometheus.exporter.self.agent",
+                "prometheus.exporter.cadvisor.containers",
+            ]
+        );
+        assert!(matches!(full.exporters[2].1, Exporter::Cadvisor(_)));
+        assert_eq!(full.docker.as_deref(), Some("/var/run/docker.sock"));
+        assert_eq!(full.journal[0].max_age, Duration::from_secs(7 * 3600));
+        assert_eq!(full.syslogs[0].address, "127.0.0.1:5514");
+        assert!(!full.syslogs[0].tcp);
+        assert_eq!(full.files.len(), 1);
+        let (address, forwards) = &full.otlp[0];
+        assert_eq!(address, "127.0.0.1:4318");
+        assert_eq!(
+            *forwards,
+            [
+                ("logs".into(), "http://127.0.0.1:19099/v1/logs".into()),
+                ("metrics".into(), "http://127.0.0.1:19099/v1/metrics".into()),
+            ]
+        );
+        let minimal = plan(include_str!("../../ci/minimal.alloy")).unwrap();
+        assert!(minimal.docker.is_none() && minimal.otlp.is_empty());
+    }
+
+    /// Each signal reaches the exporters its outputs lead to, through
+    /// a batch processor; a signal no output names goes nowhere.
+    #[cfg(feature = "otlp")]
+    #[test]
+    fn routes_otlp_signals_to_their_exporters() {
+        let plan = plan(
+            r#"otelcol.receiver.otlp "in" {
+                http { }
+                output {
+                    logs = [otelcol.processor.batch.b.input]
+                    metrics = [otelcol.exporter.otlphttp.a.input]
+                }
+            }
+            otelcol.processor.batch "b" {
+                timeout = "1s"
+                output {
+                    logs = [
+                        otelcol.exporter.otlphttp.a.input,
+                        otelcol.exporter.otlphttp.b.input,
+                    ]
+                }
+            }
+            otelcol.exporter.otlphttp "a" {
+                client { endpoint = "http://a:4318/" }
+            }
+            otelcol.exporter.otlphttp "b" {
+                logs_endpoint = "http://b/logs"
+                client { endpoint = "http://b" }
+            }"#,
+        )
+        .unwrap();
+        let (address, forwards) = &plan.otlp[0];
+        assert_eq!(address, "0.0.0.0:4318");
+        let routes: Vec<(&str, &str)> = forwards
+            .iter()
+            .map(|(s, u)| (s.as_str(), u.as_str()))
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                ("logs", "http://a:4318/v1/logs"),
+                ("logs", "http://b/logs"),
+                ("metrics", "http://a:4318/v1/metrics"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_loki_endpoints() {
+        use crate::testing::{self, response};
+        let server =
+            testing::serve(|_| response("204 No Content", "text/plain", ""));
+        let mut plan = plan(&format!(
+            r#"loki.write "w" {{
+                max_streams = 5
+                endpoint {{
+                    url = "{}"
+                    tenant_id = "home"
+                    batch_size = "1.5MiB"
+                    batch_wait = "3s"
+                    min_backoff_period = "1s"
+                    max_backoff_period = "1m"
+                    max_backoff_retries = 3
+                    retry_on_http_429 = false
+                    queue_config {{ capacity = "1MiB" }}
+                }}
+            }}"#,
+            server.url("/loki/api/v1/push"),
+        ))
+        .unwrap();
+        let loki = &mut plan.logs.sinks[0];
+        assert_eq!(loki.max_batch, 1536 << 10);
+        assert_eq!(loki.wait, Duration::from_secs(3));
+        assert_eq!(loki.max_retries, 3);
+        assert_eq!(loki.max_streams, 5);
+        let retry = loki.retry;
+        assert_eq!(
+            (retry.min, retry.max),
+            (Duration::from_secs(1), Duration::from_secs(60))
+        );
+        assert!(!retry.on_429);
+        loki.add(&vec![("job".into(), "x".into())], 1, "line");
+        assert!(matches!(loki.flush(), crate::loki::Flushed::Done));
+        let pushed = &server.requests()[0];
+        assert_eq!(pushed.header("X-Scope-OrgID"), Some("home"));
+        assert_eq!(base2_bytes("1KB512B"), Some(1536));
+        assert_eq!(base2_bytes("2GiB"), Some(2 << 30));
+        assert_eq!(base2_bytes(""), None);
+        assert_eq!(base2_bytes("5 apples"), None);
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn reads_cadvisors_raw_cgroups() {
+        let raw = |body: &str| {
+            let text =
+                format!("prometheus.exporter.cadvisor \"c\" {{ {body} }}");
+            match plan(&text).unwrap().exporters.pop() {
+                Some((_, Exporter::Cadvisor(raw))) => raw,
+                _ => panic!("no cAdvisor"),
+            }
+        };
+        assert_eq!(raw(""), [""]);
+        assert!(raw("docker_only = true").is_empty());
+        let listed = r#"docker_only = true
+            raw_cgroup_prefix_allowlist = ["/system.slice"]"#;
+        assert_eq!(raw(listed), ["/system.slice"]);
+    }
+
+    /// What Alloy refuses, refused with its reason: components of the
+    /// default build.
+    #[cfg(all(
+        feature = "docker",
+        feature = "journal",
+        feature = "otlp",
+        feature = "syslog"
+    ))]
+    #[test]
+    fn refuses_bad_components() {
+        let syslog = |listener: &str| {
+            format!(
+                r#"{LOKI} loki.source.syslog "s" {{
+                    listener {{ address = "127.0.0.1:1" {listener} }}
+                    forward_to = [loki.write.w.receiver]
+                }}"#
+            )
+        };
+        let remote = |inside: &str| {
+            format!(
+                r#"prometheus.remote_write "r" {{
+                    endpoint {{ url = "http://p/" }} {inside}
+                }}"#
+            )
+        };
+        let cases = [
+            (
+                "nope.component \"x\" { }".to_owned(),
+                "not a component this agent has",
+            ),
+            (
+                remote(r#"wal { truncate_frequency = "0s" }"#),
+                "must not be 0",
+            ),
+            (
+                remote(r#"wal { min_keepalive_time = "9h" }"#),
+                "min_keepalive_time must be smaller",
+            ),
+            (
+                r#"prometheus.remote_write "r" { }"#.into(),
+                "needs an `endpoint`",
+            ),
+            (
+                r#"prometheus.remote_write "r" { endpoint {
+                    url = "http://p/"
+                    protobuf_message = "io.prometheus.write.v2.Request"
+                } }"#
+                    .into(),
+                "only `prometheus.WriteRequest`",
+            ),
+            (r#"loki.write "w" { }"#.into(), "needs an `endpoint`"),
+            (
+                r#"loki.write "w" { endpoint {
+                    url = "http://l/"
+                    batch_size = "lots"
+                } }"#
+                    .into(),
+                "`lots`: not a size",
+            ),
+            (
+                r#"loki.relabel "r" { max_cache_size = 0 forward_to = [] }"#
+                    .into(),
+                "must provide a positive size",
+            ),
+            (
+                format!(
+                    r#"{LOKI} loki.source.journal "j" {{
+                        matches = "PRIORITY"
+                        forward_to = [loki.write.w.receiver]
+                    }}"#
+                ),
+                "`PRIORITY` is not FIELD=value",
+            ),
+            (
+                format!(
+                    r#"{LOKI} loki.source.file "f" {{
+                        targets = []
+                        file_match {{ sync_period = "0s" }}
+                        forward_to = [loki.write.w.receiver]
+                    }}"#
+                ),
+                "sync period must be greater than 0",
+            ),
+            (
+                format!(
+                    r#"{LOKI} loki.source.file "f" {{
+                        targets = []
+                        encoding = "EBCDIC"
+                        forward_to = [loki.write.w.receiver]
+                    }}"#
+                ),
+                "encoding `EBCDIC`",
+            ),
+            (
+                format!(
+                    r#"{LOKI} loki.source.file "f" {{
+                        targets = []
+                        decompression {{ format = "zip" }}
+                        forward_to = [loki.write.w.receiver]
+                    }}"#
+                ),
+                "unsupported compression format: \"zip\"",
+            ),
+            (
+                format!(
+                    r#"{LOKI} loki.source.file "f" {{
+                        targets = []
+                        decompression {{ format = "gz" }}
+                        forward_to = [loki.write.w.receiver]
+                    }}"#
+                ),
+                "`enabled` is required",
+            ),
+            (
+                r#"otelcol.exporter.otlphttp "e" {
+                    client { endpoint = "https://o" }
+                }"#
+                .into(),
+                "only http://",
+            ),
+            (
+                r#"otelcol.exporter.otlphttp "e" { }"#.into(),
+                "needs `client`",
+            ),
+            (r#"otelcol.receiver.otlp "r" { }"#.into(), "needs `http`"),
+            (
+                syslog(
+                    "raw_format_options { \
+                     use_null_terminator_delimiter = true }",
+                ),
+                "raw_format_options has no effect",
+            ),
+            (
+                syslog(
+                    r#"syslog_format = "raw" use_incoming_timestamp = true"#,
+                ),
+                "\"use_incoming_timestamp\" has no effect",
+            ),
+            (syslog(r#"syslog_format = "cef""#), "syslog_format `cef`"),
+            (syslog(r#"protocol = "sctp""#), "protocol `sctp`"),
+            (
+                syslog("max_message_length = 0"),
+                "max_message_length: a number",
+            ),
+            (
+                r#"discovery.docker "d" { host = "tcp://docker:2375" }"#.into(),
+                "only unix://",
+            ),
+            (
+                r#"discovery.docker "a" { }
+                discovery.docker "b" { host = "unix:///other.sock" }"#
+                    .into(),
+                "one Docker host per agent",
+            ),
+        ];
+        for (text, wanted) in cases {
+            let error = plan(&text).err().unwrap_or_default();
+            assert!(error.contains(wanted), "{text}\n{error}");
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn refuses_bad_listener_tls() {
+        let tls = |inside: &str| {
+            format!(
+                r#"{LOKI} loki.source.syslog "s" {{
+                    listener {{
+                        address = "127.0.0.1:1"
+                        tls_config {{ {inside} }}
+                    }}
+                    forward_to = [loki.write.w.receiver]
+                }}"#
+            )
+        };
+        let cases = [
+            (
+                r#"cert_pem = "C" key_pem = "K" min_version = "TLS10""#,
+                "min_version `TLS10`",
+            ),
+            (
+                r#"cert_pem = "C" cert_file = "/c" key_pem = "K""#,
+                "at most one of cert_pem and cert_file",
+            ),
+            (
+                r#"cert_file = "/no/such/cert" key_pem = "K""#,
+                "/no/such/cert",
+            ),
+            (r#"key_pem = "K""#, "needs cert_pem or cert_file"),
+        ];
+        for (inside, wanted) in cases {
+            let error = plan(&tls(inside)).err().unwrap_or_default();
+            assert!(error.contains(wanted), "{inside}\n{error}");
+        }
+    }
+}

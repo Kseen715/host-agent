@@ -604,6 +604,83 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    /// A router's two interfaces, as if_mib walks them, and a variable
+    /// past the first walk's root.
+    fn interfaces() -> Vec<(&'static str, Vec<u8>)> {
+        use ber::tlv;
+        let int = |n: u8| tlv(0x02, &[n]);
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        vec![
+            ("1.3.6.1.2.1.2.1.0", int(2)),
+            ("1.3.6.1.2.1.2.2.1.1.1", int(1)),
+            ("1.3.6.1.2.1.2.2.1.1.2", int(2)),
+            ("1.3.6.1.2.1.2.2.1.2.1", tlv(0x04, b"lo")),
+            ("1.3.6.1.2.1.2.2.1.2.2", tlv(0x04, b"eth0")),
+            ("1.3.6.1.2.1.2.2.1.3.1", int(24)),
+            ("1.3.6.1.2.1.2.2.1.3.2", int(6)),
+            ("1.3.6.1.2.1.2.2.1.6.1", tlv(0x04, b"")),
+            ("1.3.6.1.2.1.2.2.1.6.2", tlv(0x04, &mac)),
+            ("1.3.6.1.2.1.2.2.1.10.2", tlv(0x41, &[0x04, 0xd2])),
+            ("1.3.6.1.2.1.2.2.1.22.2", tlv(0x06, &[0])),
+            ("1.3.6.1.2.1.4.1.0", int(2)),
+            ("1.3.6.1.2.1.31.1.1.1.1.2", tlv(0x04, b"eth0")),
+            ("1.3.6.1.2.1.31.1.1.1.6.2", tlv(0x46, &[1, 0, 0, 0, 0, 0])),
+            ("1.3.6.1.2.1.31.1.1.1.18.2", tlv(0x04, b"uplink")),
+        ]
+    }
+
+    #[test]
+    fn walks_a_device_as_snmp_exporter() {
+        let device = Device {
+            name: "router".into(),
+            address: ber::agent(interfaces(), 1).to_string(),
+            community: "public".into(),
+            modules: vec!["if_mib".into()],
+        };
+        let mut snmp = Snmp::new(vec![device], true).unwrap();
+        let polled = snmp.take("router", Duration::from_secs(60)).unwrap();
+        let mut w = Writer::text();
+        polled.write(&mut w);
+        let text = w.into_text();
+        let lo = r#"ifDescr="lo",ifIndex="1""#;
+        let eth0 =
+            r#"ifAlias="uplink",ifDescr="eth0",ifIndex="2",ifName="eth0""#;
+        for line in [
+            "ifNumber 2".to_owned(),
+            format!("ifInOctets{{{eth0}}} 1234"),
+            format!("ifHCInOctets{{{eth0}}} 1099511627776"),
+            format!(r#"ifType_info{{{eth0},ifType="ethernetCsmacd"}} 1"#),
+            format!(r#"ifSpecific{{{eth0},ifSpecific="0.0"}} 1"#),
+            format!(
+                r#"ifPhysAddress{{{eth0},ifPhysAddress="52:54:00:12:34:56"}} 1"#
+            ),
+            format!(r#"ifType_info{{{lo},ifType="softwareLoopback"}} 1"#),
+            format!(
+                r#"ifPhysAddress{{{lo},ifPhysAddress="00:00:00:00:00:00"}} 1"#
+            ),
+            r#"snmp_scrape_pdus_returned{module="if_mib"} 14"#.to_owned(),
+            r#"snmp_scrape_packets_retried{module="if_mib"} 1"#.to_owned(),
+            "snmp_packets_total 4".to_owned(),
+            "snmp_unexpected_pdu_type_total 3".to_owned(),
+            "snmp_packet_duration_seconds_count 3".to_owned(),
+            "up 1".to_owned(),
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+        }
+    }
+
+    #[test]
+    fn refuses_an_unknown_module() {
+        let device = Device {
+            name: "router".into(),
+            address: "127.0.0.1".into(),
+            community: "public".into(),
+            modules: vec!["if_mib".into(), "bgp".into()],
+        };
+        let error = Snmp::new(vec![device], false).err().unwrap();
+        assert_eq!(error, "no SNMP module `bgp`");
+    }
+
     #[test]
     fn has_snmp_exporters_buckets() {
         let bounds: Vec<String> = (0..ber::BUCKETS)
